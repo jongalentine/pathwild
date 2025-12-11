@@ -89,3 +89,4 @@ mlartifacts/              # MLflow artifacts
 .pytest_cache/
 .coverage
 htmlcov/
+.env
