@@ -1,0 +1,59 @@
+name: pathwild
+channels:
+  - conda-forge          # Community channel (more packages)
+  - pytorch              # Official PyTorch channel
+  - defaults             # Anaconda default channel
+dependencies:
+  # Core Python
+  - python=3.11
+  
+  # Scientific Computing
+  - numpy
+  - pandas
+  - scipy
+  
+  # Visualization
+  - matplotlib
+  - seaborn
+  - plotly
+  
+  # Machine Learning
+  - scikit-learn
+  - xgboost
+  - lightgbm
+  
+  # Deep Learning
+  - pytorch
+  - torchvision
+  - torchaudio
+  
+  # Jupyter
+  - jupyter
+  - jupyterlab
+  - ipython
+  
+  # MLOps
+  - shap
+  - mlflow
+  
+  # Statistics & Time Series
+  - statsmodels
+  - prophet
+  
+  # Data Collection
+  - requests
+  - beautifulsoup4
+  - lxml
+  - openpyxl
+  
+  # Python package manager (for packages not in conda)
+  - pip
+  
+  # Packages only available via pip
+  - pip:
+    - boto3              # AWS SDK
+    - sagemaker          # AWS SageMaker SDK
+    - flask              # Web framework
+    - fastapi            # Alternative web framework
+    - uvicorn            # ASGI server for FastAPI
+    - python-dotenv      # Environment variable management

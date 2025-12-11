@@ -1,0 +1,91 @@
+# ============================================
+# Python
+# ============================================
+__pycache__/              # Compiled Python files
+*.py[cod]                 # .pyc, .pyo, .pyd files
+*$py.class
+*.so                      # Compiled extensions
+.Python
+env/                      # Virtual environments
+venv/
+ENV/
+build/                    # Build artifacts
+dist/
+*.egg-info/
+*.egg
+
+# ============================================
+# Jupyter Notebook
+# ============================================
+.ipynb_checkpoints        # Jupyter auto-saves
+*.ipynb_checkpoints/
+
+# ============================================
+# Data Files (too large for Git)
+# ============================================
+data/raw/*.csv            # Raw CSV files
+data/raw/*.xlsx           # Raw Excel files
+data/raw/*.pdf
+data/raw/*.json
+data/processed/*.csv      # Processed data
+data/features/*.csv       # Feature datasets
+*.h5                      # HDF5 files
+*.pkl                     # Pickle files
+*.pickle
+
+# ============================================
+# Model Files (too large for Git)
+# ============================================
+models/*.pkl              # Scikit-learn models
+models/*.h5               # Keras/TensorFlow models
+models/*.pt               # PyTorch models
+models/*.pth
+*.joblib                  # Joblib serialized models
+
+# ============================================
+# macOS
+# ============================================
+.DS_Store                 # macOS folder metadata
+.AppleDouble
+.LSOverride
+
+# ============================================
+# IDEs
+# ============================================
+.vscode/                  # VS Code settings
+*.code-workspace
+.idea/                    # PyCharm settings
+
+# ============================================
+# Environment & Secrets
+# ============================================
+.env                      # Environment variables
+.venv
+pathwild/                 # Conda environment if created here
+*.pem                     # SSH keys
+*.key                     # API keys
+secrets/                  # Secret files
+
+# ============================================
+# Logs
+# ============================================
+*.log
+logs/
+
+# ============================================
+# AWS
+# ============================================
+.aws/                     # AWS credentials
+
+# ============================================
+# MLflow
+# ============================================
+mlruns/                   # MLflow experiment tracking
+mlartifacts/              # MLflow artifacts
+
+# ============================================
+# Testing
+# ============================================
+.pytest_cache/
+.coverage
+htmlcov/

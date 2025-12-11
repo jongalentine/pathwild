@@ -1,0 +1,58 @@
+# ============================================
+# PathWild Configuration
+# ============================================
+
+project:
+  name: "PathWild"
+  version: "0.1.0"
+  description: "AI-powered wildlife location prediction"
+  domain: "pathwild.ai"
+
+# Data directories
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  features_dir: "data/features"
+  
+# Model configuration
+models:
+  dir: "models"
+  mlflow_uri: "file:./mlruns"
+  target_accuracy: 0.70
+  
+# AWS configuration
+aws:
+  region: "us-west-2"
+  sagemaker_role: "arn:aws:iam::061861711395:role/PathWildSageMakerRole"
+  s3_bucket: "pathwild-data"
+  model_endpoint: "pathwild-elk-predictor"
+
+# Species configuration
+species:
+  current:
+    - elk_rocky_mountain
+  planned:
+    - deer_mule
+    - deer_whitetail
+    - waterfowl_various
+    
+# Geographic coverage
+locations:
+  current:
+    - wyoming_usa
+  planned:
+    - montana_usa
+    - colorado_usa
+    - idaho_usa
+
+# API configuration
+api:
+  host: "0.0.0.0"
+  port: 5000
+  debug: false
+  
+# Web application
+web:
+  domain: "pathwild.ai"
+  title: "PathWild - AI Wildlife Prediction"
+  tagline: "Predict. Plan. Succeed."
