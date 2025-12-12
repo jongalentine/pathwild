@@ -90,3 +90,4 @@ mlartifacts/              # MLflow artifacts
 .coverage
 htmlcov/
 .env
+.cursorrules
