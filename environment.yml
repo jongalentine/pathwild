@@ -46,6 +46,12 @@ dependencies:
   - lxml
   - openpyxl
   
+  # Geospatial (conda handles binary dependencies better)
+  - rasterio
+  - geopandas
+  - shapely
+  - gdal
+  
   # Python package manager (for packages not in conda)
   - pip
   
@@ -57,3 +63,5 @@ dependencies:
     - fastapi            # Alternative web framework
     - uvicorn            # ASGI server for FastAPI
     - python-dotenv      # Environment variable management
+    - pytest>=7.4.0     # Testing framework
+    - pytest-cov>=4.1.0 # Coverage plugin

@@ -3,7 +3,7 @@
 AI-powered wildlife location prediction platform
 
 ## Overview
-PathWild uses machine learning to predict wildlife locations and activity patterns based on weather, terrain, and temporal data. The system helps outdoor enthusiasts, wildlife photographers, and hunters optimize their planning and increase success rates.
+PathWild uses machine learning to predict wildlife locations and activity patterns based on weather, terrain, and temporal data. The system helps outdoor enthusiasts, wildlife photographers, and hunters ethically optimize their planning and increase success rates.
 
 ## Current Focus
 - **Species:** Rocky Mountain Elk (*Cervus canadensis nelsoni*)
@@ -27,21 +27,24 @@ Democratize wildlife prediction using AI, making expert-level insights accessibl
 ## Tech Stack
 - **ML:** Python 3.11, PyTorch, scikit-learn, XGBoost
 - **MLOps:** MLflow, SHAP
+- **Geospatial:** Rasterio, GeoPandas, Shapely (for terrain, landcover, and spatial analysis)
 - **Cloud:** AWS SageMaker, Lambda, API Gateway
 - **Web:** Flask, Bootstrap
-- **Data:** NOAA Weather API, Wyoming Game & Fish
+- **Data:** NOAA Weather API, Wyoming Game & Fish, SNOTEL, satellite imagery
 
 ## Quick Start
 
 ### Setup Environment
 ```bash
-# Create conda environment
+# Create conda environment (recommended - handles geospatial dependencies better)
 conda env create -f environment.yml
 conda activate pathwild
 
-# Install dependencies
+# Or install via pip (if not using conda)
 pip install -r requirements.txt
 ```
+
+**Note:** Geospatial packages (rasterio, geopandas) have binary dependencies (GDAL). Conda is recommended as it handles these dependencies automatically.
 
 ### Run Jupyter Lab
 ```bash
@@ -62,19 +65,49 @@ python app/app.py
 ## Project Structure
 ```
 pathwild/
-├── data/              # Data files
-│   ├── raw/          # Original data (not in Git)
+├── config.yaml        # Configuration file
+├── data/              # Data files (not in Git)
+│   ├── raw/          # Original data
 │   ├── processed/    # Cleaned data
-│   └── features/     # ML-ready features
-├── notebooks/         # Jupyter notebooks
-├── src/              # Production code
-│   ├── data/         # Data collection
-│   ├── features/     # Feature engineering
-│   ├── models/       # Model training/prediction
-│   └── deployment/   # AWS deployment
-├── models/           # Trained models (not in Git)
-├── app/              # Web application
-└── tests/            # Unit tests
+│   ├── features/     # ML-ready features
+│   ├── dem/          # Digital elevation models
+│   ├── terrain/      # Slope, aspect data
+│   ├── landcover/    # Land cover classifications
+│   ├── canopy/       # Canopy cover data
+│   ├── hydrology/    # Water sources
+│   ├── infrastructure/ # Roads, trails
+│   └── wildlife/     # Predator territories, activity
+├── docs/              # Documentation
+├── notebooks/         # Jupyter notebooks for exploration
+├── src/               # Production code
+│   ├── data/          # Data processing and context building
+│   │   └── processors.py  # DataContextBuilder, SNOTEL, Weather, Satellite clients
+│   ├── examples/      # Usage examples
+│   │   └── example_usage.py
+│   ├── features/      # Feature engineering
+│   ├── inference/     # Inference engine
+│   │   └── engine.py
+│   ├── models/        # Model training/prediction
+│   ├── scoring/       # Scoring and heuristic modules
+│   │   ├── aggregator.py
+│   │   └── heuristics/  # Individual heuristic modules
+│   │       ├── access.py
+│   │       ├── elevation.py
+│   │       ├── nutrition.py
+│   │       ├── predation.py
+│   │       ├── security.py
+│   │       ├── snow.py
+│   │       ├── vegetation.py
+│   │       ├── water.py
+│   │       └── winterkill.py
+│   └── deployment/    # AWS deployment
+└── tests/             # Unit tests
+    ├── test_aggregator.py
+    ├── test_data_context.py
+    ├── test_heuristics.py
+    ├── test_inference_engine.py
+    ├── test_integration.py
+    └── test_validation.py
 ```
 
 ## Development Roadmap

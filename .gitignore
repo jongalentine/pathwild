@@ -88,6 +88,25 @@ mlartifacts/              # MLflow artifacts
 # ============================================
 .pytest_cache/
 .coverage
+.coverage.*
+coverage.xml
+*.cover
 htmlcov/
+.tox/
+.hypothesis/
+
+# ============================================
+# Code Quality Tools
+# ============================================
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pytype/
+typecheck/
+
+# ============================================
+# IDE & Editor
+# ============================================
 .env
 .cursorrules
