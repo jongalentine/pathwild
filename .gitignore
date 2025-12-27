@@ -34,6 +34,11 @@ data/features/*.csv       # Feature datasets
 *.pickle
 
 # ============================================
+# Blog Posts
+# ============================================
+docs/blog_post_*          # Blog post drafts
+
+# ============================================
 # Model Files (too large for Git)
 # ============================================
 models/*.pkl              # Scikit-learn models

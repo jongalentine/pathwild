@@ -45,6 +45,20 @@ locations:
     - colorado_usa
     - idaho_usa
 
+# Hunt area configuration
+hunt_areas:
+  primary:
+    area_id: "048"
+    name: "Area 048"
+    full_name: "Wyoming Hunt Area 048 (Leo-Hanna area)"
+    county: "Carbon"
+    center_lat: 41.8350
+    center_lon: -106.4250
+    size_sq_miles: 819.0
+    size_acres: 524052.0
+    # For exact polygon boundaries, download from WGFD GIS service
+    # https://wgfd.wyo.gov/hunting/hunt-planner
+
 # API configuration
 api:
   host: "0.0.0.0"
