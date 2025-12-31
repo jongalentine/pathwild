@@ -2,11 +2,25 @@ from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 from datetime import datetime, timedelta
 import numpy as np
-import rasterio
-from rasterio.mask import mask
 from shapely.geometry import Point, shape
 import requests
 from functools import lru_cache
+import logging
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Lazy import rasterio to avoid import errors in sandboxed environments
+try:
+    import rasterio
+    from rasterio.mask import mask
+    RASTERIO_AVAILABLE = True
+except (ImportError, OSError) as e:
+    rasterio = None
+    mask = None
+    RASTERIO_AVAILABLE = False
+    logger.warning(f"rasterio not available: {e}. Some features may be limited.")
 
 class DataContextBuilder:
     """Builds comprehensive context for heuristic calculations"""
@@ -26,6 +40,60 @@ class DataContextBuilder:
     
     def _load_static_layers(self):
         """Load data that doesn't change over time"""
+        
+        if not RASTERIO_AVAILABLE:
+            print("Loading static data layers...")
+            print("  ⚠ rasterio not available, skipping raster data loading")
+            self.dem = None
+            self.slope = None
+            self.aspect = None
+            self.landcover = None
+            self.canopy = None
+            # Still load vector data which doesn't require rasterio
+            import geopandas as gpd
+            # Water sources
+            water_path = self.data_dir / "hydrology" / "water_sources.geojson"
+            if water_path.exists():
+                self.water_sources = gpd.read_file(water_path)
+                print(f"  ✓ Water sources loaded: {len(self.water_sources)} features")
+            else:
+                self.water_sources = None
+            # Roads
+            roads_path = self.data_dir / "infrastructure" / "roads.geojson"
+            if roads_path.exists():
+                self.roads = gpd.read_file(roads_path)
+                print(f"  ✓ Roads loaded: {len(self.roads)} features")
+            else:
+                self.roads = None
+            # Hunt areas
+            hunt_areas_path = self.data_dir / "hunt_areas" / "hunt_areas.geojson"
+            if hunt_areas_path.exists():
+                self.hunt_areas = gpd.read_file(hunt_areas_path)
+                print(f"  ✓ Hunt areas loaded: {len(self.hunt_areas)} features")
+            else:
+                self.hunt_areas = None
+            # Trails
+            trails_path = self.data_dir / "infrastructure" / "trails.geojson"
+            if trails_path.exists():
+                self.trails = gpd.read_file(trails_path)
+                print(f"  ✓ Trails loaded: {len(self.trails)} features")
+            else:
+                self.trails = None
+            # Wolf pack territories
+            wolf_path = self.data_dir / "wildlife" / "wolf_packs.geojson"
+            if wolf_path.exists():
+                self.wolf_packs = gpd.read_file(wolf_path)
+                print(f"  ✓ Wolf territories loaded: {len(self.wolf_packs)} packs")
+            else:
+                self.wolf_packs = None
+            # Bear activity
+            bear_path = self.data_dir / "wildlife" / "bear_activity.geojson"
+            if bear_path.exists():
+                self.bear_activity = gpd.read_file(bear_path)
+                print(f"  ✓ Bear activity loaded: {len(self.bear_activity)} features")
+            else:
+                self.bear_activity = None
+            return
         
         print("Loading static data layers...")
         
@@ -240,7 +308,7 @@ class DataContextBuilder:
     def _sample_raster(self, raster, lon: float, lat: float, 
                       default: float = 0.0) -> float:
         """Sample value from raster at point"""
-        if raster is None:
+        if raster is None or not RASTERIO_AVAILABLE:
             return default
         
         try:
@@ -310,6 +378,9 @@ class DataContextBuilder:
         # Security criteria: slope > 40° OR canopy > 70% OR remote
         
         if self.slope is None:
+            return 35.0  # Default moderate security
+        
+        if not RASTERIO_AVAILABLE or self.slope is None:
             return 35.0  # Default moderate security
         
         try:
