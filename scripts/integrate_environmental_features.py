@@ -1,0 +1,725 @@
+#!/usr/bin/env python3
+"""
+Add environmental features to existing presence/absence datasets.
+
+This script updates existing CSV files with real environmental features
+from DEM, water sources, land cover, etc. It replaces placeholder values
+with actual data from environmental datasets.
+
+Usage:
+    python scripts/integrate_environmental_features.py [dataset_path] [--workers N] [--batch-size N] [--limit N]
+    
+Examples:
+    # Process full dataset (auto-detects optimal workers and batch size based on hardware)
+    python scripts/integrate_environmental_features.py data/processed/combined_north_bighorn_presence_absence.csv
+    
+    # Process with specific number of workers
+    python scripts/integrate_environmental_features.py data/processed/combined_national_refuge_presence_absence.csv --workers 4
+    
+    # Force sequential processing (no parallelization)
+    python scripts/integrate_environmental_features.py data/processed/dataset.csv --workers 1
+    
+    # Test on first 100 rows (saves to *_test.csv, doesn't overwrite original)
+    python scripts/integrate_environmental_features.py data/processed/combined_national_refuge_presence_absence.csv --limit 100
+    
+    # Process with custom batch size (auto-detects workers)
+    python scripts/integrate_environmental_features.py data/processed/dataset.csv --batch-size 500
+"""
+
+import argparse
+import logging
+import pandas as pd
+from pathlib import Path
+import sys
+import os
+import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import multiprocessing
+from functools import partial
+
+# Optional psutil for hardware detection
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+# Optional progress bar
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+    # Fallback: simple progress function
+    def tqdm(iterable, desc=""):
+        return iterable
+
+# Add src to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.data.processors import DataContextBuilder
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+# Placeholder values that indicate data needs to be replaced
+PLACEHOLDER_VALUES = {
+    'elevation': 8500.0,
+    'slope_degrees': 15.0,
+    'aspect_degrees': 180.0,
+    'canopy_cover_percent': 30.0,
+    'water_distance_miles': 0.5,
+    'water_reliability': 0.5,
+    'land_cover_code': 0,
+    'road_distance_miles': 10.0,
+    'trail_distance_miles': 10.0,
+    'security_habitat_percent': 0.5
+}
+
+
+def has_placeholder_values(row, env_columns, tolerance: float = 0.01) -> bool:
+    """
+    Check if a row contains placeholder values or missing data.
+    
+    Args:
+        row: pandas Series representing a row
+        env_columns: List of environmental column names to check
+        tolerance: Floating point tolerance for comparison
+    
+    Returns:
+        True if row has placeholders or missing data, False otherwise
+    """
+    import numpy as np
+    
+    for col in env_columns:
+        # Check if column is missing
+        if col not in row.index:
+            return True
+        
+        # Check for NaN
+        if pd.isna(row[col]):
+            return True
+        
+        # Check for placeholder value
+        if col in PLACEHOLDER_VALUES:
+            placeholder = PLACEHOLDER_VALUES[col]
+            value = row[col]
+            
+            # For numeric values, use tolerance
+            if isinstance(value, (int, float)) and isinstance(placeholder, (int, float)):
+                if abs(value - placeholder) <= tolerance:
+                    return True
+            elif value == placeholder:
+                return True
+    
+    return False
+
+
+def detect_optimal_workers(dataset_size: int = None) -> int:
+    """
+    Auto-detect optimal number of workers based on hardware.
+    
+    Args:
+        dataset_size: Number of rows in dataset (optional, for size-based tuning)
+    
+    Returns:
+        Optimal number of workers
+    """
+    try:
+        # Get CPU count
+        cpu_count = os.cpu_count() or 4
+        
+        if HAS_PSUTIL:
+            logical_cores = psutil.cpu_count(logical=True)
+            physical_cores = psutil.cpu_count(logical=False) or logical_cores
+            
+            # Get available memory
+            memory = psutil.virtual_memory()
+            available_gb = memory.available / (1024**3)
+            total_gb = memory.total / (1024**3)
+        else:
+            # Fallback without psutil
+            logical_cores = cpu_count
+            physical_cores = cpu_count // 2 if cpu_count > 2 else cpu_count
+            available_gb = 8.0  # Assume 8 GB available
+            total_gb = 16.0  # Assume 16 GB total
+        
+        logger.info(f"Hardware detection:")
+        logger.info(f"  Physical CPU cores: {physical_cores}")
+        logger.info(f"  Logical CPU cores: {logical_cores}")
+        logger.info(f"  Available memory: {available_gb:.1f} GB / {total_gb:.1f} GB")
+        
+        # Base calculation: use physical cores, but leave 1-2 cores free
+        base_workers = max(1, physical_cores - 1)
+        
+        # Memory-based adjustment
+        # Each worker loads ~1-2 GB of environmental data (rasters, GeoDataFrames)
+        # Reserve 4 GB for system and main process
+        memory_workers = max(1, int((available_gb - 4) / 1.5))
+        
+        # Dataset size adjustment (for very large datasets, can use more workers)
+        if dataset_size:
+            if dataset_size > 500000:
+                # Very large dataset - can benefit from more workers
+                size_factor = 1.2
+            elif dataset_size > 100000:
+                # Large dataset
+                size_factor = 1.0
+            elif dataset_size < 10000:
+                # Small dataset - fewer workers to avoid overhead
+                size_factor = 0.7
+            else:
+                size_factor = 1.0
+        else:
+            size_factor = 1.0
+        
+        # Take minimum of CPU-based and memory-based, apply size factor
+        optimal = max(1, min(base_workers, memory_workers))
+        optimal = max(1, int(optimal * size_factor))
+        
+        # Cap at reasonable maximum (8 workers for threading due to GIL)
+        optimal = min(optimal, 8)
+        
+        # Minimum of 2 for small systems
+        if optimal < 2 and physical_cores >= 2:
+            optimal = 2
+        
+        logger.info(f"  Recommended workers: {optimal}")
+        
+        return optimal
+        
+    except Exception as e:
+        logger.warning(f"Could not detect hardware, using default: {e}")
+        return 4
+
+
+def detect_optimal_batch_size(dataset_size: int, n_workers: int) -> int:
+    """
+    Auto-detect optimal batch size based on dataset size and workers.
+    
+    Args:
+        dataset_size: Number of rows in dataset
+        n_workers: Number of workers
+    
+    Returns:
+        Optimal batch size
+    """
+    # Base batch size: save progress every 1000 rows
+    base_batch = 1000
+    
+    # Adjust based on dataset size
+    if dataset_size > 500000:
+        # Very large dataset - save more frequently
+        batch_size = 500
+    elif dataset_size > 100000:
+        # Large dataset - standard batch size
+        batch_size = 1000
+    elif dataset_size > 10000:
+        # Medium dataset - can save less frequently
+        batch_size = 2000
+    else:
+        # Small dataset - save at end
+        batch_size = dataset_size
+    
+    # Adjust based on workers (more workers = smaller batches to avoid memory issues)
+    if n_workers > 4:
+        batch_size = int(batch_size * 0.75)
+    
+    # Ensure reasonable bounds
+    batch_size = max(100, min(batch_size, 5000))
+    
+    return batch_size
+
+
+def _process_sequential(df, builder, date_col, batch_size, limit, dataset_path, force: bool = False):
+    """Process rows sequentially (original method)"""
+    updated_count = 0
+    error_count = 0
+    skipped_count = 0
+    
+    # Define environmental columns
+    env_columns = [
+        'elevation', 'slope_degrees', 'aspect_degrees',
+        'canopy_cover_percent', 'land_cover_code', 'land_cover_type',
+        'water_distance_miles', 'water_reliability',
+        'road_distance_miles', 'trail_distance_miles',
+        'security_habitat_percent'
+    ]
+    
+    # Filter rows if not forcing (only process rows with placeholders)
+    if not force:
+        rows_to_process = []
+        for idx in range(len(df)):
+            row = df.iloc[idx]
+            if has_placeholder_values(row, env_columns):
+                rows_to_process.append(idx)
+        skipped_count = len(df) - len(rows_to_process)
+        if skipped_count > 0:
+            logger.info(f"Skipping {skipped_count:,} rows without placeholders (use --force to process all)")
+    else:
+        rows_to_process = list(range(len(df)))
+        logger.info("Force mode: Processing all rows")
+    
+    iterator = rows_to_process
+    if HAS_TQDM:
+        iterator = tqdm(iterator, desc="Processing points")
+    else:
+        logger.info("Progress bar not available (install tqdm for progress updates)")
+    
+    for idx in iterator:
+        try:
+            row = df.iloc[idx]
+            lat, lon = row['latitude'], row['longitude']
+            
+            # Get date if available
+            date_str = "2024-01-01"  # Default
+            if date_col and pd.notna(row[date_col]):
+                date_str = str(row[date_col])
+                if ' ' in date_str:
+                    date_str = date_str.split(' ')[0]
+            
+            # Build context
+            context = builder.build_context(
+                location={"lat": lat, "lon": lon},
+                date=date_str
+            )
+            
+            # Update environmental columns
+            env_columns = [
+                'elevation', 'slope_degrees', 'aspect_degrees',
+                'canopy_cover_percent', 'land_cover_code', 'land_cover_type',
+                'water_distance_miles', 'water_reliability',
+                'road_distance_miles', 'trail_distance_miles',
+                'security_habitat_percent'
+            ]
+            
+            for col in env_columns:
+                if col in context:
+                    if col not in df.columns:
+                        df[col] = None
+                    df.at[idx, col] = context[col]
+            
+            updated_count += 1
+            
+            # Save progress periodically
+            if (idx + 1) % batch_size == 0:
+                if limit is not None:
+                    test_output = dataset_path.parent / f"{dataset_path.stem}_test{dataset_path.suffix}"
+                    df.to_csv(test_output, index=False)
+                else:
+                    df.to_csv(dataset_path, index=False)
+                logger.debug(f"Progress saved at row {idx + 1}")
+        
+        except Exception as e:
+            error_count += 1
+            logger.warning(f"Error processing row {idx}: {e}")
+            if error_count > 100:
+                logger.error("Too many errors, stopping")
+                break
+    
+    if skipped_count > 0:
+        logger.info(f"Skipped {skipped_count:,} rows without placeholders")
+    return updated_count, error_count
+
+
+def _process_parallel(df, data_dir, date_col, batch_size, limit, dataset_path, n_workers, force: bool = False):
+    """Process rows in parallel using multiprocessing"""
+    # Define environmental columns
+    env_columns = [
+        'elevation', 'slope_degrees', 'aspect_degrees',
+        'canopy_cover_percent', 'land_cover_code', 'land_cover_type',
+        'water_distance_miles', 'water_reliability',
+        'road_distance_miles', 'trail_distance_miles',
+        'security_habitat_percent'
+    ]
+    
+    # Filter rows if not forcing (only process rows with placeholders)
+    if not force:
+        rows_to_process = []
+        for idx in range(len(df)):
+            row = df.iloc[idx]
+            if has_placeholder_values(row, env_columns):
+                rows_to_process.append(idx)
+        skipped_count = len(df) - len(rows_to_process)
+        if skipped_count > 0:
+            logger.info(f"Skipping {skipped_count:,} rows without placeholders (use --force to process all)")
+        # Filter dataframe to only rows with placeholders
+        df = df.iloc[rows_to_process].copy()
+    else:
+        logger.info("Force mode: Processing all rows")
+    
+    # Prepare batches
+    chunk_size = max(100, len(df) // (n_workers * 4))  # 4 chunks per worker
+    batches = []
+    
+    # Convert data_dir to string for pickling (Path objects can sometimes cause issues)
+    data_dir_str = str(data_dir)
+    
+    for i in range(0, len(df), chunk_size):
+        chunk = df.iloc[i:i+chunk_size]
+        # Convert rows to dictionaries to avoid any pandas-specific pickling issues
+        batch_data = [(idx, row.to_dict()) for idx, row in chunk.iterrows()]
+        batches.append((batch_data, data_dir_str, date_col))
+    
+    logger.info(f"Processing {len(batches)} batches with {n_workers} workers")
+    
+    updated_count = 0
+    error_count = 0
+    
+    # Process batches in parallel
+    env_columns = [
+        'elevation', 'slope_degrees', 'aspect_degrees',
+        'canopy_cover_percent', 'land_cover_code', 'land_cover_type',
+        'water_distance_miles', 'water_reliability',
+        'road_distance_miles', 'trail_distance_miles',
+        'security_habitat_percent'
+    ]
+    
+    # Initialize columns if needed
+    for col in env_columns:
+        if col not in df.columns:
+            df[col] = None
+    
+    # Use ThreadPoolExecutor instead of ProcessPoolExecutor to avoid pickling issues
+    # with rasterio dataset handles. ThreadPoolExecutor doesn't require pickling.
+    # Note: Threads are limited by Python's GIL, but I/O operations (raster reading)
+    # can still benefit from parallelization.
+    logger.info("Using ThreadPoolExecutor (avoids rasterio pickling issues)")
+    logger.info(f"Processing {len(batches)} batches with {n_workers} workers")
+    logger.info(f"First batch has ~{len(batches[0][0]):,} rows - this may take 2-3 minutes")
+    
+    # Calculate dynamic timeout based on batch size (more rows = more time)
+    # Base: 1 minute per 1000 rows, minimum 2 minutes, maximum 10 minutes
+    base_rows = len(batches[0][0])
+    timeout_seconds = max(120, min(600, int(base_rows / 1000 * 60)))
+    logger.info(f"Using {timeout_seconds/60:.1f} minute timeout per batch (based on batch size)")
+    
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        # Submit all batches
+        logger.info("Submitting batches to workers...")
+        future_to_batch = {executor.submit(process_batch, batch): i for i, batch in enumerate(batches)}
+        logger.info(f"All {len(future_to_batch)} batches submitted")
+        
+        # Process results as they complete
+        iterator = as_completed(future_to_batch)
+        if HAS_TQDM:
+            iterator = tqdm(iterator, total=len(batches), desc="Processing batches")
+        
+        batch_count = 0
+        start_time = time.time()
+        last_progress_time = start_time
+        
+        for future in iterator:
+            try:
+                # Add timeout to detect stuck workers
+                # Use dynamic timeout based on batch size
+                batch_idx = future_to_batch[future]
+                batch_size = len(batches[batch_idx][0])
+                batch_timeout = max(120, min(600, int(batch_size / 1000 * 60)))
+                
+                logger.debug(f"Waiting for batch {batch_idx} (timeout: {batch_timeout}s)")
+                results = future.result(timeout=batch_timeout)
+                for idx, context in results:
+                    if context is None:
+                        error_count += 1
+                    else:
+                        for col in env_columns:
+                            if col in context:
+                                df.at[idx, col] = context[col]
+                        updated_count += 1
+                
+                # Log batch completion with timing
+                batch_count += 1
+                elapsed = time.time() - start_time
+                avg_time_per_batch = elapsed / batch_count if batch_count > 0 else 0
+                remaining_batches = len(batches) - batch_count
+                estimated_remaining = avg_time_per_batch * remaining_batches
+                
+                logger.info(f"✓ Batch {batch_count}/{len(batches)} completed "
+                          f"({batch_count/len(batches)*100:.0f}%) - "
+                          f"~{estimated_remaining/60:.1f} min remaining")
+                          
+            except TimeoutError:
+                batch_idx = future_to_batch[future]
+                batch_size_actual = len(batches[batch_idx][0])
+                error_count += batch_size_actual
+                logger.error(f"Batch {batch_idx} timed out after 5 minutes (likely stuck)")
+                logger.error(f"  This batch had {batch_size_actual} rows")
+                logger.error(f"  Consider reducing --workers or checking for issues")
+            except Exception as e:
+                batch_idx = future_to_batch[future]
+                batch_size_actual = len(batches[batch_idx][0])
+                error_count += batch_size_actual
+                logger.error(f"Error processing batch {batch_idx}: {e}")
+                logger.error(f"  This batch had {batch_size_actual} rows")
+                import traceback
+                logger.debug(traceback.format_exc())
+    
+    return updated_count, error_count
+
+
+def process_batch(args):
+    """Process a batch of rows - used for parallel processing"""
+    batch_data, data_dir_str, date_col = args
+    
+    # Convert string back to Path and initialize DataContextBuilder for this worker
+    # This ensures clean pickling (Path objects can be pickled, but we convert to string for safety)
+    from pathlib import Path
+    import logging
+    worker_logger = logging.getLogger(f"{__name__}.worker")
+    
+    data_dir = Path(data_dir_str)
+    
+    # Initialize DataContextBuilder for this worker
+    # Each worker loads its own copy of the rasters (avoids pickling issues)
+    try:
+        builder = DataContextBuilder(data_dir)
+    except Exception as e:
+        worker_logger.error(f"Failed to initialize DataContextBuilder: {e}")
+        return [(idx, None) for idx, _ in batch_data]
+    
+    results = []
+    processed = 0
+    batch_start_time = time.time()
+    
+    worker_logger.info(f"Worker starting batch with {len(batch_data)} rows")
+    
+    for row_data in batch_data:
+        idx, row_dict = row_data
+        try:
+            # row_dict is a dictionary (converted from pandas Series)
+            # Ensure we're working with basic Python types
+            lat = float(row_dict['latitude'])
+            lon = float(row_dict['longitude'])
+            
+            # Get date if available
+            date_str = "2024-01-01"  # Default
+            if date_col and date_col in row_dict:
+                date_val = row_dict[date_col]
+                # Handle None, NaN, and other non-string values
+                if date_val is not None and str(date_val).lower() not in ['nan', 'none', '']:
+                    date_str = str(date_val)
+                    if ' ' in date_str:
+                        date_str = date_str.split(' ')[0]
+            
+            # Build context
+            context = builder.build_context(
+                location={"lat": lat, "lon": lon},
+                date=date_str
+            )
+            
+            results.append((idx, context))
+            processed += 1
+            
+            # Log progress every 1000 rows to show worker is alive
+            if processed % 1000 == 0:
+                elapsed = time.time() - batch_start_time
+                rate = processed / elapsed if elapsed > 0 else 0
+                remaining = len(batch_data) - processed
+                eta = remaining / rate if rate > 0 else 0
+                worker_logger.info(f"Worker: {processed:,}/{len(batch_data):,} rows "
+                                 f"({processed/len(batch_data)*100:.1f}%) - "
+                                 f"{rate:.0f} rows/sec - ~{eta/60:.1f} min remaining")
+                
+        except Exception as e:
+            worker_logger.warning(f"Error processing row {idx}: {e}")
+            results.append((idx, None))  # Error marker
+    
+    total_time = time.time() - batch_start_time
+    worker_logger.info(f"Worker completed batch: {processed:,} rows in {total_time/60:.1f} minutes "
+                      f"({processed/total_time:.0f} rows/sec)")
+    
+    return results
+
+
+def update_dataset(dataset_path: Path, data_dir: Path, batch_size: int = 1000, limit: int = None, n_workers: int = None, force: bool = False):
+    """
+    Update dataset with real environmental features.
+    
+    Args:
+        dataset_path: Path to CSV file to update
+        data_dir: Path to data directory with environmental datasets
+        batch_size: Number of rows to process before saving progress
+        limit: Maximum number of rows to process (for testing). If None, processes all rows.
+    """
+    logger.info(f"Loading dataset: {dataset_path}")
+    
+    if not dataset_path.exists():
+        logger.error(f"Dataset not found: {dataset_path}")
+        return False
+    
+    df = pd.read_csv(dataset_path)
+    original_len = len(df)
+    logger.info(f"Loaded {original_len:,} rows")
+    
+    # Limit rows for testing if specified
+    if limit is not None:
+        df = df.head(limit)
+        logger.info(f"⚠️  TEST MODE: Processing only first {len(df):,} rows (limit={limit})")
+    
+    # Check required columns
+    required_cols = ['latitude', 'longitude']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        logger.error(f"Missing required columns: {missing_cols}")
+        return False
+    
+    # Initialize DataContextBuilder
+    logger.info("Initializing DataContextBuilder...")
+    try:
+        builder = DataContextBuilder(data_dir)
+        logger.info("✓ DataContextBuilder initialized")
+    except Exception as e:
+        logger.error(f"Failed to initialize DataContextBuilder: {e}")
+        return False
+    
+    # Check what environmental data is available
+    logger.info("\nEnvironmental data availability:")
+    logger.info(f"  DEM: {builder.dem is not None}")
+    logger.info(f"  Slope: {builder.slope is not None}")
+    logger.info(f"  Aspect: {builder.aspect is not None}")
+    logger.info(f"  Land cover: {builder.landcover is not None}")
+    logger.info(f"  Canopy: {builder.canopy is not None}")
+    logger.info(f"  Water sources: {builder.water_sources is not None}")
+    logger.info(f"  Roads: {builder.roads is not None}")
+    logger.info(f"  Trails: {builder.trails is not None}")
+    
+    # Determine date column
+    date_col = None
+    for col in ['date', 'firstdate', 'Date_Time_MST']:
+        if col in df.columns:
+            date_col = col
+            break
+    
+    if date_col:
+        logger.info(f"Using date column: {date_col}")
+    else:
+        logger.warning("No date column found, using default date")
+    
+    # Add/update environmental features
+    logger.info(f"\nAdding environmental features to {len(df):,} points...")
+    
+    # Auto-detect optimal workers if not specified
+    if n_workers is None:
+        n_workers = detect_optimal_workers(len(df))
+        logger.info(f"Auto-detected optimal workers: {n_workers}")
+    
+    # Auto-detect optimal batch size if using default
+    if batch_size == 1000:  # Default value
+        optimal_batch = detect_optimal_batch_size(len(df), n_workers)
+        if optimal_batch != batch_size:
+            batch_size = optimal_batch
+            logger.info(f"Auto-detected optimal batch size: {batch_size}")
+    
+    # Determine if we should use parallel processing
+    use_parallel = n_workers > 1 and len(df) > 1000
+    
+    if use_parallel:
+        logger.info(f"Using parallel processing with {n_workers} workers")
+        updated_count, error_count = _process_parallel(df, data_dir, date_col, batch_size, limit, dataset_path, n_workers, force)
+    else:
+        logger.info("Using sequential processing")
+        updated_count, error_count = _process_sequential(df, builder, date_col, batch_size, limit, dataset_path, force)
+    
+    # Final save
+    logger.info(f"\nSaving updated dataset...")
+    if limit is not None:
+        # In test mode, save to a test file
+        test_output = dataset_path.parent / f"{dataset_path.stem}_test{dataset_path.suffix}"
+        df.to_csv(test_output, index=False)
+        logger.info(f"⚠️  TEST MODE: Saved to {test_output} (not overwriting original)")
+        logger.info(f"   Original file unchanged: {dataset_path}")
+        output_path = test_output
+    else:
+        df.to_csv(dataset_path, index=False)
+        output_path = dataset_path
+    
+    logger.info(f"\n✓ Update complete!")
+    logger.info(f"  Updated: {updated_count:,} rows")
+    logger.info(f"  Errors: {error_count:,} rows")
+    if limit is not None:
+        logger.info(f"  Test mode: Processed {len(df):,} of {original_len:,} total rows")
+    logger.info(f"  Saved to: {output_path}")
+    
+    # Show sample of updated values
+    logger.info("\nSample updated values:")
+    sample_cols = ['elevation', 'slope_degrees', 'water_distance_miles']
+    available_cols = [col for col in sample_cols if col in df.columns]
+    if available_cols:
+        logger.info(f"\n{df[available_cols].head().to_string()}")
+    
+    return True
+
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description="Add environmental features to presence/absence datasets"
+    )
+    parser.add_argument(
+        'dataset',
+        nargs='?',
+        default='data/processed/combined_north_bighorn_presence_absence.csv',
+        help='Path to dataset CSV file to update'
+    )
+    parser.add_argument(
+        '--data-dir',
+        default='data',
+        help='Path to data directory (default: data)'
+    )
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=1000,
+        help='Number of rows to process before saving progress. Default: 1000 (auto-adjusted based on dataset size)'
+    )
+    parser.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='Maximum number of rows to process (for testing). If not specified, processes all rows.'
+    )
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=None,
+        help='Number of parallel workers to use. Default: None (auto-detect based on hardware). Use 1 for sequential processing.'
+    )
+    parser.add_argument(
+        '--auto-workers',
+        action='store_true',
+        help='Explicitly enable auto-detection of optimal workers (this is the default behavior)'
+    )
+    parser.add_argument(
+        '--force',
+        action='store_true',
+        help='Force regeneration of all features, even if placeholders don\'t exist'
+    )
+    
+    args = parser.parse_args()
+    
+    dataset_path = Path(args.dataset)
+    data_dir = Path(args.data_dir)
+    
+    if not dataset_path.exists():
+        logger.error(f"Dataset not found: {dataset_path}")
+        logger.info(f"Usage: python {sys.argv[0]} <dataset_path>")
+        return 1
+    
+    if not data_dir.exists():
+        logger.error(f"Data directory not found: {data_dir}")
+        return 1
+    
+    success = update_dataset(dataset_path, data_dir, args.batch_size, args.limit, args.workers, args.force)
+    
+    return 0 if success else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
