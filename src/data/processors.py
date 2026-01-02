@@ -6,8 +6,7 @@ from shapely.geometry import Point, shape
 import requests
 from functools import lru_cache
 import logging
-
-import logging
+import warnings
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +15,8 @@ try:
     import rasterio
     from rasterio.mask import mask
     RASTERIO_AVAILABLE = True
+    # Suppress NotGeoreferencedWarning (non-critical, rasterio handles it with identity transform)
+    warnings.filterwarnings('ignore', category=rasterio.errors.NotGeoreferencedWarning)
 except (ImportError, OSError) as e:
     rasterio = None
     mask = None
@@ -143,10 +144,16 @@ class DataContextBuilder:
         if water_path.exists():
             import geopandas as gpd
             self.water_sources = gpd.read_file(water_path)
+            # Cache projected version for efficient distance calculations
+            if self.water_sources.crs is None:
+                self.water_sources.set_crs('EPSG:4326', inplace=True)
+            # Convert to UTM Zone 12N (covers most of Wyoming) for accurate distance calculations
+            self.water_sources_proj = self.water_sources.to_crs('EPSG:32612')
             print(f"  ✓ Water sources loaded: {len(self.water_sources)} features")
         else:
             print(f"  ✗ Water sources not found")
             self.water_sources = None
+            self.water_sources_proj = None
         
         # Roads (vector data)
         roads_path = self.data_dir / "infrastructure" / "roads.geojson"
@@ -208,9 +215,12 @@ class DataContextBuilder:
         context["elevation"] = self._sample_raster(self.dem, lon, lat, default=8500.0)
         context["slope_degrees"] = self._sample_raster(self.slope, lon, lat, default=15.0)
         context["aspect_degrees"] = self._sample_raster(self.aspect, lon, lat, default=180.0)
-        context["canopy_cover_percent"] = self._sample_raster(
+        # Sample canopy cover and clamp to valid range (0-100%)
+        canopy_value = self._sample_raster(
             self.canopy, lon, lat, default=30.0
         )
+        # Clamp to valid percentage range (0-100%)
+        context["canopy_cover_percent"] = max(0.0, min(100.0, canopy_value))
         
         # Land cover type
         landcover_code = self._sample_raster(self.landcover, lon, lat, default=0)
@@ -312,8 +322,17 @@ class DataContextBuilder:
             return default
         
         try:
-            # Convert lon/lat to raster coordinates
-            row, col = raster.index(lon, lat)
+            # Handle CRS transformation if needed
+            # If raster is not in WGS84, transform coordinates
+            if raster.crs and not raster.crs.is_geographic:
+                # Raster is in projected CRS, need to transform lat/lon
+                from pyproj import Transformer
+                transformer = Transformer.from_crs("EPSG:4326", raster.crs, always_xy=True)
+                x, y = transformer.transform(lon, lat)
+                row, col = raster.index(x, y)
+            else:
+                # Raster is in geographic CRS (WGS84), use directly
+                row, col = raster.index(lon, lat)
             
             # Read value
             window = rasterio.windows.Window(col, row, 1, 1)
@@ -322,29 +341,80 @@ class DataContextBuilder:
             value = float(data[0, 0])
             
             # Check for nodata
-            if value == raster.nodata or np.isnan(value):
+            if raster.nodata is not None and (value == raster.nodata or np.isnan(value)):
                 return default
             
             return value
         except Exception as e:
+            logger.debug(f"Error sampling raster at ({lon}, {lat}): {e}")
             return default
     
     def _calculate_water_metrics(self, point: Point) -> Tuple[float, float]:
-        """Calculate distance to water and reliability"""
-        from shapely.ops import nearest_points
+        """Calculate distance to water and reliability using spatial index for efficiency"""
+        import geopandas as gpd
+        import pandas as pd
         
-        # Find nearest water source
-        nearest_geom = nearest_points(point, self.water_sources.unary_union)[1]
-        distance_m = point.distance(nearest_geom) * 111139  # degrees to meters (approx)
-        distance_mi = distance_m / 1609.34
+        # Ensure water_sources has a CRS (should be EPSG:4326)
+        if self.water_sources.crs is None:
+            self.water_sources.set_crs('EPSG:4326', inplace=True)
+        
+        # Use cached projected version for efficient distance calculations
+        utm_crs = 'EPSG:32612'
+        point_gdf = gpd.GeoDataFrame([1], geometry=[point], crs='EPSG:4326')
+        point_gdf_proj = point_gdf.to_crs(utm_crs)
+        point_proj = point_gdf_proj.geometry.iloc[0]
+        
+        try:
+            # Use sjoin_nearest in projected CRS (no warnings, accurate distances)
+            nearest = gpd.sjoin_nearest(
+                point_gdf_proj,
+                self.water_sources_proj,
+                how='left',
+                max_distance=100000,  # 100 km max in meters
+                distance_col='distance_m'
+            )
+            
+            if len(nearest) == 0 or pd.isna(nearest.iloc[0].get('index_right')):
+                # No water source found within max_distance
+                return 10.0, 0.5  # Default: 10 miles, medium reliability
+            
+            # Get the nearest water source (use original index from projected dataframe)
+            nearest_idx = int(nearest.iloc[0]['index_right'])
+            nearest_feature = self.water_sources.iloc[nearest_idx]
+            
+            # Distance is already in meters from sjoin_nearest
+            distance_m = nearest.iloc[0].get('distance_m', point_proj.distance(self.water_sources_proj.iloc[nearest_idx].geometry))
+            distance_mi = distance_m / 1609.34
+            
+        except (AttributeError, TypeError, KeyError):
+            # Fallback: use spatial index directly
+            if not hasattr(self.water_sources_proj, 'sindex') or self.water_sources_proj.sindex is None:
+                self.water_sources_proj.sindex  # Build spatial index if needed
+            
+            # Find nearest using spatial index
+            possible_matches_index = list(self.water_sources_proj.sindex.nearest(
+                point_proj.bounds, num_results=1
+            ))
+            
+            if len(possible_matches_index) == 0:
+                return 10.0, 0.5  # Default
+            
+            # Get the nearest feature
+            nearest_idx = possible_matches_index[0]
+            nearest_feature = self.water_sources.iloc[nearest_idx]
+            nearest_geom_proj = self.water_sources_proj.iloc[nearest_idx].geometry
+            
+            # Calculate distance in projected CRS (meters)
+            distance_m = point_proj.distance(nearest_geom_proj)
+            distance_mi = distance_m / 1609.34
         
         # Get water source attributes
-        nearest_feature = self.water_sources[
-            self.water_sources.geometry == nearest_geom
-        ].iloc[0]
+        water_type = nearest_feature.get("water_type", nearest_feature.get("type", "stream"))
+        if pd.notna(water_type):
+            water_type = str(water_type).lower()
+        else:
+            water_type = "stream"
         
-        # Reliability: 1.0 for springs/lakes, 0.7 for streams, 0.4 for ephemeral
-        water_type = nearest_feature.get("type", "stream").lower()
         reliability_map = {
             "spring": 1.0,
             "lake": 1.0,
@@ -358,12 +428,62 @@ class DataContextBuilder:
         return distance_mi, reliability
     
     def _calculate_distance_to_nearest(self, point: Point, features) -> float:
-        """Calculate distance to nearest feature in miles"""
-        from shapely.ops import nearest_points
+        """Calculate distance to nearest feature in miles using spatial index"""
+        import geopandas as gpd
+        import pandas as pd
         
-        nearest_geom = nearest_points(point, features.unary_union)[1]
-        distance_m = point.distance(nearest_geom) * 111139
-        distance_mi = distance_m / 1609.34
+        # Ensure features have a CRS
+        if features.crs is None:
+            features.set_crs('EPSG:4326', inplace=True)
+        
+        # Convert to projected CRS (UTM Zone 12N for Wyoming) for accurate distance calculations
+        utm_crs = 'EPSG:32612'
+        features_proj = features.to_crs(utm_crs)
+        point_gdf = gpd.GeoDataFrame([1], geometry=[point], crs='EPSG:4326')
+        point_gdf_proj = point_gdf.to_crs(utm_crs)
+        point_proj = point_gdf_proj.geometry.iloc[0]
+        
+        try:
+            # Use sjoin_nearest in projected CRS (no warnings, accurate distances)
+            nearest = gpd.sjoin_nearest(
+                point_gdf_proj,
+                features_proj,
+                how='left',
+                max_distance=100000,  # 100 km max in meters
+                distance_col='distance_m'
+            )
+            
+            if len(nearest) == 0 or pd.isna(nearest.iloc[0].get('index_right')):
+                # No feature found within max_distance
+                return 10.0  # Default: 10 miles
+            
+            # Get the nearest feature
+            nearest_idx = int(nearest.iloc[0]['index_right'])
+            
+            # Distance is already in meters from sjoin_nearest
+            distance_m = nearest.iloc[0].get('distance_m', point_proj.distance(features_proj.iloc[nearest_idx].geometry))
+            distance_mi = distance_m / 1609.34
+            
+        except (AttributeError, TypeError, KeyError):
+            # Fallback: use spatial index directly
+            if not hasattr(features_proj, 'sindex') or features_proj.sindex is None:
+                features_proj.sindex  # Build spatial index if needed
+            
+            # Find nearest using spatial index
+            possible_matches_index = list(features_proj.sindex.nearest(
+                point_proj.bounds, num_results=1
+            ))
+            
+            if len(possible_matches_index) == 0:
+                return 10.0  # Default
+            
+            # Get the nearest feature
+            nearest_idx = possible_matches_index[0]
+            nearest_geom_proj = features_proj.iloc[nearest_idx].geometry
+            
+            # Calculate distance in projected CRS (meters)
+            distance_m = point_proj.distance(nearest_geom_proj)
+            distance_mi = distance_m / 1609.34
         
         return distance_mi
     
@@ -388,7 +508,11 @@ class DataContextBuilder:
             from rasterio.mask import mask as rio_mask
             
             geom = [buffered.__geo_interface__]
-            slope_data, _ = rio_mask(self.slope, geom, crop=True)
+            # Suppress NotGeoreferencedWarning for this operation (non-critical)
+            with warnings.catch_warnings():
+                if RASTERIO_AVAILABLE:
+                    warnings.filterwarnings('ignore', category=rasterio.errors.NotGeoreferencedWarning)
+                slope_data, _ = rio_mask(self.slope, geom, crop=True)
             
             # Calculate % meeting security criteria
             steep_pixels = np.sum(slope_data > 40)
