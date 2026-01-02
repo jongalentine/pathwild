@@ -46,6 +46,25 @@ pip install -r requirements.txt
 
 **Note:** Geospatial packages (rasterio, geopandas) have binary dependencies (GDAL). Conda is recommended as it handles these dependencies automatically.
 
+### Run Automated Data Pipeline
+
+Process raw elk GPS collar data into training-ready datasets:
+
+```bash
+# Process all datasets end-to-end
+python scripts/run_data_pipeline.py
+
+# Process specific dataset
+python scripts/run_data_pipeline.py --dataset north_bighorn
+
+# Skip already-complete steps
+python scripts/run_data_pipeline.py --skip-steps process_raw,generate_absence
+```
+
+**⚠️ Prerequisites:** Before running the pipeline, ensure all required environmental data files are present. The pipeline will automatically check prerequisites and fail fast if required files are missing. See [Environmental Data Prerequisites Guide](./docs/environmental_data_prerequisites.md) for detailed instructions.
+
+See [Automated Data Pipeline Documentation](./docs/automated_data_pipeline.md) for details.
+
 ### Run Jupyter Lab
 ```bash
 jupyter lab
