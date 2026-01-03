@@ -235,6 +235,12 @@ def main():
         default=None,
         help='Number of parallel processes (default: auto-detect, max 8)'
     )
+    parser.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='Limit number of presence points to process (for testing). Reduces absence generation accordingly.'
+    )
     
     args = parser.parse_args()
     
@@ -253,6 +259,13 @@ def main():
         return 1
     
     presence_df = pd.read_csv(presence_file)
+    
+    # Limit presence data if --limit is set (for testing)
+    if args.limit is not None:
+        original_count = len(presence_df)
+        presence_df = presence_df.head(args.limit)
+        logger.info(f"⚠️  TEST MODE: Limited presence data from {original_count:,} to {len(presence_df):,} points")
+    
     logger.info(f"Loaded {len(presence_df):,} presence points")
     
     # Create GeoDataFrame

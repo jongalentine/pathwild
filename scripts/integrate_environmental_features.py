@@ -7,6 +7,10 @@ from DEM, water sources, land cover, etc. It replaces placeholder values
 with actual data from environmental datasets.
 
 Usage:
+    # First, activate the conda environment:
+    conda activate pathwild
+    
+    # Then run the script:
     python scripts/integrate_environmental_features.py [dataset_path] [--workers N] [--batch-size N] [--limit N]
     
 Examples:
@@ -28,10 +32,22 @@ Examples:
 
 import argparse
 import logging
-import pandas as pd
-from pathlib import Path
 import sys
 import os
+
+# Check for required dependencies early with helpful error message
+try:
+    import pandas as pd
+except ImportError:
+    print("ERROR: pandas is not installed.", file=sys.stderr)
+    print("\nThis script requires the 'pathwild' conda environment.", file=sys.stderr)
+    print("Please activate it first:", file=sys.stderr)
+    print("  conda activate pathwild", file=sys.stderr)
+    print("\nOr install pandas in your current environment:", file=sys.stderr)
+    print("  pip install pandas", file=sys.stderr)
+    sys.exit(1)
+
+from pathlib import Path
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing
@@ -69,6 +85,7 @@ logger = logging.getLogger(__name__)
 
 # Placeholder values that indicate data needs to be replaced
 PLACEHOLDER_VALUES = {
+    # Static features
     'elevation': 8500.0,
     'slope_degrees': 15.0,
     'aspect_degrees': 180.0,
@@ -78,13 +95,27 @@ PLACEHOLDER_VALUES = {
     'land_cover_code': 0,
     'road_distance_miles': 10.0,
     'trail_distance_miles': 10.0,
-    'security_habitat_percent': 0.5
+    'security_habitat_percent': 0.5,
+    # Temporal features (SNOTEL, weather, satellite)
+    'snow_depth_inches': 0.0,  # Will be replaced with real SNOTEL data
+    'snow_water_equiv_inches': 0.0,
+    'snow_crust_detected': False,
+    'temperature_f': 45.0,
+    'precip_last_7_days_inches': 0.0,
+    'cloud_cover_percent': 20,
+    'ndvi': 0.5,
+    'ndvi_age_days': 8,
+    'irg': 0.0,
+    'summer_integrated_ndvi': 0.0
 }
 
 
 def has_placeholder_values(row, env_columns, tolerance: float = 0.01) -> bool:
     """
     Check if a row contains placeholder values or missing data.
+    
+    Data quality tracking columns (snow_data_source, snow_station_name, etc.)
+    are excluded from placeholder detection as they're metadata, not features.
     
     Args:
         row: pandas Series representing a row
@@ -96,7 +127,14 @@ def has_placeholder_values(row, env_columns, tolerance: float = 0.01) -> bool:
     """
     import numpy as np
     
+    # Columns that are metadata/data quality tracking, not features with placeholders
+    metadata_columns = {'snow_data_source', 'snow_station_name', 'snow_station_distance_km'}
+    
     for col in env_columns:
+        # Skip metadata columns - they don't have placeholder values
+        if col in metadata_columns:
+            continue
+        
         # Check if column is missing
         if col not in row.index:
             return True
@@ -242,13 +280,19 @@ def _process_sequential(df, builder, date_col, batch_size, limit, dataset_path, 
     error_count = 0
     skipped_count = 0
     
-    # Define environmental columns
+    # Define environmental columns (static + temporal)
     env_columns = [
+        # Static features (terrain, infrastructure, etc.)
         'elevation', 'slope_degrees', 'aspect_degrees',
         'canopy_cover_percent', 'land_cover_code', 'land_cover_type',
         'water_distance_miles', 'water_reliability',
         'road_distance_miles', 'trail_distance_miles',
-        'security_habitat_percent'
+        'security_habitat_percent',
+        # Temporal features (SNOTEL, weather, satellite)
+        'snow_depth_inches', 'snow_water_equiv_inches', 'snow_crust_detected',
+        'snow_data_source', 'snow_station_name', 'snow_station_distance_km',  # Data quality tracking
+        'temperature_f', 'precip_last_7_days_inches', 'cloud_cover_percent',
+        'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi'
     ]
     
     # Filter rows if not forcing (only process rows with placeholders)
@@ -289,13 +333,32 @@ def _process_sequential(df, builder, date_col, batch_size, limit, dataset_path, 
                 date=date_str
             )
             
-            # Update environmental columns
+            # Extract year and month from date_str for absence rows that don't have them
+            # This ensures temporal metadata is populated for all rows
+            try:
+                from datetime import datetime
+                date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+                if 'year' in df.columns and pd.isna(row.get('year')):
+                    df.at[idx, 'year'] = date_obj.year
+                if 'month' in df.columns and pd.isna(row.get('month')):
+                    df.at[idx, 'month'] = date_obj.month
+            except (ValueError, TypeError):
+                # If date parsing fails, leave year/month as is
+                pass
+            
+            # Update environmental columns (static + temporal)
             env_columns = [
+                # Static features (terrain, infrastructure, etc.)
                 'elevation', 'slope_degrees', 'aspect_degrees',
                 'canopy_cover_percent', 'land_cover_code', 'land_cover_type',
                 'water_distance_miles', 'water_reliability',
                 'road_distance_miles', 'trail_distance_miles',
-                'security_habitat_percent'
+                'security_habitat_percent',
+                # Temporal features (SNOTEL, weather, satellite)
+                'snow_depth_inches', 'snow_water_equiv_inches', 'snow_crust_detected',
+                'snow_data_source', 'snow_station_name', 'snow_station_distance_km',  # Data quality tracking
+                'temperature_f', 'precip_last_7_days_inches', 'cloud_cover_percent',
+                'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi'
             ]
             
             for col in env_columns:
@@ -329,13 +392,19 @@ def _process_sequential(df, builder, date_col, batch_size, limit, dataset_path, 
 
 def _process_parallel(df, data_dir, date_col, batch_size, limit, dataset_path, n_workers, force: bool = False):
     """Process rows in parallel using multiprocessing"""
-    # Define environmental columns
+    # Define environmental columns (static + temporal)
     env_columns = [
+        # Static features (terrain, infrastructure, etc.)
         'elevation', 'slope_degrees', 'aspect_degrees',
         'canopy_cover_percent', 'land_cover_code', 'land_cover_type',
         'water_distance_miles', 'water_reliability',
         'road_distance_miles', 'trail_distance_miles',
-        'security_habitat_percent'
+        'security_habitat_percent',
+        # Temporal features (SNOTEL, weather, satellite)
+        'snow_depth_inches', 'snow_water_equiv_inches', 'snow_crust_detected',
+        'snow_data_source', 'snow_station_name', 'snow_station_distance_km',  # Data quality tracking
+        'temperature_f', 'precip_last_7_days_inches', 'cloud_cover_percent',
+        'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi'
     ]
     
     # Filter rows if not forcing (only process rows with placeholders)
@@ -373,11 +442,17 @@ def _process_parallel(df, data_dir, date_col, batch_size, limit, dataset_path, n
     
     # Process batches in parallel
     env_columns = [
+        # Static features (terrain, infrastructure, etc.)
         'elevation', 'slope_degrees', 'aspect_degrees',
         'canopy_cover_percent', 'land_cover_code', 'land_cover_type',
         'water_distance_miles', 'water_reliability',
         'road_distance_miles', 'trail_distance_miles',
-        'security_habitat_percent'
+        'security_habitat_percent',
+        # Temporal features (SNOTEL, weather, satellite)
+        'snow_depth_inches', 'snow_water_equiv_inches', 'snow_crust_detected',
+        'snow_data_source', 'snow_station_name', 'snow_station_distance_km',  # Data quality tracking
+        'temperature_f', 'precip_last_7_days_inches', 'cloud_cover_percent',
+        'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi'
     ]
     
     # Initialize columns if needed
@@ -428,6 +503,15 @@ def _process_parallel(df, data_dir, date_col, batch_size, limit, dataset_path, n
                     if context is None:
                         error_count += 1
                     else:
+                        # Update year and month if they were extracted from date
+                        if '_year' in context and context['_year'] is not None:
+                            if 'year' in df.columns and pd.isna(df.at[idx, 'year']):
+                                df.at[idx, 'year'] = context['_year']
+                        if '_month' in context and context['_month'] is not None:
+                            if 'month' in df.columns and pd.isna(df.at[idx, 'month']):
+                                df.at[idx, 'month'] = context['_month']
+                        
+                        # Update environmental columns
                         for col in env_columns:
                             if col in context:
                                 df.at[idx, col] = context[col]
@@ -512,6 +596,18 @@ def process_batch(args):
                 location={"lat": lat, "lon": lon},
                 date=date_str
             )
+            
+            # Extract year and month from date_str and add to context
+            # This will be used to update year/month columns for absence rows
+            try:
+                from datetime import datetime
+                date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+                context['_year'] = date_obj.year
+                context['_month'] = date_obj.month
+            except (ValueError, TypeError):
+                # If date parsing fails, leave year/month as is
+                context['_year'] = None
+                context['_month'] = None
             
             results.append((idx, context))
             processed += 1

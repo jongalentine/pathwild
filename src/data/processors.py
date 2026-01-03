@@ -35,7 +35,7 @@ class DataContextBuilder:
         self._load_static_layers()
         
         # Initialize data loaders
-        self.snotel_client = SNOTELClient()
+        self.snotel_client = SNOTELClient(self.data_dir)
         self.weather_client = WeatherClient()
         self.satellite_client = SatelliteClient()
     
@@ -212,7 +212,51 @@ class DataContextBuilder:
         context = {}
         
         # --- STATIC TERRAIN DATA ---
-        context["elevation"] = self._sample_raster(self.dem, lon, lat, default=8500.0)
+        elevation = self._sample_raster(self.dem, lon, lat, default=8500.0)
+        context["elevation"] = elevation
+        
+        # Warn if using placeholder elevation (indicates potential DEM boundary issue)
+        if elevation == 8500.0:
+            # Check if location is at/near Wyoming DEM boundaries
+            # Wyoming boundaries: approximately 41-45°N, 104-111°W
+            wyoming_bounds = {
+                'north': 45.0,
+                'south': 41.0,
+                'east': -104.0,
+                'west': -111.0
+            }
+            boundary_issues = []
+            
+            # Check if near boundaries (within 0.1 degrees)
+            tolerance = 0.1
+            if lat > wyoming_bounds['north'] - tolerance:
+                boundary_issues.append(f"near northern boundary ({wyoming_bounds['north']}°N)")
+            if lat < wyoming_bounds['south'] + tolerance:
+                boundary_issues.append(f"near southern boundary ({wyoming_bounds['south']}°N)")
+            if lon < wyoming_bounds['west'] + tolerance:
+                boundary_issues.append(f"near western boundary ({wyoming_bounds['west']}°W)")
+            if lon > wyoming_bounds['east'] - tolerance:
+                boundary_issues.append(f"near eastern boundary ({wyoming_bounds['east']}°W)")
+            
+            # Check if outside Wyoming bounds
+            outside_bounds = (
+                lat > wyoming_bounds['north'] or
+                lat < wyoming_bounds['south'] or
+                lon < wyoming_bounds['west'] or
+                lon > wyoming_bounds['east']
+            )
+            
+            # Build warning message
+            warning_msg = f"Using default elevation (8500 ft) for location ({lat:.6f}, {lon:.6f})"
+            if outside_bounds:
+                warning_msg += f" - LOCATION IS OUTSIDE WYOMING BOUNDS"
+            elif boundary_issues:
+                warning_msg += f" - Location is {', '.join(boundary_issues)}"
+            else:
+                warning_msg += " - DEM sampling failed (may be outside DEM bounds or DEM file issue)"
+            
+            logger.warning(warning_msg)
+        
         context["slope_degrees"] = self._sample_raster(self.slope, lon, lat, default=15.0)
         context["aspect_degrees"] = self._sample_raster(self.aspect, lon, lat, default=180.0)
         # Sample canopy cover and clamp to valid range (0-100%)
@@ -275,11 +319,18 @@ class DataContextBuilder:
         # --- TEMPORAL DATA (depends on date) ---
         dt = datetime.fromisoformat(date)
         
-        # Snow data
-        snow_data = self.snotel_client.get_snow_data(lat, lon, dt)
+        # Snow data - pass elevation for better estimation if no station nearby
+        location_elevation = context.get("elevation", None)
+        snow_data = self.snotel_client.get_snow_data(lat, lon, dt, elevation_ft=location_elevation)
         context["snow_depth_inches"] = snow_data.get("depth", 0.0)
         context["snow_water_equiv_inches"] = snow_data.get("swe", 0.0)
         context["snow_crust_detected"] = snow_data.get("crust", False)
+        
+        # Data quality tracking: indicate whether data is real SNOTEL or estimate
+        snow_station = snow_data.get("station")
+        context["snow_data_source"] = "snotel" if snow_station else "estimate"
+        context["snow_station_name"] = snow_station
+        context["snow_station_distance_km"] = snow_data.get("station_distance_km", None)
         
         # Weather data
         weather = self.weather_client.get_weather(lat, lon, dt)
@@ -561,74 +612,300 @@ class DataContextBuilder:
 
 
 class SNOTELClient:
-    """Client for accessing SNOTEL snow data"""
+    """Client for accessing SNOTEL snow data using snotelr R package"""
     
-    def __init__(self):
-        self.base_url = "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data"
-        self.cache = {}
+    def __init__(self, data_dir: Optional[Path] = None):
+        self.data_dir = Path(data_dir) if data_dir else Path("data")
+        self.cache_dir = self.data_dir / "cache"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.station_cache_path = self.cache_dir / "snotel_stations_wyoming.geojson"
+        self._stations_gdf = None
+        self._load_stations()
+        
+        # Two-level caching:
+        # 1. Station data cache: station_id -> full DataFrame from snotelr (entire historical record)
+        #    This avoids re-downloading the same station data for multiple locations/dates
+        #    snotel_download() returns all historical data, so we cache by station ID only
+        # 2. Request cache: (lat, lon, date) -> final result dict
+        #    This provides fast lookup for exact same location/date queries
+        self.station_data_cache = {}  # Cache full station downloads: {site_id: DataFrame}
+        self.request_cache = {}  # Cache final results: {(lat, lon, date_str): result_dict}
+        
+        self._r_initialized = False
+        self._init_r_snotelr()
     
-    def get_snow_data(self, lat: float, lon: float, date: datetime) -> Dict:
-        """Get snow data for location and date"""
+    def _init_r_snotelr(self):
+        """Initialize R and load snotelr package"""
+        try:
+            import rpy2.robjects as ro  # type: ignore
+            from rpy2.robjects.packages import importr  # type: ignore
+            
+            # Initialize R
+            if not self._r_initialized:
+                # Try to import snotelr
+                try:
+                    self.snotelr = importr('snotelr')
+                    self.ro = ro
+                    self._r_initialized = True
+                    logger.info("snotelr R package initialized successfully")
+                except Exception as e:
+                    logger.warning(f"Could not load snotelr R package: {e}")
+                    logger.info("Install with: R -e \"install.packages('snotelr', repos='https://cloud.r-project.org')\"")
+                    self.snotelr = None
+                    self.ro = None
+        except ImportError:
+            logger.warning("rpy2 not available. Install with: pip install rpy2")
+            logger.info("Or use conda: conda install -c conda-forge rpy2")
+            self.snotelr = None
+            self.ro = None
+            self._r_initialized = False
+    
+    def _load_stations(self):
+        """Load SNOTEL station locations"""
+        import geopandas as gpd
+        from shapely.geometry import Point
+        
+        if self.station_cache_path.exists():
+            try:
+                self._stations_gdf = gpd.read_file(self.station_cache_path)
+                logger.info(f"Loaded {len(self._stations_gdf)} SNOTEL stations")
+            except Exception as e:
+                logger.warning(f"Error loading stations: {e}")
+                self._stations_gdf = None
+        else:
+            logger.warning(f"SNOTEL stations file not found: {self.station_cache_path}")
+            logger.info("Run scripts/download_snotel_stations_manual.py to download stations")
+            self._stations_gdf = None
+    
+    def _find_nearest_station(self, lat: float, lon: float, max_distance_km: float = 100.0):
+        """
+        Find nearest SNOTEL station to location.
+        
+        Prioritizes mapped stations (those with snotelr_site_id) over unmapped ones.
+        If multiple mapped stations are within range, returns the closest one.
+        Only returns unmapped stations if no mapped stations are available.
+        
+        Args:
+            lat: Latitude
+            lon: Longitude
+            max_distance_km: Maximum distance to search (default: 100 km to allow finding mapped stations)
+        
+        Returns:
+            Dictionary with station info, or None if no station within range
+        """
+        if self._stations_gdf is None:
+            return None
+        
+        from shapely.geometry import Point
+        import geopandas as gpd
+        import pandas as pd
+        
+        point = Point(lon, lat)
+        point_gdf = gpd.GeoDataFrame([1], geometry=[point], crs="EPSG:4326")
+        
+        # Convert to UTM for distance calculation (Wyoming is in UTM Zone 12N)
+        stations_utm = self._stations_gdf.to_crs("EPSG:32612").copy()
+        point_utm = point_gdf.to_crs("EPSG:32612")
+        
+        # Calculate distances to all stations
+        stations_utm['distance_m'] = stations_utm.geometry.distance(point_utm.geometry.iloc[0])
+        stations_utm['distance_km'] = stations_utm['distance_m'] / 1000.0
+        
+        # Filter to stations within max distance
+        within_range = stations_utm[stations_utm['distance_km'] <= max_distance_km].copy()
+        
+        if len(within_range) == 0:
+            return None
+        
+        # Prioritize mapped stations (those with snotelr_site_id)
+        mapped_stations = within_range[within_range['snotelr_site_id'].notna()]
+        
+        if len(mapped_stations) > 0:
+            # Use nearest mapped station
+            nearest_mapped = mapped_stations.nsmallest(1, 'distance_km').iloc[0]
+            station = self._stations_gdf.iloc[nearest_mapped.name]  # Use original index
+            distance_km = nearest_mapped['distance_km']
+        else:
+            # No mapped stations available, use nearest unmapped station
+            # (will fall back to elevation estimate anyway)
+            nearest_unmapped = within_range.nsmallest(1, 'distance_km').iloc[0]
+            station = self._stations_gdf.iloc[nearest_unmapped.name]
+            distance_km = nearest_unmapped['distance_km']
+            logger.debug(f"Using unmapped station {station['name']} (no mapped stations within {max_distance_km} km)")
+        
+        return {
+            "triplet": station["triplet"],
+            "name": station["name"],
+            "lat": station["lat"],
+            "lon": station["lon"],
+            "elevation_ft": station.get("elevation_ft", 0),
+            "distance_km": distance_km,
+            "snotelr_site_id": station.get("snotelr_site_id")  # May be None if not mapped
+        }
+    
+    def get_snow_data(self, lat: float, lon: float, date: datetime, elevation_ft: Optional[float] = None) -> Dict:
+        """
+        Get snow data for location and date.
+        
+        Args:
+            lat: Latitude
+            lon: Longitude  
+            date: Date for snow data
+            elevation_ft: Optional elevation in feet (from DEM). If provided, used for
+                         better elevation-based estimation when no station is nearby.
+        """
+        import pandas as pd  # Import at function level for use throughout
+        
+        # Check request cache first (fast path for exact same location/date)
+        cache_key = f"{lat:.4f},{lon:.4f},{date.strftime('%Y-%m-%d')}"
+        if cache_key in self.request_cache:
+            logger.debug(f"Cache hit for location ({lat:.4f}, {lon:.4f}) on {date.strftime('%Y-%m-%d')}")
+            return self.request_cache[cache_key]
         
         # Find nearest SNOTEL station
         station = self._find_nearest_station(lat, lon)
         
         if station is None:
-            # No station nearby, use model or defaults
-            return self._estimate_snow_from_elevation(lat, lon, date)
+            # No station nearby, use elevation-based estimate
+            result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
+            self.request_cache[cache_key] = result
+            return result
         
-        # Fetch data from SNOTEL API
+        # Fetch data using snotelr R package
+        if self.snotelr is None:
+            logger.warning("snotelr not available, using elevation estimate")
+            return self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
+        
         try:
-            params = {
-                "stationTriplets": station["triplet"],
-                "elementCd": "SNWD,WTEQ",  # Snow depth, SWE
-                "ordinal": 1,
-                "duration": "DAILY",
-                "getFlags": False,
-                "beginDate": date.strftime("%Y-%m-%d"),
-                "endDate": date.strftime("%Y-%m-%d")
-            }
+            # Get snotelr site_id from mapped station data
+            snotelr_site_id = station.get("snotelr_site_id")
             
-            response = requests.get(self.base_url, params=params)
-            data = response.json()
+            if snotelr_site_id is None or pd.isna(snotelr_site_id):
+                # Station not mapped to snotelr site_id
+                logger.warning(f"Station {station['name']} has no snotelr site_id mapping")
+                logger.info("Run scripts/map_snotel_station_ids.py to create mapping")
+                # Fall back to elevation estimate with available elevation
+                return self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
             
-            snow_depth = 0.0
-            swe = 0.0
+            snotelr_site_id = int(snotelr_site_id)
             
-            for item in data:
-                if item["elementCd"] == "SNWD":
-                    snow_depth = item.get("value", 0.0)
-                elif item["elementCd"] == "WTEQ":
-                    swe = item.get("value", 0.0)
+            # Convert date to R Date format
+            date_str = date.strftime("%Y-%m-%d")
+            
+            # Check station data cache first - this is the key optimization!
+            # snotel_download() returns the ENTIRE historical record for a station,
+            # so we cache by station ID only (not station + date)
+            # Multiple locations can use the same station, so we only download once per station
+            station_cache_key = snotelr_site_id
+            
+            if station_cache_key in self.station_data_cache:
+                # Use cached station data - no download needed!
+                logger.debug(f"Using cached data for station {station['name']} (site_id {snotelr_site_id})")
+                df = self.station_data_cache[station_cache_key]
+            else:
+                # Need to download station data
+                logger.debug(f"Downloading historical data for station {station['name']} (site_id {snotelr_site_id})")
+                
+                # Get the download function
+                snotel_download = self.snotelr.snotel_download
+                
+                # Call snotelr::snotel_download() with mapped site_id
+                # This downloads the entire historical record for the station (one time per station)
+                r_data = snotel_download(snotelr_site_id, internal=True)
+                
+                # Convert R data frame to pandas using new rpy2 API
+                from rpy2.robjects import pandas2ri  # type: ignore
+                from rpy2.robjects.conversion import localconverter  # type: ignore
+                
+                # Use context manager instead of activate/deactivate
+                with localconverter(pandas2ri.converter):
+                    df = pandas2ri.rpy2py(r_data)
+                
+                # Convert date column
+                df['date'] = pd.to_datetime(df['date'])
+                
+                # Cache the full station dataframe - this is the key optimization!
+                # Now any other location/date querying this same station can reuse the data
+                self.station_data_cache[station_cache_key] = df
+                logger.debug(f"Cached full station data for {station['name']} (site_id {snotelr_site_id}) - {len(df)} records covering {df['date'].min()} to {df['date'].max()}")
+            
+            # Filter to the specific date from cached dataframe
+            date_data = df[df['date'].dt.date == date.date()]
+            
+            if len(date_data) == 0:
+                # No data for this exact date, try to get closest date
+                logger.debug(f"No data for {date_str}, using closest available date")
+                # Get data within ±7 days
+                date_range = pd.date_range(date - timedelta(days=7), date + timedelta(days=7))
+                date_data = df[df['date'].isin(date_range)]
+                if len(date_data) > 0:
+                    # Use closest date
+                    date_data = date_data.iloc[[(date_data['date'] - pd.Timestamp(date)).abs().idxmin()]]
+            
+            if len(date_data) == 0:
+                logger.warning(f"No SNOTEL data available for station {station['name']} (site_id {snotelr_site_id}) near {date_str}")
+                return self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
+            
+            # Extract snow depth and SWE
+            # snotelr column names: snow_water_equivalent (SWE in mm), snow_depth (in mm)
+            row = date_data.iloc[0]
+            
+            # Convert from mm to inches
+            swe_mm = row.get('snow_water_equivalent', 0)
+            if pd.isna(swe_mm):
+                swe_mm = 0
+            swe = float(swe_mm) / 25.4  # mm to inches
+            
+            # Snow depth (if available)
+            snow_depth_mm = row.get('snow_depth', None)
+            if snow_depth_mm is not None and not pd.isna(snow_depth_mm):
+                snow_depth = float(snow_depth_mm) / 25.4  # mm to inches
+            else:
+                # Estimate snow depth from SWE (typical density ~0.25)
+                snow_depth = swe / 0.25 if swe > 0 else 0.0
             
             # Detect crusting (SWE high relative to depth)
             density = swe / snow_depth if snow_depth > 0 else 0
             crust_detected = density > 0.35  # High density = crust
             
-            return {
-                "depth": snow_depth,
-                "swe": swe,
+            result = {
+                "depth": float(snow_depth),
+                "swe": float(swe),
                 "crust": crust_detected,
-                "station": station["name"]
+                "station": station["name"],
+                "station_distance_km": station["distance_km"]
             }
+            
+            # Cache result for this specific location/date (fast lookup)
+            self.request_cache[cache_key] = result
+            return result
         
         except Exception as e:
-            print(f"SNOTEL fetch error: {e}")
-            return self._estimate_snow_from_elevation(lat, lon, date)
-    
-    def _find_nearest_station(self, lat: float, lon: float):
-        """Find nearest SNOTEL station"""
-        # Simplified - in production, query station database
-        # For now, return None to use estimates
-        return None
+            logger.warning(f"Error retrieving SNOTEL data via snotelr: {e}, using elevation estimate")
+            import traceback
+            logger.debug(traceback.format_exc())
+            # Pass elevation if available for better estimation
+            return self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
     
     def _estimate_snow_from_elevation(self, lat: float, lon: float, 
-                                     date: datetime) -> Dict:
-        """Estimate snow based on elevation and date"""
-        # Placeholder - simple elevation-based model
-        # In production: use snow reanalysis products (SNODAS, etc.)
+                                     date: datetime, elevation_ft: Optional[float] = None) -> Dict:
+        """
+        Estimate snow based on elevation and date (fallback).
         
-        elevation = 8500  # Default
+        Args:
+            lat: Latitude
+            lon: Longitude
+            date: Date for estimation
+            elevation_ft: Optional elevation in feet. If None, attempts to sample from DEM,
+                         otherwise defaults to 8500 ft.
+        """
+        # Use provided elevation, or try to sample from DEM, or use default
+        if elevation_ft is not None:
+            elevation = elevation_ft
+        else:
+            # Try to sample from DEM if available
+            elevation = self._get_elevation_from_dem(lat, lon)
+        
         month = date.month
         
         # Simple heuristic
@@ -644,8 +921,52 @@ class SNOTELClient:
         return {
             "depth": snow_depth,
             "swe": snow_depth * 0.25,
-            "crust": False
+            "crust": False,
+            "station": None
         }
+    
+    def _get_elevation_from_dem(self, lat: float, lon: float) -> float:
+        """
+        Attempt to get elevation from DEM if available.
+        
+        Falls back to default elevation if DEM not accessible.
+        """
+        try:
+            # Try to use DEM if available in data_dir
+            dem_path = self.data_dir / "dem" / "wyoming_dem.tif"
+            if dem_path.exists():
+                try:
+                    import rasterio
+                    from rasterio.warp import transform_geom
+                    from shapely.geometry import Point, mapping
+                    
+                    # Sample DEM at location
+                    point = Point(lon, lat)
+                    geom = mapping(point)
+                    
+                    # Transform to DEM CRS if needed (assuming DEM is in UTM or similar)
+                    # For simplicity, assume DEM is in EPSG:4326 or can be sampled directly
+                    with rasterio.open(dem_path) as src:
+                        # Sample the point
+                        for val in src.sample([(lon, lat)]):
+                            if val[0] is not None and not (val[0] < -1000 or val[0] > 15000):
+                                # Convert meters to feet if needed
+                                # Assume DEM is in meters, convert to feet
+                                elevation_m = float(val[0])
+                                if elevation_m < 500:  # Likely in feet already
+                                    return elevation_m
+                                else:  # Likely in meters
+                                    return elevation_m * 3.28084  # meters to feet
+                except Exception as e:
+                    logger.debug(f"Could not sample DEM for elevation: {e}")
+                    pass
+            
+        except Exception as e:
+            logger.debug(f"Error accessing DEM for elevation: {e}")
+            pass
+        
+        # Default fallback
+        return 8500.0
 
 
 class WeatherClient:

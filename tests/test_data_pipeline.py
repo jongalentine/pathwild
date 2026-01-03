@@ -148,7 +148,8 @@ class TestDataPipeline:
             data_dir=data_dir,
             dataset_name='test_dataset',
             skip_steps=[],
-            force=False
+            force=False,
+            limit=None
         )
         
         # Patch script paths to point to temporary files to avoid overwriting real scripts
@@ -186,6 +187,49 @@ class TestDataPipeline:
         assert 'integrate_features' in step_names
         assert 'analyze_features' in step_names
         assert 'assess_readiness' in step_names
+    
+    def test_pipeline_with_limit_creates_test_files(self, tmp_path):
+        """Test that pipeline with limit creates test files."""
+        data_dir = tmp_path / "data"
+        processed_dir = data_dir / "processed"
+        features_dir = data_dir / "features"
+        processed_dir.mkdir(parents=True)
+        features_dir.mkdir(parents=True)
+        
+        pipeline = DataPipeline(
+            data_dir=data_dir,
+            dataset_name='test_dataset',
+            skip_steps=[],
+            force=False,
+            limit=50
+        )
+        
+        # Check that integrate_features step uses test output
+        integrate_step = next((s for s in pipeline.steps if s.name == 'integrate_features'), None)
+        assert integrate_step is not None
+        assert '--limit' in integrate_step.command_args
+        assert '50' in integrate_step.command_args
+        assert 'test' in str(integrate_step.expected_output) or '_test' in str(integrate_step.expected_output)
+        
+        # Check that analyze_features step uses test file
+        analyze_step = next((s for s in pipeline.steps if s.name == 'analyze_features'), None)
+        assert analyze_step is not None
+        assert 'test' in str(analyze_step.required_input) or '_test' in str(analyze_step.required_input)
+        
+        # Check that assess_readiness step uses test file when limit is set
+        assess_step = next((s for s in pipeline.steps if s.name == 'assess_readiness'), None)
+        assert assess_step is not None
+        assert '--dataset' in assess_step.command_args
+        # Should pass the test file path
+        test_file_arg_idx = assess_step.command_args.index('--dataset')
+        test_file_path = assess_step.command_args[test_file_arg_idx + 1]
+        assert 'test' in test_file_path or '_test' in test_file_path
+        
+        # Check that prepare_features step uses test files
+        prepare_step = next((s for s in pipeline.steps if s.name == 'prepare_features'), None)
+        assert prepare_step is not None
+        assert 'test' in str(prepare_step.required_input) or '_test' in str(prepare_step.required_input)
+        assert 'test' in str(prepare_step.expected_output) or '_test' in str(prepare_step.expected_output)
     
     @patch('subprocess.run')
     def test_pipeline_run_success(self, mock_run, pipeline):
@@ -249,7 +293,8 @@ class TestDataPipeline:
             data_dir=data_dir,
             dataset_name='test_dataset',
             skip_steps=[],
-            force=False
+            force=False,
+            limit=None
         )
         
         # Check that prepare_features step exists
@@ -277,7 +322,8 @@ class TestDataPipeline:
             data_dir=data_dir,
             dataset_name='test_dataset',
             skip_steps=[],
-            force=False
+            force=False,
+            limit=None
         )
         
         # Find prepare_features step
@@ -307,7 +353,8 @@ class TestDataPipeline:
             data_dir=data_dir,
             dataset_name=None,  # All datasets
             skip_steps=[],
-            force=False
+            force=False,
+            limit=None
         )
         
         # Find prepare_features step
@@ -329,7 +376,8 @@ class TestDataPipeline:
             data_dir=data_dir,
             dataset_name='test_dataset',
             skip_steps=['prepare_features'],
-            force=False
+            force=False,
+            limit=None
         )
         
         # Find prepare_features step
@@ -538,7 +586,8 @@ class TestEndToEndPipeline:
             data_dir=data_dir,
             dataset_name='test_dataset',
             skip_steps=[],
-            force=False
+            force=False,
+            limit=None
         )
         
         # Mock all script paths to exist
@@ -573,11 +622,44 @@ class TestEndToEndPipeline:
             data_dir=data_dir,
             dataset_name='nonexistent_dataset',
             skip_steps=[],
-            force=False
+            force=False,
+            limit=None
         )
         
         # Check that steps requiring missing inputs report can_run() as False
         for step in pipeline.steps:
             if step.required_input and not step.required_input.exists():
                 assert step.can_run() is False
-
+    
+    def test_pipeline_with_limit_parameter(self, tmp_path):
+        """Test that pipeline correctly handles limit parameter."""
+        data_dir = tmp_path / "data"
+        processed_dir = data_dir / "processed"
+        processed_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create pipeline with limit
+        pipeline = DataPipeline(
+            data_dir=data_dir,
+            dataset_name='test_dataset',
+            skip_steps=[],
+            force=False,
+            limit=100
+        )
+        
+        # Verify limit is stored
+        assert pipeline.limit == 100
+        
+        # Verify generate_absence step includes --limit
+        generate_absence_step = next((s for s in pipeline.steps if s.name == 'generate_absence'), None)
+        assert generate_absence_step is not None
+        assert '--limit' in generate_absence_step.command_args
+        assert '100' in generate_absence_step.command_args
+        
+        # Verify integrate_features step includes --limit
+        integrate_step = next((s for s in pipeline.steps if s.name == 'integrate_features'), None)
+        assert integrate_step is not None
+        assert '--limit' in integrate_step.command_args
+        assert '100' in integrate_step.command_args
+        
+        # Verify test files are used
+        assert 'test' in str(integrate_step.expected_output) or '_test' in str(integrate_step.expected_output)

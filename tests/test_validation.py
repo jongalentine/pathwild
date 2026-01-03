@@ -2,6 +2,7 @@ import pytest
 import numpy as np
 from src.inference.engine import ElkPredictionEngine
 from pathlib import Path
+from unittest.mock import patch
 
 class TestValidation:
     """Tests for validating predictions against known data"""
@@ -15,7 +16,9 @@ class TestValidation:
         for subdir in ["dem", "terrain", "landcover", "hydrology"]:
             (data_dir / subdir).mkdir()
         
-        return ElkPredictionEngine(str(data_dir))
+        # Mock SNOTELClient initialization to avoid rpy2 import issues
+        with patch('src.data.processors.SNOTELClient._init_r_snotelr'):
+            return ElkPredictionEngine(str(data_dir))
     
     def test_known_good_habitat_scores_high(self, engine):
         """Test that known good elk habitat scores highly"""

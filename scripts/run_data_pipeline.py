@@ -25,6 +25,9 @@ Examples:
     
     # Force regeneration of all features (even if placeholders don't exist)
     python scripts/run_data_pipeline.py --force
+    
+    # Test mode: Process only first 50 rows (creates test files)
+    python scripts/run_data_pipeline.py --dataset north_bighorn --limit 50
 """
 
 import argparse
@@ -140,12 +143,14 @@ class DataPipeline:
         data_dir: Path = Path('data'),
         dataset_name: Optional[str] = None,
         skip_steps: Optional[List[str]] = None,
-        force: bool = False
+        force: bool = False,
+        limit: Optional[int] = None
     ):
         self.data_dir = data_dir
         self.dataset_name = dataset_name
         self.skip_steps = skip_steps or []
         self.force = force
+        self.limit = limit
         
         self.raw_dir = data_dir / 'raw'
         self.processed_dir = data_dir / 'processed'
@@ -240,17 +245,26 @@ class DataPipeline:
         # Step 2: Generate absence data (only if dataset specified)
         if self.dataset_name:
             presence_file = self.processed_dir / f"{self.dataset_name}_points.csv"
+            # Always create the regular combined file (full dataset)
+            # integrate_features will limit it and create the test file when limit is set
             combined_output = self.processed_dir / f"combined_{self.dataset_name}_presence_absence.csv"
+            
+            command_args = [
+                '--presence-file', str(presence_file),
+                '--output-file', str(combined_output),
+                '--data-dir', str(self.data_dir)
+            ]
+            
+            # In test mode (limit set), limit the presence data input for absence generation
+            # This prevents generating 8K+ absence points when we only need 15
+            if self.limit is not None:
+                command_args.extend(['--limit', str(self.limit)])
             
             steps.append(PipelineStep(
                 name='generate_absence',
                 description='Generate absence data and combine with presence',
                 script_path=self.scripts_dir / 'generate_absence_data.py',
-                command_args=[
-                    '--presence-file', str(presence_file),
-                    '--output-file', str(combined_output),
-                    '--data-dir', str(self.data_dir)
-                ],
+                command_args=command_args,
                 required_input=presence_file,
                 expected_output=combined_output
             ))
@@ -258,23 +272,37 @@ class DataPipeline:
         # Step 3: Integrate environmental features
         if self.dataset_name:
             combined_file = self.processed_dir / f"combined_{self.dataset_name}_presence_absence.csv"
-            integrated_output = combined_file  # Overwrites input
+            # In test mode (limit set), output goes to _test file
+            if self.limit is not None:
+                integrated_output = self.processed_dir / f"combined_{self.dataset_name}_presence_absence_test.csv"
+            else:
+                integrated_output = combined_file  # Overwrites input
+            
+            command_args = [
+                str(combined_file),
+                '--data-dir', str(self.data_dir)
+            ]
+            if self.force:
+                command_args.append('--force')
+            if self.limit is not None:
+                command_args.extend(['--limit', str(self.limit)])
             
             steps.append(PipelineStep(
                 name='integrate_features',
                 description='Integrate environmental features (elevation, water, landcover, etc.)',
                 script_path=self.scripts_dir / 'integrate_environmental_features.py',
-                command_args=[
-                    str(combined_file),
-                    '--data-dir', str(self.data_dir)
-                ] + (['--force'] if self.force else []),
+                command_args=command_args,
                 required_input=combined_file,
                 expected_output=integrated_output
             ))
         
         # Step 4: Analyze integrated features
         if self.dataset_name:
-            integrated_file = self.processed_dir / f"combined_{self.dataset_name}_presence_absence.csv"
+            # In test mode, analyze the test file
+            if self.limit is not None:
+                integrated_file = self.processed_dir / f"combined_{self.dataset_name}_presence_absence_test.csv"
+            else:
+                integrated_file = self.processed_dir / f"combined_{self.dataset_name}_presence_absence.csv"
             
             steps.append(PipelineStep(
                 name='analyze_features',
@@ -287,21 +315,34 @@ class DataPipeline:
             ))
         
         # Step 5: Assess training readiness
+        # In test mode (limit set), assess the test file created by integrate_features
+        assess_args = []
+        if self.dataset_name and self.limit is not None:
+            # Test file will be created by integrate_features step (runs before this)
+            test_file = self.processed_dir / f"combined_{self.dataset_name}_presence_absence_test.csv"
+            assess_args = ['--dataset', str(test_file)]
+        
         steps.append(PipelineStep(
             name='assess_readiness',
             description='Assess training data readiness for model training',
             script_path=self.scripts_dir / 'assess_training_readiness.py',
-            command_args=[],
-            required_input=None,  # Reads from processed_dir
+            command_args=assess_args,
+            required_input=None,  # Reads from processed_dir or uses provided dataset
             expected_output=None,  # Assessment output to stdout
             check_output_exists=False
         ))
         
         # Step 6: Prepare training features (only if dataset specified)
         if self.dataset_name:
-            combined_file = self.processed_dir / f"combined_{self.dataset_name}_presence_absence.csv"
-            features_dir = self.data_dir / 'features'
-            features_output = features_dir / f"{self.dataset_name}_features.csv"
+            # In test mode, use test file and create test output
+            if self.limit is not None:
+                combined_file = self.processed_dir / f"combined_{self.dataset_name}_presence_absence_test.csv"
+                features_dir = self.data_dir / 'features'
+                features_output = features_dir / f"{self.dataset_name}_features_test.csv"
+            else:
+                combined_file = self.processed_dir / f"combined_{self.dataset_name}_presence_absence.csv"
+                features_dir = self.data_dir / 'features'
+                features_output = features_dir / f"{self.dataset_name}_features.csv"
             
             steps.append(PipelineStep(
                 name='prepare_features',
@@ -345,6 +386,8 @@ class DataPipeline:
         else:
             logger.info(f"Dataset: All datasets")
         logger.info(f"Force mode: {self.force}")
+        if self.limit is not None:
+            logger.info(f"⚠️  TEST MODE: Processing only first {self.limit:,} rows (will create test files)")
         if self.skip_steps:
             logger.info(f"Skipping steps: {', '.join(self.skip_steps)}")
         logger.info("")
@@ -464,6 +507,12 @@ Examples:
         action='store_true',
         help='Force regeneration of all features, even if placeholders don\'t exist'
     )
+    parser.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='Maximum number of rows to process (for testing). Creates test files with _test suffix instead of overwriting originals.'
+    )
     
     args = parser.parse_args()
     
@@ -475,7 +524,8 @@ Examples:
         data_dir=args.data_dir,
         dataset_name=args.dataset,
         skip_steps=skip_steps,
-        force=args.force
+        force=args.force,
+        limit=args.limit
     )
     
     success = pipeline.run()

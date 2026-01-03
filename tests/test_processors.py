@@ -21,40 +21,24 @@ from src.data.processors import (
 
 
 class TestSNOTELClient:
-    """Test SNOTELClient for snow data retrieval."""
+    """Test SNOTELClient for snow data retrieval (updated for snotelr implementation)."""
     
+    @pytest.mark.unit
     def test_init(self):
         """Test SNOTELClient initialization."""
         client = SNOTELClient()
-        assert client.base_url == "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data"
-        assert client.cache == {}
+        assert client.data_dir == Path("data")
+        assert client.station_cache_path == Path("data/cache/snotel_stations_wyoming.geojson")
+        assert client.request_cache == {}
     
-    @patch('src.data.processors.requests.get')
-    def test_get_snow_data_with_station(self, mock_get):
-        """Test getting snow data when station is found."""
-        client = SNOTELClient()
-        
-        # Mock station finding
-        client._find_nearest_station = Mock(return_value={
-            "triplet": "123:WY:SNTL",
-            "name": "Test Station"
-        })
-        
-        # Mock API response
-        mock_response = Mock()
-        mock_response.json.return_value = [
-            {"elementCd": "SNWD", "value": 24.5},
-            {"elementCd": "WTEQ", "value": 8.0}
-        ]
-        mock_get.return_value = mock_response
-        
-        result = client.get_snow_data(43.0, -110.0, datetime(2026, 1, 15))
-        
-        assert result["depth"] == 24.5
-        assert result["swe"] == 8.0
-        assert result["station"] == "Test Station"
-        assert "crust" in result
+    @pytest.mark.unit
+    def test_init_with_data_dir(self, tmp_path):
+        """Test SNOTELClient initialization with custom data_dir."""
+        client = SNOTELClient(data_dir=tmp_path)
+        assert client.data_dir == tmp_path
+        assert client.station_cache_path == tmp_path / "cache" / "snotel_stations_wyoming.geojson"
     
+    @pytest.mark.unit
     def test_get_snow_data_no_station(self):
         """Test getting snow data when no station is found."""
         client = SNOTELClient()
@@ -66,18 +50,35 @@ class TestSNOTELClient:
         assert "depth" in result
         assert "swe" in result
         assert "crust" in result
+        assert result.get("station") is None
     
-    @patch('src.data.processors.requests.get')
-    def test_get_snow_data_api_error(self, mock_get):
-        """Test handling API errors."""
+    @pytest.mark.unit
+    def test_get_snow_data_unmapped_station(self):
+        """Test getting snow data when station isn't mapped to snotelr."""
         client = SNOTELClient()
         client._find_nearest_station = Mock(return_value={
-            "triplet": "123:WY:SNTL",
-            "name": "Test Station"
+            "triplet": "SNOTEL:WY:967",
+            "name": "ELKHORN PARK",
+            "snotelr_site_id": None  # Unmapped
         })
         
-        # Mock API error
-        mock_get.side_effect = Exception("Network error")
+        result = client.get_snow_data(43.0, -110.0, datetime(2026, 1, 15))
+        
+        # Should fall back to elevation estimate
+        assert "depth" in result
+        assert "swe" in result
+        assert "crust" in result
+    
+    @pytest.mark.unit
+    def test_get_snow_data_snotelr_not_available(self):
+        """Test fallback when snotelr is not available."""
+        client = SNOTELClient()
+        client.snotelr = None
+        client._find_nearest_station = Mock(return_value={
+            "triplet": "SNOTEL:WY:975",
+            "name": "MEDICINE BOW",
+            "snotelr_site_id": 1196
+        })
         
         result = client.get_snow_data(43.0, -110.0, datetime(2026, 1, 15))
         
@@ -85,63 +86,91 @@ class TestSNOTELClient:
         assert "depth" in result
         assert "swe" in result
     
-    def test_find_nearest_station(self):
-        """Test finding nearest SNOTEL station."""
-        client = SNOTELClient()
-        # Currently returns None (placeholder)
-        result = client._find_nearest_station(43.0, -110.0)
-        assert result is None
-    
+    @pytest.mark.unit
     def test_estimate_snow_from_elevation_winter(self):
-        """Test snow estimation for winter months."""
+        """Test snow estimation for winter months with actual elevation."""
         client = SNOTELClient()
         
-        result = client._estimate_snow_from_elevation(43.0, -110.0, datetime(2026, 1, 15))
+        # Test with high elevation (should have snow)
+        result = client._estimate_snow_from_elevation(43.0, -110.0, datetime(2026, 1, 15), elevation_ft=8500.0)
         
         assert "depth" in result
         assert "swe" in result
         assert result["crust"] is False
         assert result["depth"] > 0  # Winter should have snow
+        # At 8500 ft in winter: (8500 - 6000) / 100 = 25 inches
+        assert result["depth"] == 25.0
     
+    @pytest.mark.unit
     def test_estimate_snow_from_elevation_summer(self):
-        """Test snow estimation for summer months."""
+        """Test snow estimation for summer months with actual elevation."""
         client = SNOTELClient()
         
-        result = client._estimate_snow_from_elevation(43.0, -110.0, datetime(2026, 7, 15))
+        # Test with high elevation (summer may have no snow)
+        result = client._estimate_snow_from_elevation(43.0, -110.0, datetime(2026, 7, 15), elevation_ft=8500.0)
         
         assert "depth" in result
         assert "swe" in result
-        # Summer may have less or no snow
+        # Summer at 8500 ft: max(0, (8500 - 10000) / 100) = 0 inches
+        assert result["depth"] == 0.0
     
+    @pytest.mark.unit
     def test_estimate_snow_from_elevation_spring(self):
-        """Test snow estimation for spring months."""
+        """Test snow estimation for spring months with actual elevation."""
         client = SNOTELClient()
         
-        result = client._estimate_snow_from_elevation(43.0, -110.0, datetime(2026, 4, 15))
+        result = client._estimate_snow_from_elevation(43.0, -110.0, datetime(2026, 4, 15), elevation_ft=8500.0)
         
         assert "depth" in result
-        assert result["crust"] is False
+        # Spring at 8500 ft: (8500 - 7000) / 150 = 10 inches
+        assert result["depth"] == 10.0
     
-    @patch('src.data.processors.requests.get')
-    def test_get_snow_data_crust_detection(self, mock_get):
-        """Test crust detection from SWE/depth ratio."""
+    @pytest.mark.unit
+    def test_estimate_snow_from_elevation_low_elevation_zero_snow(self):
+        """Test that low elevations correctly estimate zero snow."""
         client = SNOTELClient()
-        client._find_nearest_station = Mock(return_value={
-            "triplet": "123:WY:SNTL",
-            "name": "Test Station"
-        })
         
-        # High density (SWE/depth > 0.35) should indicate crust
-        mock_response = Mock()
-        mock_response.json.return_value = [
-            {"elementCd": "SNWD", "value": 10.0},
-            {"elementCd": "WTEQ", "value": 4.0}  # 4.0/10.0 = 0.4 > 0.35
-        ]
-        mock_get.return_value = mock_response
+        # Low elevation locations (like the problematic ones)
+        result_1500 = client._estimate_snow_from_elevation(43.0, -110.0, datetime(2026, 1, 15), elevation_ft=1500.0)
+        result_3000 = client._estimate_snow_from_elevation(43.0, -110.0, datetime(2026, 1, 15), elevation_ft=3000.0)
         
-        result = client.get_snow_data(43.0, -110.0, datetime(2026, 3, 15))
+        # Both should be 0 (below 6000 ft threshold)
+        assert result_1500["depth"] == 0.0
+        assert result_3000["depth"] == 0.0
+    
+    @pytest.mark.unit
+    def test_estimate_snow_from_elevation_uses_provided_elevation(self):
+        """Test that provided elevation is used correctly."""
+        client = SNOTELClient()
         
-        assert result["crust"] is True
+        # Test different elevations produce different results
+        result_6000 = client._estimate_snow_from_elevation(43.0, -110.0, datetime(2026, 1, 15), elevation_ft=6000.0)
+        result_7000 = client._estimate_snow_from_elevation(43.0, -110.0, datetime(2026, 1, 15), elevation_ft=7000.0)
+        result_8000 = client._estimate_snow_from_elevation(43.0, -110.0, datetime(2026, 1, 15), elevation_ft=8000.0)
+        
+        # Winter formula: (elevation - 6000) / 100
+        assert result_6000["depth"] == 0.0  # (6000 - 6000) / 100
+        assert result_7000["depth"] == 10.0  # (7000 - 6000) / 100
+        assert result_8000["depth"] == 20.0  # (8000 - 6000) / 100
+        
+        # Higher elevation = more snow
+        assert result_8000["depth"] > result_7000["depth"] > result_6000["depth"]
+        assert result_8000["crust"] is False
+    
+    @pytest.mark.unit
+    def test_get_snow_data_caching(self):
+        """Test that get_snow_data caches results."""
+        client = SNOTELClient()
+        client._find_nearest_station = Mock(return_value=None)
+        
+        # First call
+        result1 = client.get_snow_data(43.0, -110.0, datetime(2026, 1, 15))
+        
+        # Second call (same location/date)
+        result2 = client.get_snow_data(43.0, -110.0, datetime(2026, 1, 15))
+        
+        # Results should be identical (cached)
+        assert result1 == result2
 
 
 class TestWeatherClient:

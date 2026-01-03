@@ -35,16 +35,45 @@ def assess_training_readiness(dataset_path: Optional[Path] = None):
     print("=" * 70)
     
     if dataset_path:
-        datasets_to_assess = {dataset_path.stem.replace('combined_', '').replace('_presence_absence', ''): dataset_path}
+        # Handle test files (with _test suffix)
+        is_test_file = '_test' in dataset_path.stem
+        display_name = dataset_path.stem.replace('combined_', '').replace('_presence_absence', '').replace('_test', '')
+        if is_test_file:
+            display_name += ' (TEST)'
+        
+        datasets_to_assess = {display_name: dataset_path}
         print(f"\nAssessing single dataset: {dataset_path}")
+        if is_test_file:
+            print(f"  ⚠️  TEST MODE: Assessing test dataset (limited rows)")
     else:
-        datasets_to_assess = {
-            'North Bighorn': Path('data/processed/combined_north_bighorn_presence_absence.csv'),
-            'South Bighorn': Path('data/processed/combined_southern_bighorn_presence_absence.csv'),
-            'National Refuge': Path('data/processed/combined_national_refuge_presence_absence.csv'),
-            'Southern GYE': Path('data/processed/combined_southern_gye_presence_absence.csv')
+        # When no specific dataset provided, look for both regular and test files
+        # Prefer test files if they exist (indicates recent test run)
+        base_datasets = {
+            'North Bighorn': 'north_bighorn',
+            'South Bighorn': 'southern_bighorn',
+            'National Refuge': 'national_refuge',
+            'Southern GYE': 'southern_gye'
         }
-        print("\nAssessing all known datasets.")
+        
+        datasets_to_assess = {}
+        for display_name, base_name in base_datasets.items():
+            # Check for test file first
+            test_path = Path(f'data/processed/combined_{base_name}_presence_absence_test.csv')
+            regular_path = Path(f'data/processed/combined_{base_name}_presence_absence.csv')
+            
+            if test_path.exists():
+                datasets_to_assess[f"{display_name} (TEST)"] = test_path
+            elif regular_path.exists():
+                datasets_to_assess[display_name] = regular_path
+        
+        if datasets_to_assess:
+            test_count = sum(1 for name in datasets_to_assess.keys() if '(TEST)' in name)
+            if test_count > 0:
+                print(f"\nAssessing all known datasets ({test_count} test file(s) detected).")
+            else:
+                print("\nAssessing all known datasets.")
+        else:
+            print("\nNo datasets found to assess.")
     
     all_data = []
     for name, path in datasets_to_assess.items():

@@ -39,7 +39,10 @@ METADATA_COLUMNS = {
     # Date (redundant with year/month, could cause leakage)
     'date',
     # Dataset name (if present)
-    'dataset_name', 'dataset'
+    'dataset_name', 'dataset',
+    # SNOTEL station name (categorical with high cardinality, risk of overfitting)
+    # Note: snow_data_source and snow_station_distance_km are kept as features
+    'snow_station_name'
 }
 
 # Columns that might be useful but should be evaluated carefully

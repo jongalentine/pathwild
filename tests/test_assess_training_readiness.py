@@ -75,6 +75,29 @@ class TestAssessTrainingReadiness:
         assert 0 <= score <= 5
         assert 0 <= percentage <= 100
     
+    def test_assess_test_file(self, assess_module, tmp_path):
+        """Test that assess_training_readiness can handle test files (with _test suffix)."""
+        # Create a test file (with _test in name)
+        df = pd.DataFrame({
+            'latitude': [43.0, 43.1],
+            'longitude': [-110.0, -110.1],
+            'elk_present': [1, 0],
+            'elevation': [2000.0, 2100.0],
+            'slope_degrees': [5.0, 10.0],
+        })
+        
+        test_file = tmp_path / "combined_test_dataset_presence_absence_test.csv"
+        df.to_csv(test_file, index=False)
+        
+        # Should handle test file without error
+        score, percentage = assess_module.assess_training_readiness(test_file)
+        
+        # Should return valid scores
+        assert isinstance(score, (int, float))
+        assert isinstance(percentage, (int, float))
+        assert 0 <= score <= 5
+        assert 0 <= percentage <= 100
+    
     def test_assess_all_datasets(self, assess_module, tmp_path):
         """Test assessing all datasets (when none exist, should handle gracefully)."""
         # Create processed directory structure

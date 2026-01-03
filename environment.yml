@@ -52,6 +52,11 @@ dependencies:
   - shapely
   - gdal
   
+  # R and R-Python interface (for snotelr package)
+  - r-base>=4.0
+  - r-snotelr
+  - rpy2
+  
   # Python package manager (for packages not in conda)
   - pip
   

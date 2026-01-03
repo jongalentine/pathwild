@@ -31,6 +31,296 @@ except (ImportError, OSError) as e:
     logger.warning(f"rasterio not available: {e}. Some features may be limited.")
 
 
+def _static_generate_worker(
+    n_samples: int,
+    max_attempts: int,
+    seed: int,
+    study_area_bounds: Tuple[float, float, float, float],
+    presence_points_list: list,
+    min_distance_meters: float,
+    crs: str,
+    utm_crs: str,
+    dem_path: Optional[str],
+    slope_path: Optional[str],
+    water_path: Optional[str],
+    strategy_name: str
+) -> list:
+    """
+    Static worker function for multiprocessing that doesn't require self.
+    
+    Opens rasters inside the worker process to avoid pickling issues.
+    """
+    import logging
+    worker_logger = logging.getLogger(f"{__name__}.worker.{seed}")
+    
+    try:
+        worker_logger.info(f"Worker {seed} starting: {n_samples} samples, {max_attempts} max attempts")
+        
+        if seed is not None:
+            np.random.seed(seed)
+        
+        absence_points = []
+        attempts = 0
+        
+        # Open rasters inside worker (avoids pickling issues)
+        worker_logger.debug(f"Worker {seed}: Opening rasters...")
+        dem_raster = None
+        slope_raster = None
+        water_gdf = None
+        
+        if dem_path and RASTERIO_AVAILABLE:
+            try:
+                dem_raster = rasterio.open(dem_path)
+                worker_logger.debug(f"Worker {seed}: DEM opened")
+            except Exception as e:
+                worker_logger.warning(f"Worker {seed}: Failed to open DEM: {e}")
+        
+        if slope_path and RASTERIO_AVAILABLE:
+            try:
+                slope_raster = rasterio.open(slope_path)
+                worker_logger.debug(f"Worker {seed}: Slope opened")
+            except Exception as e:
+                worker_logger.warning(f"Worker {seed}: Failed to open slope: {e}")
+        
+        # Only load water sources if needed for this strategy
+        if water_path and strategy_name in ['environmental', 'unsuitable']:
+            try:
+                worker_logger.debug(f"Worker {seed}: Loading water sources ({water_path})...")
+                water_gdf = gpd.read_file(water_path)
+                if water_gdf.crs != crs:
+                    water_gdf = water_gdf.to_crs(crs)
+                worker_logger.debug(f"Worker {seed}: Loaded {len(water_gdf)} water features")
+                # Don't build spatial index here - do it lazily when needed
+            except Exception as e:
+                worker_logger.warning(f"Worker {seed}: Failed to load water sources: {e}")
+                water_gdf = None
+        else:
+            worker_logger.debug(f"Worker {seed}: Skipping water sources (not needed for {strategy_name})")
+        
+        # Convert presence points to GeoDataFrame for distance calculations
+        # Note: presence_points_list is already in UTM coordinates from self.presence_utm
+        worker_logger.debug(f"Worker {seed}: Creating presence GeoDataFrame from {len(presence_points_list)} points...")
+        presence_gdf_utm = None
+        if presence_points_list:
+            try:
+                from shapely.geometry import Point as ShapelyPoint
+                presence_points_utm = [ShapelyPoint(x, y) for x, y in presence_points_list]
+                presence_gdf_utm = gpd.GeoDataFrame(geometry=presence_points_utm, crs=utm_crs)
+                worker_logger.debug(f"Worker {seed}: Presence GeoDataFrame created")
+                # Try to build spatial index (but don't fail if it doesn't work)
+                try:
+                    if len(presence_gdf_utm) > 1000:
+                        _ = presence_gdf_utm.sindex  # Access to build index
+                except Exception:
+                    pass  # Spatial index optional
+            except Exception as e:
+                worker_logger.warning(f"Worker {seed}: Failed to create presence GeoDataFrame: {e}")
+                presence_gdf_utm = None
+        
+        # Create study area polygon from bounds
+        try:
+            from shapely.geometry import box
+            study_area_poly = box(*study_area_bounds)
+        except Exception:
+            study_area_poly = None
+        
+        # Define helper functions inside try block
+        def sample_raster_static(raster, lon: float, lat: float, default: float = 0.0) -> float:
+            """Sample value from raster at point (static version)."""
+            if raster is None or not RASTERIO_AVAILABLE:
+                return default
+            try:
+                row, col = raster.index(lon, lat)
+                window = rasterio.windows.Window(col, row, 1, 1)
+                data = raster.read(1, window=window)
+                value = float(data[0, 0])
+                if value == raster.nodata or np.isnan(value):
+                    return default
+                return value
+            except Exception:
+                return default
+        
+        def calculate_water_distance_static(point: Point) -> float:
+            """Calculate distance to nearest water source in miles (static version)."""
+            if water_gdf is None or len(water_gdf) == 0:
+                return 0.5
+            try:
+                # Convert point and water_gdf to UTM for accurate distance calculation
+                # This avoids the geographic CRS warning and is more accurate
+                point_gdf = gpd.GeoDataFrame(geometry=[point], crs=crs)
+                point_utm = point_gdf.to_crs(utm_crs).geometry.iloc[0]
+                
+                # Ensure water_gdf is in UTM (convert if needed)
+                water_gdf_utm = water_gdf
+                if water_gdf.crs != utm_crs:
+                    water_gdf_utm = water_gdf.to_crs(utm_crs)
+                
+                # For very large datasets, use sampling for performance
+                # unary_union on 958K+ features is extremely slow, and spatial index building can hang
+                if len(water_gdf_utm) > 10000:
+                    # Always use sampling for large datasets - much faster and avoids index building
+                    sample_size = min(1000, len(water_gdf_utm))
+                    sample_gdf = water_gdf_utm.sample(n=sample_size, random_state=42)
+                    # Distance in UTM is in meters, convert to miles
+                    distances_m = sample_gdf.geometry.distance(point_utm)
+                    distances_mi = distances_m / 1609.34  # meters to miles
+                    return float(distances_mi.min())
+                else:
+                    # Small dataset: calculate distance to all
+                    # Distance in UTM is in meters, convert to miles
+                    distances_m = water_gdf_utm.geometry.distance(point_utm)
+                    distances_mi = distances_m / 1609.34  # meters to miles
+                    return float(distances_mi.min())
+            except Exception as e:
+                # Return default if calculation fails
+                worker_logger.debug(f"Worker {seed}: Water distance calculation failed: {e}")
+                return 0.5
+        
+        def check_distance_constraint_static(point: Point) -> bool:
+            """Check if point meets distance constraint (static version)."""
+            if presence_gdf_utm is None or len(presence_gdf_utm) == 0:
+                return True
+            try:
+                point_gdf = gpd.GeoDataFrame(geometry=[point], crs=crs).to_crs(utm_crs)
+                point_utm = point_gdf.geometry.iloc[0]
+                
+                # For large presence datasets, use spatial index if available
+                if len(presence_gdf_utm) > 1000:
+                    try:
+                        # Build spatial index if not already available
+                        if presence_gdf_utm.sindex is None:
+                            # Force index creation (geopandas does this automatically, but sometimes fails)
+                            presence_gdf_utm.sindex
+                    except Exception:
+                        pass
+                    
+                    # Use spatial index for efficient query
+                    try:
+                        if presence_gdf_utm.sindex is not None:
+                            # Query nearby points within a buffer
+                            buffer_m = min_distance_meters * 1.1  # Add 10% buffer
+                            point_bounds = (
+                                point_utm.x - buffer_m,
+                                point_utm.y - buffer_m,
+                                point_utm.x + buffer_m,
+                                point_utm.y + buffer_m
+                            )
+                            nearby_indices = list(presence_gdf_utm.sindex.intersection(point_bounds))
+                            if nearby_indices:
+                                # Only check distances to nearby candidates
+                                candidates = presence_gdf_utm.iloc[nearby_indices]
+                                distances = candidates.geometry.distance(point_utm)
+                                min_distance = distances.min()
+                                return min_distance >= min_distance_meters
+                            else:
+                                # No nearby points, constraint satisfied
+                                return True
+                    except Exception:
+                        # Fall back to full distance calculation
+                        pass
+                
+                # Standard distance calculation (for small datasets or if spatial index fails)
+                distances = presence_gdf_utm.geometry.distance(point_utm)
+                min_distance = distances.min()
+                return min_distance >= min_distance_meters
+            except Exception as e:
+                worker_logger.debug(f"Worker {seed}: Distance constraint check failed: {e}")
+                return True
+        
+        def is_environmentally_suitable_static(point: Point) -> bool:
+            """Check environmental suitability (static version)."""
+            lon, lat = point.x, point.y
+            
+            # Check elevation
+            elevation_m = sample_raster_static(dem_raster, lon, lat, default=2500.0)
+            elevation_ft = elevation_m * 3.28084
+            if not (6000 <= elevation_ft <= 13500):
+                return False
+            
+            # Check slope
+            slope_deg = sample_raster_static(slope_raster, lon, lat, default=15.0)
+            if slope_deg >= 45.0:
+                return False
+            
+            # Check water distance
+            water_dist_mi = calculate_water_distance_static(point)
+            if water_dist_mi > 5.0:
+                return False
+            
+            return True
+        
+        def is_unsuitable_static(point: Point) -> bool:
+            """Check if point is unsuitable habitat (static version)."""
+            lon, lat = point.x, point.y
+            
+            # Check elevation (too low)
+            elevation_m = sample_raster_static(dem_raster, lon, lat, default=2500.0)
+            elevation_ft = elevation_m * 3.28084
+            if elevation_ft < 4000:
+                return True
+            
+            # Check slope (too steep)
+            slope_deg = sample_raster_static(slope_raster, lon, lat, default=15.0)
+            if slope_deg >= 45.0:
+                return True
+            
+            # Check water distance (too far)
+            water_dist_mi = calculate_water_distance_static(point)
+            if water_dist_mi > 10.0:
+                return True
+            
+            return False
+        
+        worker_logger.info(f"Worker {seed}: Starting generation loop...")
+        
+        # Generate points
+        while len(absence_points) < n_samples and attempts < max_attempts:
+            attempts += 1
+            
+            # Log progress every 1000 attempts to show worker is alive
+            if attempts % 1000 == 0:
+                worker_logger.info(f"Worker {seed}: {attempts:,} attempts, {len(absence_points)}/{n_samples} points found")
+            
+            # Sample random point
+            lon = np.random.uniform(study_area_bounds[0], study_area_bounds[2])
+            lat = np.random.uniform(study_area_bounds[1], study_area_bounds[3])
+            point = Point(lon, lat)
+            
+            # Check if point is within study area
+            if study_area_poly and not study_area_poly.contains(point):
+                continue
+            
+            # Check distance constraint
+            if not check_distance_constraint_static(point):
+                continue
+            
+            # Strategy-specific checks
+            if strategy_name == 'environmental':
+                if not is_environmentally_suitable_static(point):
+                    continue
+            elif strategy_name == 'unsuitable':
+                if not is_unsuitable_static(point):
+                    continue
+            # For 'background' and 'temporal', no additional checks needed
+            
+            absence_points.append(point)
+        
+        worker_logger.info(f"Worker {seed}: Completed - found {len(absence_points)}/{n_samples} points in {attempts} attempts")
+        
+        # Close rasters
+        if dem_raster:
+            dem_raster.close()
+        if slope_raster:
+            slope_raster.close()
+        
+        return absence_points
+        
+    except Exception as e:
+        worker_logger.error(f"Worker {seed}: Fatal error: {e}", exc_info=True)
+        # Return whatever points we found before the error
+        return absence_points
+
+
 class AbsenceGenerator(ABC):
     """Abstract base class for generating absence points.
     
@@ -203,6 +493,26 @@ class AbsenceGenerator(ABC):
             # Divide max_attempts across workers (each worker gets a portion)
             attempts_per_worker = max(1, max_attempts // n_processes)
             
+            # Prepare data that can be pickled for workers
+            # Convert rasterio DatasetReader objects to file paths
+            dem_path = None
+            slope_path = None
+            water_path = None
+            
+            if hasattr(self, 'data_dir') and self.data_dir:
+                if hasattr(self, 'dem') and self.dem is not None:
+                    dem_path = str(self.dem.name) if hasattr(self.dem, 'name') else None
+                if hasattr(self, 'slope') and self.slope is not None:
+                    slope_path = str(self.slope.name) if hasattr(self.slope, 'name') else None
+                if hasattr(self, 'water_sources') and self.water_sources is not None:
+                    # For GeoDataFrames, we need to save to a temp file or pass the path
+                    # Since water_sources is already loaded from a file, use the original path
+                    water_path = str(self.data_dir / "hydrology" / "water_sources.geojson")
+            
+            # Prepare study area and presence data for pickling (convert to dict/shapely)
+            study_area_bounds = self.study_area.total_bounds
+            presence_points_list = [(p.x, p.y) for p in self.presence_utm.geometry]
+            
             # Distribute remaining samples
             worker_args = []
             for i in range(n_processes):
@@ -212,16 +522,45 @@ class AbsenceGenerator(ABC):
                 
                 # Use different seeds for each worker
                 seed = 42 + i
-                worker_args.append((worker_n_samples, attempts_per_worker, seed))
+                worker_args.append((
+                    worker_n_samples,
+                    attempts_per_worker,
+                    seed,
+                    study_area_bounds,
+                    presence_points_list,
+                    self.min_distance_meters,
+                    self.crs,
+                    self.utm_crs,
+                    dem_path,
+                    slope_path,
+                    water_path,
+                    strategy_name
+                ))
             
             logger.info(f"Using {n_processes} parallel processes for {strategy_name} generation")
+            logger.info(f"Workers will process {len(worker_args)} batches")
             
-            # Create worker function bound to this instance
-            worker_func = partial(self._generate_worker)
-            
-            # Generate in parallel
-            with Pool(processes=n_processes) as pool:
-                results = pool.starmap(worker_func, worker_args)
+            # Use a static worker function that doesn't require self
+            # Generate in parallel with timeout protection
+            try:
+                with Pool(processes=n_processes) as pool:
+                    # Use map_async with timeout to detect stuck workers
+                    logger.debug("Starting parallel worker pool...")
+                    async_result = pool.starmap_async(_static_generate_worker, worker_args)
+                    
+                    # Wait with a reasonable timeout (5 minutes per worker should be plenty)
+                    # For 10,000 attempts, should complete in < 1 minute even if slow
+                    timeout = max(300, max_attempts // 100)  # At least 5 minutes, or based on attempts
+                    logger.debug(f"Waiting for workers (timeout: {timeout}s)...")
+                    results = async_result.get(timeout=timeout)
+                    logger.info(f"All workers completed successfully")
+            except TimeoutError:
+                logger.error(f"Workers timed out after {timeout}s - some workers may be stuck")
+                pool.terminate()  # Force kill stuck workers
+                raise
+            except Exception as e:
+                logger.error(f"Error in parallel processing: {e}")
+                raise
             
             # Combine results
             points = []
