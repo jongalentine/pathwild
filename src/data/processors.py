@@ -774,7 +774,9 @@ class SNOTELClient:
         # Fetch data using snotelr R package
         if self.snotelr is None:
             logger.warning("snotelr not available, using elevation estimate")
-            return self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
+            result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
+            self.request_cache[cache_key] = result
+            return result
         
         try:
             # Get snotelr site_id from mapped station data
@@ -785,7 +787,9 @@ class SNOTELClient:
                 logger.warning(f"Station {station['name']} has no snotelr site_id mapping")
                 logger.info("Run scripts/map_snotel_station_ids.py to create mapping")
                 # Fall back to elevation estimate with available elevation
-                return self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
+                result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
+                self.request_cache[cache_key] = result
+                return result
             
             snotelr_site_id = int(snotelr_site_id)
             
@@ -840,11 +844,15 @@ class SNOTELClient:
                 date_data = df[df['date'].isin(date_range)]
                 if len(date_data) > 0:
                     # Use closest date
-                    date_data = date_data.iloc[[(date_data['date'] - pd.Timestamp(date)).abs().idxmin()]]
+                    # idxmin() returns an index label, so use .loc with the label (not .iloc with position)
+                    closest_date_label = (date_data['date'] - pd.Timestamp(date)).abs().idxmin()
+                    date_data = date_data.loc[[closest_date_label]]
             
             if len(date_data) == 0:
                 logger.warning(f"No SNOTEL data available for station {station['name']} (site_id {snotelr_site_id}) near {date_str}")
-                return self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
+                result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
+                self.request_cache[cache_key] = result
+                return result
             
             # Extract snow depth and SWE
             # snotelr column names: snow_water_equivalent (SWE in mm), snow_depth (in mm)
@@ -885,7 +893,9 @@ class SNOTELClient:
             import traceback
             logger.debug(traceback.format_exc())
             # Pass elevation if available for better estimation
-            return self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
+            result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
+            self.request_cache[cache_key] = result
+            return result
     
     def _estimate_snow_from_elevation(self, lat: float, lon: float, 
                                      date: datetime, elevation_ft: Optional[float] = None) -> Dict:

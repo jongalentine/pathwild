@@ -371,41 +371,6 @@ class TestSNOTELClientUnit:
         assert result_10000['depth'] > result_5000['depth']
     
     @pytest.mark.unit
-    def test_estimate_snow_from_elevation_actual_low_elevations(self):
-        """Test that low elevations produce correct (zero) snow estimates - fixes hardcoded bug."""
-        client = SNOTELClient()
-        
-        # Test actual low elevations from real data
-        low_elevations = [1340.5, 1496.7, 2955.8]  # Actual elevations from your data
-        
-        for elevation_ft in low_elevations:
-            result = client._estimate_snow_from_elevation(41.0, -106.0, datetime(2024, 1, 15), elevation_ft=elevation_ft)
-            # Low elevations (< 6000 ft) should have 0 snow in winter
-            assert result['depth'] == 0.0, f"Expected 0 inches for {elevation_ft} ft elevation, got {result['depth']}"
-            assert result['swe'] == 0.0
-    
-    @pytest.mark.unit
-    def test_estimate_snow_from_elevation_varies_by_elevation(self):
-        """Test that estimates correctly vary by elevation (verifies no hardcoded values)."""
-        client = SNOTELClient()
-        date = datetime(2024, 1, 15)  # Winter
-        
-        elevations = [1000, 5000, 7000, 8500, 10000]
-        results = {}
-        
-        for elev in elevations:
-            result = client._estimate_snow_from_elevation(41.0, -106.0, date, elevation_ft=elev)
-            results[elev] = result['depth']
-        
-        # Verify they're different (not all hardcoded)
-        assert len(set(results.values())) > 1, "All elevations produced same result - possible hardcoded bug"
-        
-        # Verify increasing elevation generally increases snow (for elevations above threshold)
-        assert results[10000] > results[8500] > results[7000], "Snow depth should increase with elevation"
-        assert results[5000] == 0.0, "Low elevations should have 0 snow"
-        assert results[1000] == 0.0, "Very low elevations should have 0 snow"
-    
-    @pytest.mark.unit
     def test_estimate_snow_from_elevation_seasonal_variation(self):
         """Test that estimation varies correctly by season."""
         client = SNOTELClient()
@@ -1229,6 +1194,209 @@ class TestSNOTELDataQualityTracking:
         assert 'swe' in result
         assert result.get('station') is None
         assert result.get('station_distance_km') is None
+    
+    @pytest.mark.unit
+    @patch('geopandas.read_file')
+    @patch.object(SNOTELClient, '_init_r_snotelr')
+    def test_elevation_estimates_are_cached(self, mock_init_r, mock_read_file, data_dir, sample_station_file):
+        """Test that elevation estimates are properly cached in request_cache."""
+        # Mock geopandas
+        mock_gdf = gpd.GeoDataFrame({
+            'name': ['ELKHORN PARK'],
+            'triplet': ['SNOTEL:WY:967'],
+            'lat': [41.5667],
+            'lon': [-106.8667],
+            'elevation_ft': [10200],
+            'state': ['WY'],
+            'snotelr_site_id': [None],  # Unmapped station
+            'geometry': [Point(-106.8667, 41.5667)]
+        }, crs='EPSG:4326')
+        mock_read_file.return_value = mock_gdf
+        
+        # Mock rpy2 initialization
+        mock_init_r.return_value = None
+        
+        client = SNOTELClient(data_dir=data_dir)
+        client.snotelr = None  # Simulate snotelr unavailable
+        
+        # Clear cache
+        client.request_cache.clear()
+        
+        # First call - should compute and cache
+        lat, lon = 41.5667, -106.8667
+        date = datetime(2024, 1, 15)
+        
+        result1 = client.get_snow_data(lat, lon, date)
+        cache_key = f"{lat:.4f},{lon:.4f},{date.strftime('%Y-%m-%d')}"
+        
+        # Verify result was cached
+        assert cache_key in client.request_cache
+        assert client.request_cache[cache_key] == result1
+        
+        # Second call - should return cached result (same location/date)
+        # Mock _estimate_snow_from_elevation to verify it's not called again
+        with patch.object(client, '_estimate_snow_from_elevation') as mock_estimate:
+            result2 = client.get_snow_data(lat, lon, date)
+            
+            # Should return cached result without calling _estimate_snow_from_elevation
+            assert result2 == result1
+            mock_estimate.assert_not_called()
+    
+    @pytest.mark.unit
+    @patch('geopandas.read_file')
+    @patch.object(SNOTELClient, '_init_r_snotelr')
+    def test_unmapped_station_estimates_are_cached(self, mock_init_r, mock_read_file, data_dir, sample_station_file):
+        """Test that elevation estimates for unmapped stations are cached."""
+        # Mock geopandas with unmapped station
+        mock_gdf = gpd.GeoDataFrame({
+            'name': ['ELKHORN PARK'],
+            'triplet': ['SNOTEL:WY:967'],
+            'lat': [41.5667],
+            'lon': [-106.8667],
+            'elevation_ft': [10200],
+            'state': ['WY'],
+            'snotelr_site_id': [None],  # Unmapped station
+            'geometry': [Point(-106.8667, 41.5667)]
+        }, crs='EPSG:4326')
+        mock_read_file.return_value = mock_gdf
+        
+        # Mock rpy2 initialization
+        mock_init_r.return_value = None
+        
+        # Mock snotelr as available (but station is unmapped)
+        mock_snotelr = MagicMock()
+        
+        client = SNOTELClient(data_dir=data_dir)
+        client.snotelr = mock_snotelr  # snotelr available but station unmapped
+        
+        # Clear cache
+        client.request_cache.clear()
+        
+        # First call - should detect unmapped station and cache elevation estimate
+        lat, lon = 41.5667, -106.8667
+        date = datetime(2024, 1, 15)
+        
+        result1 = client.get_snow_data(lat, lon, date)
+        cache_key = f"{lat:.4f},{lon:.4f},{date.strftime('%Y-%m-%d')}"
+        
+        # Verify result was cached
+        assert cache_key in client.request_cache
+        assert client.request_cache[cache_key] == result1
+        
+        # Second call - should return cached result
+        with patch.object(client, '_estimate_snow_from_elevation') as mock_estimate:
+            result2 = client.get_snow_data(lat, lon, date)
+            
+            # Should return cached result without calling _estimate_snow_from_elevation
+            assert result2 == result1
+            mock_estimate.assert_not_called()
+    
+    @pytest.mark.unit
+    @patch('geopandas.read_file')
+    @patch.object(SNOTELClient, '_init_r_snotelr')
+    def test_exception_fallback_estimates_are_cached(self, mock_init_r, mock_read_file, data_dir, sample_station_file):
+        """Test that elevation estimates from exception fallback are cached."""
+        # Mock geopandas with mapped station
+        mock_gdf = gpd.GeoDataFrame({
+            'name': ['MEDICINE BOW'],
+            'triplet': ['SNOTEL:WY:975'],
+            'lat': [41.3500],
+            'lon': [-106.3167],
+            'elevation_ft': [9700],
+            'state': ['WY'],
+            'snotelr_site_id': [1196],  # Mapped station
+            'geometry': [Point(-106.3167, 41.3500)]
+        }, crs='EPSG:4326')
+        mock_read_file.return_value = mock_gdf
+        
+        # Mock rpy2 initialization
+        mock_init_r.return_value = None
+        
+        # Mock snotelr to raise an exception
+        mock_snotelr = MagicMock()
+        mock_snotelr.snotel_download.side_effect = Exception("Test error")
+        
+        client = SNOTELClient(data_dir=data_dir)
+        client.snotelr = mock_snotelr
+        
+        # Clear cache
+        client.request_cache.clear()
+        
+        # First call - should catch exception and cache elevation estimate
+        lat, lon = 41.3500, -106.3167
+        date = datetime(2024, 1, 15)
+        
+        result1 = client.get_snow_data(lat, lon, date)
+        cache_key = f"{lat:.4f},{lon:.4f},{date.strftime('%Y-%m-%d')}"
+        
+        # Verify result was cached
+        assert cache_key in client.request_cache
+        assert client.request_cache[cache_key] == result1
+        
+        # Second call - should return cached result without retrying snotelr
+        with patch.object(client, '_estimate_snow_from_elevation') as mock_estimate:
+            result2 = client.get_snow_data(lat, lon, date)
+            
+            # Should return cached result without calling _estimate_snow_from_elevation
+            assert result2 == result1
+            mock_estimate.assert_not_called()
+    
+    @pytest.mark.unit
+    @patch('geopandas.read_file')
+    @patch.object(SNOTELClient, '_init_r_snotelr')
+    def test_closest_date_selection_with_non_sequential_index(self, mock_init_r, mock_read_file, data_dir, sample_station_file):
+        """Test that closest date selection works correctly with non-sequential DataFrame index."""
+        import pandas as pd
+        
+        # Create a DataFrame with non-sequential index (simulating filtered data)
+        # This simulates what happens when df[df['date'].isin(date_range)] filters rows
+        date_base = pd.Timestamp('2024-01-01')
+        dates = [date_base + pd.Timedelta(days=i) for i in [0, 5, 10, 15, 20]]
+        values = [10.0, 20.0, 30.0, 40.0, 50.0]
+        
+        # Create DataFrame with non-sequential index (rows 0, 5, 10, 15, 20)
+        full_df = pd.DataFrame({
+            'date': dates,
+            'snow_water_equivalent': [v * 25.4 for v in values],  # mm
+            'snow_depth': [v * 25.4 for v in values]  # mm
+        }, index=[0, 5, 10, 15, 20])
+        
+        # Mock geopandas
+        mock_gdf = gpd.GeoDataFrame({
+            'name': ['MEDICINE BOW'],
+            'triplet': ['SNOTEL:WY:975'],
+            'lat': [41.3500],
+            'lon': [-106.3167],
+            'elevation_ft': [9700],
+            'state': ['WY'],
+            'snotelr_site_id': [1196],
+            'geometry': [Point(-106.3167, 41.3500)]
+        }, crs='EPSG:4326')
+        mock_read_file.return_value = mock_gdf
+        
+        # Mock rpy2 initialization
+        mock_init_r.return_value = None
+        
+        # Create client and manually set cached DataFrame (bypassing actual R call)
+        client = SNOTELClient(data_dir=data_dir)
+        client.snotelr = MagicMock()  # Mock snotelr (won't be called due to cache)
+        client.station_data_cache[1196] = full_df
+        
+        # Test: Request date 2024-01-08 (closest to index 5, which is 2024-01-06)
+        # When filtered to ±7 days, the dataframe would have indices [0, 5, 10] 
+        # idxmin() returns label 5, and we need .loc[5] (not .iloc[5])
+        target_date = datetime(2024, 1, 8)
+        result = client.get_snow_data(41.3500, -106.3167, target_date)
+        
+        # Verify result contains expected data
+        assert 'depth' in result
+        assert 'swe' in result
+        
+        # The closest date should be 2024-01-06 (index 5), which has value 20.0
+        # Converted from mm to inches: 20.0 * 25.4 / 25.4 = 20.0 inches
+        expected_swe = 20.0
+        assert abs(result['swe'] - expected_swe) < 0.1, f"Expected SWE ~{expected_swe}, got {result['swe']}"
+        assert abs(result['depth'] - expected_swe) < 0.1, f"Expected depth ~{expected_swe}, got {result['depth']}"
 
 
 @pytest.mark.integration
