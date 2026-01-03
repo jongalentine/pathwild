@@ -14,7 +14,10 @@ Usage:
     python scripts/integrate_environmental_features.py [dataset_path] [--workers N] [--batch-size N] [--limit N]
     
 Examples:
-    # Process full dataset (auto-detects optimal workers and batch size based on hardware)
+    # Process ALL datasets in data/processed/ (finds all combined_*_presence_absence.csv files)
+    python scripts/integrate_environmental_features.py
+    
+    # Process specific dataset (auto-detects optimal workers and batch size based on hardware)
     python scripts/integrate_environmental_features.py data/processed/combined_north_bighorn_presence_absence.csv
     
     # Process with specific number of workers
@@ -140,6 +143,8 @@ def has_placeholder_values(row, env_columns, tolerance: float = 0.01) -> bool:
             return True
         
         # Check for NaN
+        # Note: NaN can mean either "not processed yet" or "outside Wyoming bounds"
+        # Both cases should be processed (outside bounds will get NaN again, which is correct)
         if pd.isna(row[col]):
             return True
         
@@ -752,6 +757,23 @@ def update_dataset(dataset_path: Path, data_dir: Path, batch_size: int = 1000, l
     return True
 
 
+def find_all_datasets(processed_dir: Path) -> list[Path]:
+    """
+    Find all combined presence/absence dataset files.
+    
+    Args:
+        processed_dir: Directory to search for dataset files
+    
+    Returns:
+        List of paths to dataset CSV files (excluding test files)
+    """
+    # Find all combined_*_presence_absence.csv files, excluding *_test.csv files
+    all_files = list(processed_dir.glob('combined_*_presence_absence.csv'))
+    # Filter out test files
+    dataset_files = [f for f in all_files if '_test' not in f.stem]
+    return sorted(dataset_files)
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -760,13 +782,18 @@ def main():
     parser.add_argument(
         'dataset',
         nargs='?',
-        default='data/processed/combined_north_bighorn_presence_absence.csv',
-        help='Path to dataset CSV file to update'
+        default=None,
+        help='Path to dataset CSV file to update. If not provided, processes all combined_*_presence_absence.csv files in the processed directory.'
     )
     parser.add_argument(
         '--data-dir',
         default='data',
         help='Path to data directory (default: data)'
+    )
+    parser.add_argument(
+        '--processed-dir',
+        default='data/processed',
+        help='Path to processed directory (default: data/processed). Used when processing all datasets.'
     )
     parser.add_argument(
         '--batch-size',
@@ -799,21 +826,74 @@ def main():
     
     args = parser.parse_args()
     
-    dataset_path = Path(args.dataset)
     data_dir = Path(args.data_dir)
-    
-    if not dataset_path.exists():
-        logger.error(f"Dataset not found: {dataset_path}")
-        logger.info(f"Usage: python {sys.argv[0]} <dataset_path>")
-        return 1
+    processed_dir = Path(args.processed_dir)
     
     if not data_dir.exists():
         logger.error(f"Data directory not found: {data_dir}")
         return 1
     
-    success = update_dataset(dataset_path, data_dir, args.batch_size, args.limit, args.workers, args.force)
-    
-    return 0 if success else 1
+    # Determine which dataset(s) to process
+    if args.dataset is None:
+        # Process all datasets
+        if not processed_dir.exists():
+            logger.error(f"Processed directory not found: {processed_dir}")
+            return 1
+        
+        dataset_files = find_all_datasets(processed_dir)
+        
+        if not dataset_files:
+            logger.warning(f"No combined_*_presence_absence.csv files found in {processed_dir}")
+            logger.info("Expected files matching pattern: combined_*_presence_absence.csv")
+            return 1
+        
+        logger.info(f"Found {len(dataset_files)} dataset file(s) to process:")
+        for f in dataset_files:
+            logger.info(f"  - {f.name}")
+        logger.info("")
+        
+        # Process each file
+        all_success = True
+        for i, dataset_path in enumerate(dataset_files, 1):
+            logger.info(f"{'='*70}")
+            logger.info(f"Processing dataset {i}/{len(dataset_files)}: {dataset_path.name}")
+            logger.info(f"{'='*70}")
+            
+            success = update_dataset(
+                dataset_path, data_dir, args.batch_size, args.limit, args.workers, args.force
+            )
+            
+            if not success:
+                logger.error(f"Failed to process {dataset_path.name}")
+                all_success = False
+            else:
+                logger.info(f"✓ Successfully processed {dataset_path.name}\n")
+        
+        if all_success:
+            logger.info(f"{'='*70}")
+            logger.info(f"✓ All {len(dataset_files)} dataset(s) processed successfully!")
+            logger.info(f"{'='*70}")
+            return 0
+        else:
+            logger.error(f"{'='*70}")
+            logger.error(f"✗ Some datasets failed to process")
+            logger.error(f"{'='*70}")
+            return 1
+    else:
+        # Process single dataset
+        dataset_path = Path(args.dataset)
+        
+        if not dataset_path.exists():
+            logger.error(f"Dataset not found: {dataset_path}")
+            logger.info(f"Usage: python {sys.argv[0]} [dataset_path]")
+            logger.info(f"  Or omit dataset_path to process all combined_*_presence_absence.csv files")
+            return 1
+        
+        success = update_dataset(
+            dataset_path, data_dir, args.batch_size, args.limit, args.workers, args.force
+        )
+        
+        return 0 if success else 1
 
 
 if __name__ == "__main__":

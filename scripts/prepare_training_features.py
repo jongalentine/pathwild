@@ -16,7 +16,7 @@ import argparse
 import pandas as pd
 from pathlib import Path
 import sys
-from typing import List, Set
+from typing import List, Set, Optional
 
 # Metadata columns to exclude from training (dataset-specific identifiers and source info)
 METADATA_COLUMNS = {
@@ -155,28 +155,51 @@ def prepare_training_dataset(
 def prepare_all_datasets(
     processed_dir: Path = Path('data/processed'),
     features_dir: Path = Path('data/features'),
-    exclude_temporal: bool = False
+    exclude_temporal: bool = False,
+    limit: Optional[int] = None
 ):
     """Prepare training features for all combined datasets."""
     processed_dir = Path(processed_dir)
     features_dir = Path(features_dir)
     
-    # Find all combined datasets
-    combined_files = list(processed_dir.glob('combined_*_presence_absence.csv'))
+    # When limit is set, look for test files (created by integrate_environmental_features with --limit)
+    if limit is not None:
+        # Find test files: combined_*_presence_absence_test.csv
+        combined_files = list(processed_dir.glob('combined_*_presence_absence_test.csv'))
+        if not combined_files:
+            print(f"⚠️  TEST MODE: No test files found in {processed_dir}")
+            print(f"   Looking for: combined_*_presence_absence_test.csv")
+            print(f"   Run integrate_environmental_features.py with --limit first")
+            return
+    else:
+        # Find regular combined datasets
+        combined_files = list(processed_dir.glob('combined_*_presence_absence.csv'))
+        # Exclude test files when not in test mode
+        combined_files = [f for f in combined_files if '_test' not in f.stem]
     
     if not combined_files:
         print(f"No combined datasets found in {processed_dir}")
         return
     
-    print(f"Found {len(combined_files)} dataset(s) to process\n")
+    print(f"Found {len(combined_files)} dataset(s) to process")
+    if limit is not None:
+        print(f"⚠️  TEST MODE: Processing test files (limit={limit})")
+    print()
     
     for input_file in combined_files:
         # Extract dataset name
-        dataset_name = input_file.stem.replace('combined_', '').replace('_presence_absence', '')
-        output_file = features_dir / f"{dataset_name}_features.csv"
+        dataset_name = input_file.stem.replace('combined_', '').replace('_presence_absence', '').replace('_test', '')
+        
+        # When limit is set, save to test file
+        if limit is not None:
+            output_file = features_dir / f"{dataset_name}_features_test.csv"
+        else:
+            output_file = features_dir / f"{dataset_name}_features.csv"
         
         print(f"{'='*70}")
         print(f"Processing: {dataset_name}")
+        if limit is not None:
+            print(f"  (TEST MODE)")
         print(f"{'='*70}")
         
         try:
@@ -247,6 +270,12 @@ Examples:
         default=Path('data/features'),
         help='Directory to save feature datasets (default: data/features)'
     )
+    parser.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='Limit mode: process test files (combined_*_presence_absence_test.csv) and save to test output files'
+    )
     
     args = parser.parse_args()
     
@@ -254,7 +283,8 @@ Examples:
         prepare_all_datasets(
             processed_dir=args.processed_dir,
             features_dir=args.features_dir,
-            exclude_temporal=args.exclude_temporal
+            exclude_temporal=args.exclude_temporal,
+            limit=args.limit
         )
     else:
         if not args.input_file or not args.output_file:

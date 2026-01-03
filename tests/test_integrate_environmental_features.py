@@ -34,6 +34,7 @@ _process_parallel = integrate_module._process_parallel
 update_dataset = integrate_module.update_dataset
 detect_optimal_workers = integrate_module.detect_optimal_workers
 detect_optimal_batch_size = integrate_module.detect_optimal_batch_size
+find_all_datasets = integrate_module.find_all_datasets
 
 
 class TestPlaceholderDetection:
@@ -789,4 +790,224 @@ class TestFullIntegration:
             # The key validation is functional (fewer or equal calls, as checked above)
             assert speedup >= -0.1, \
                 f"Incremental should not be more than 10% slower than force mode (got {speedup*100:.1f}%)"
+
+
+class TestBatchProcessing:
+    """Test batch processing of multiple datasets."""
+    
+    def test_find_all_datasets(self, tmp_path):
+        """Test finding all dataset files in a directory."""
+        processed_dir = tmp_path / "processed"
+        processed_dir.mkdir()
+        
+        # Create multiple dataset files
+        dataset1 = processed_dir / "combined_north_bighorn_presence_absence.csv"
+        dataset2 = processed_dir / "combined_southern_bighorn_presence_absence.csv"
+        dataset3 = processed_dir / "combined_national_refuge_presence_absence.csv"
+        test_file = processed_dir / "combined_north_bighorn_presence_absence_test.csv"
+        other_file = processed_dir / "other_file.csv"
+        
+        # Create empty files
+        for f in [dataset1, dataset2, dataset3, test_file, other_file]:
+            f.touch()
+        
+        # Find all datasets (should exclude test files and other files)
+        found = find_all_datasets(processed_dir)
+        
+        # Should find 3 dataset files, sorted
+        assert len(found) == 3
+        assert dataset1 in found
+        assert dataset2 in found
+        assert dataset3 in found
+        assert test_file not in found  # Test files should be excluded
+        assert other_file not in found  # Other files should be excluded
+        
+        # Should be sorted
+        assert found == sorted(found)
+    
+    def test_find_all_datasets_empty_directory(self, tmp_path):
+        """Test finding datasets in empty directory."""
+        processed_dir = tmp_path / "processed"
+        processed_dir.mkdir()
+        
+        found = find_all_datasets(processed_dir)
+        assert len(found) == 0
+    
+    def test_find_all_datasets_only_test_files(self, tmp_path):
+        """Test that test files are excluded."""
+        processed_dir = tmp_path / "processed"
+        processed_dir.mkdir()
+        
+        # Create only test files
+        test_file1 = processed_dir / "combined_north_bighorn_presence_absence_test.csv"
+        test_file2 = processed_dir / "combined_southern_bighorn_presence_absence_test.csv"
+        
+        for f in [test_file1, test_file2]:
+            f.touch()
+        
+        found = find_all_datasets(processed_dir)
+        assert len(found) == 0
+    
+    @patch.object(integrate_module, 'update_dataset')
+    def test_main_processes_all_datasets(self, mock_update_dataset, tmp_path, monkeypatch):
+        """Test that main() processes all datasets when no path is provided."""
+        processed_dir = tmp_path / "data" / "processed"
+        processed_dir.mkdir(parents=True)
+        data_dir = tmp_path / "data"
+        
+        # Create multiple dataset files
+        dataset1 = processed_dir / "combined_north_bighorn_presence_absence.csv"
+        dataset2 = processed_dir / "combined_southern_bighorn_presence_absence.csv"
+        
+        # Create minimal CSV files
+        df = pd.DataFrame({
+            'latitude': [43.0],
+            'longitude': [-110.0],
+            'elevation': [8500.0]
+        })
+        df.to_csv(dataset1, index=False)
+        df.to_csv(dataset2, index=False)
+        
+        # Mock update_dataset to return success
+        mock_update_dataset.return_value = True
+        
+        # Mock sys.argv to simulate no dataset argument
+        import sys
+        original_argv = sys.argv.copy()
+        try:
+            sys.argv = ['integrate_environmental_features.py', '--data-dir', str(data_dir), '--processed-dir', str(processed_dir)]
+            
+            # Call main function
+            result = integrate_module.main()
+            
+            # Should succeed
+            assert result == 0
+            
+            # Should have been called twice (once for each dataset)
+            assert mock_update_dataset.call_count == 2
+            
+            # Check that both datasets were processed
+            call_args_list = mock_update_dataset.call_args_list
+            processed_paths = [call[0][0] for call in call_args_list]
+            assert dataset1 in processed_paths
+            assert dataset2 in processed_paths
+            
+        finally:
+            sys.argv = original_argv
+    
+    @patch.object(integrate_module, 'update_dataset')
+    def test_main_processes_single_dataset_when_provided(self, mock_update_dataset, tmp_path, monkeypatch):
+        """Test that main() processes single dataset when path is provided."""
+        processed_dir = tmp_path / "data" / "processed"
+        processed_dir.mkdir(parents=True)
+        data_dir = tmp_path / "data"
+        
+        # Create dataset file
+        dataset1 = processed_dir / "combined_north_bighorn_presence_absence.csv"
+        dataset2 = processed_dir / "combined_southern_bighorn_presence_absence.csv"
+        
+        # Create minimal CSV files
+        df = pd.DataFrame({
+            'latitude': [43.0],
+            'longitude': [-110.0],
+            'elevation': [8500.0]
+        })
+        df.to_csv(dataset1, index=False)
+        df.to_csv(dataset2, index=False)
+        
+        # Mock update_dataset to return success
+        mock_update_dataset.return_value = True
+        
+        # Mock sys.argv to simulate dataset argument provided
+        import sys
+        original_argv = sys.argv.copy()
+        try:
+            sys.argv = [
+                'integrate_environmental_features.py',
+                str(dataset1),
+                '--data-dir', str(data_dir)
+            ]
+            
+            # Call main function
+            result = integrate_module.main()
+            
+            # Should succeed
+            assert result == 0
+            
+            # Should have been called once (only for specified dataset)
+            assert mock_update_dataset.call_count == 1
+            
+            # Check that only the specified dataset was processed
+            call_args = mock_update_dataset.call_args[0]
+            assert call_args[0] == dataset1
+            
+        finally:
+            sys.argv = original_argv
+    
+    @patch.object(integrate_module, 'update_dataset')
+    def test_main_handles_failed_dataset(self, mock_update_dataset, tmp_path, monkeypatch):
+        """Test that main() handles failures when processing multiple datasets."""
+        processed_dir = tmp_path / "data" / "processed"
+        processed_dir.mkdir(parents=True)
+        data_dir = tmp_path / "data"
+        
+        # Create multiple dataset files
+        dataset1 = processed_dir / "combined_north_bighorn_presence_absence.csv"
+        dataset2 = processed_dir / "combined_southern_bighorn_presence_absence.csv"
+        
+        # Create minimal CSV files
+        df = pd.DataFrame({
+            'latitude': [43.0],
+            'longitude': [-110.0],
+            'elevation': [8500.0]
+        })
+        df.to_csv(dataset1, index=False)
+        df.to_csv(dataset2, index=False)
+        
+        # Mock update_dataset to return failure for second dataset
+        def side_effect(dataset_path, *args, **kwargs):
+            if dataset_path == dataset2:
+                return False
+            return True
+        
+        mock_update_dataset.side_effect = side_effect
+        
+        # Mock sys.argv to simulate no dataset argument
+        import sys
+        original_argv = sys.argv.copy()
+        try:
+            sys.argv = ['integrate_environmental_features.py', '--data-dir', str(data_dir), '--processed-dir', str(processed_dir)]
+            
+            # Call main function
+            result = integrate_module.main()
+            
+            # Should fail (return code 1)
+            assert result == 1
+            
+            # Should have been called twice (once for each dataset)
+            assert mock_update_dataset.call_count == 2
+            
+        finally:
+            sys.argv = original_argv
+    
+    def test_main_no_datasets_found(self, tmp_path, monkeypatch):
+        """Test that main() handles case when no datasets are found."""
+        processed_dir = tmp_path / "data" / "processed"
+        processed_dir.mkdir(parents=True)
+        data_dir = tmp_path / "data"
+        
+        # Mock sys.argv to simulate no dataset argument
+        import sys
+        original_argv = sys.argv.copy()
+        try:
+            sys.argv = ['integrate_environmental_features.py', '--data-dir', str(data_dir), '--processed-dir', str(processed_dir)]
+            
+            # Call main function
+            result = integrate_module.main()
+            
+            # Should fail (return code 1) because no datasets found
+            assert result == 1
+            
+        finally:
+            sys.argv = original_argv
 

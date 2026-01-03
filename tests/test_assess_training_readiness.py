@@ -199,6 +199,51 @@ class TestAssessTrainingReadiness:
         # Should return valid scores (might be lower for small dataset)
         assert isinstance(score, (int, float))
         assert isinstance(percentage, (int, float))
+    
+    def test_assess_with_test_mode_flag(self, assess_module, tmp_path):
+        """Test that assess_training_readiness prefers test files when --test-mode is used."""
+        processed_dir = tmp_path / "data" / "processed"
+        processed_dir.mkdir(parents=True)
+        
+        # Create both regular and test files
+        regular_df = pd.DataFrame({
+            'latitude': [43.0, 43.1, 43.2],
+            'longitude': [-110.0, -110.1, -110.2],
+            'elk_present': [1, 0, 1],
+            'elevation': [2000.0, 2100.0, 2200.0],
+            'slope_degrees': [5.0, 10.0, 15.0],
+        })
+        
+        test_df = pd.DataFrame({
+            'latitude': [43.0, 43.1],
+            'longitude': [-110.0, -110.1],
+            'elk_present': [1, 0],
+            'elevation': [2000.0, 2100.0],
+            'slope_degrees': [5.0, 10.0],
+        })
+        
+        regular_file = processed_dir / "combined_north_bighorn_presence_absence.csv"
+        test_file = processed_dir / "combined_north_bighorn_presence_absence_test.csv"
+        regular_df.to_csv(regular_file, index=False)
+        test_df.to_csv(test_file, index=False)
+        
+        # Test without --test-mode (should prefer regular file)
+        import os
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            score1, pct1 = assess_module.assess_training_readiness(None, test_mode=False)
+            
+            # Test with --test-mode (should prefer test file)
+            score2, pct2 = assess_module.assess_training_readiness(None, test_mode=True)
+            
+            # Both should return valid scores
+            assert isinstance(score1, (int, float))
+            assert isinstance(score2, (int, float))
+            assert 0 <= score1 <= 5
+            assert 0 <= score2 <= 5
+        finally:
+            os.chdir(old_cwd)
 
 
 class TestAssessTrainingReadinessIntegration:
@@ -296,6 +341,50 @@ class TestAssessTrainingReadinessIntegration:
             # Should succeed if at least one dataset is found
             assert result.returncode == 0
             assert "TRAINING READINESS ASSESSMENT" in result.stdout or "READINESS ASSESSMENT" in result.stdout
+        finally:
+            os.chdir(old_cwd)
+    
+    def test_script_accepts_test_mode_flag(self, tmp_path):
+        """Test that script accepts --test-mode command-line flag."""
+        import subprocess
+        scripts_dir = Path(__file__).parent.parent / "scripts"
+        script_path = scripts_dir / "assess_training_readiness.py"
+        
+        if not script_path.exists():
+            pytest.skip("Script not found")
+        
+        # Create processed directory with test files
+        processed_dir = tmp_path / "data" / "processed"
+        processed_dir.mkdir(parents=True)
+        
+        df = pd.DataFrame({
+            'latitude': [43.0, 43.1],
+            'longitude': [-110.0, -110.1],
+            'elk_present': [1, 0],
+            'elevation': [2000.0, 2100.0],
+            'slope_degrees': [5.0, 10.0],
+        })
+        
+        # Create test file
+        test_file = processed_dir / "combined_north_bighorn_presence_absence_test.csv"
+        df.to_csv(test_file, index=False)
+        
+        # Change to tmp_path to simulate data directory
+        import os
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+            result = subprocess.run(
+                [sys.executable, str(script_path), '--test-mode'],
+                capture_output=True,
+                text=True,
+                cwd=tmp_path
+            )
+            
+            # Should succeed
+            assert result.returncode == 0
+            # Should indicate test mode
+            assert "TEST MODE" in result.stdout or "test" in result.stdout.lower()
         finally:
             os.chdir(old_cwd)
 

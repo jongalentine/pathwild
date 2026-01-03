@@ -212,64 +212,78 @@ class DataContextBuilder:
         context = {}
         
         # --- STATIC TERRAIN DATA ---
-        elevation = self._sample_raster(self.dem, lon, lat, default=8500.0)
-        context["elevation"] = elevation
+        # Check if location is within Wyoming bounds before sampling
+        # Wyoming boundaries: approximately 41-45°N, 104-111°W
+        wyoming_bounds = {
+            'north': 45.0,
+            'south': 41.0,
+            'east': -104.0,
+            'west': -111.0
+        }
         
-        # Warn if using placeholder elevation (indicates potential DEM boundary issue)
-        if elevation == 8500.0:
-            # Check if location is at/near Wyoming DEM boundaries
-            # Wyoming boundaries: approximately 41-45°N, 104-111°W
-            wyoming_bounds = {
-                'north': 45.0,
-                'south': 41.0,
-                'east': -104.0,
-                'west': -111.0
-            }
-            boundary_issues = []
-            
-            # Check if near boundaries (within 0.1 degrees)
-            tolerance = 0.1
-            if lat > wyoming_bounds['north'] - tolerance:
-                boundary_issues.append(f"near northern boundary ({wyoming_bounds['north']}°N)")
-            if lat < wyoming_bounds['south'] + tolerance:
-                boundary_issues.append(f"near southern boundary ({wyoming_bounds['south']}°N)")
-            if lon < wyoming_bounds['west'] + tolerance:
-                boundary_issues.append(f"near western boundary ({wyoming_bounds['west']}°W)")
-            if lon > wyoming_bounds['east'] - tolerance:
-                boundary_issues.append(f"near eastern boundary ({wyoming_bounds['east']}°W)")
-            
-            # Check if outside Wyoming bounds
-            outside_bounds = (
-                lat > wyoming_bounds['north'] or
-                lat < wyoming_bounds['south'] or
-                lon < wyoming_bounds['west'] or
-                lon > wyoming_bounds['east']
-            )
-            
-            # Build warning message
-            warning_msg = f"Using default elevation (8500 ft) for location ({lat:.6f}, {lon:.6f})"
-            if outside_bounds:
-                warning_msg += f" - LOCATION IS OUTSIDE WYOMING BOUNDS"
-            elif boundary_issues:
-                warning_msg += f" - Location is {', '.join(boundary_issues)}"
-            else:
-                warning_msg += " - DEM sampling failed (may be outside DEM bounds or DEM file issue)"
-            
-            logger.warning(warning_msg)
-        
-        context["slope_degrees"] = self._sample_raster(self.slope, lon, lat, default=15.0)
-        context["aspect_degrees"] = self._sample_raster(self.aspect, lon, lat, default=180.0)
-        # Sample canopy cover and clamp to valid range (0-100%)
-        canopy_value = self._sample_raster(
-            self.canopy, lon, lat, default=30.0
+        outside_bounds = (
+            lat > wyoming_bounds['north'] or
+            lat < wyoming_bounds['south'] or
+            lon < wyoming_bounds['west'] or
+            lon > wyoming_bounds['east']
         )
-        # Clamp to valid percentage range (0-100%)
-        context["canopy_cover_percent"] = max(0.0, min(100.0, canopy_value))
         
-        # Land cover type
-        landcover_code = self._sample_raster(self.landcover, lon, lat, default=0)
-        context["land_cover_type"] = self._decode_landcover(landcover_code)
-        context["land_cover_code"] = landcover_code
+        if outside_bounds:
+            # Location is outside Wyoming - use NaN to indicate "outside bounds" 
+            # This is different from placeholder 8500.0, so we can distinguish
+            # between "not processed yet" vs "outside bounds"
+            context["elevation"] = np.nan
+            logger.debug(f"Location ({lat:.6f}, {lon:.6f}) is outside Wyoming bounds - setting elevation to NaN")
+        else:
+            # Sample elevation from DEM
+            elevation = self._sample_raster(self.dem, lon, lat, default=8500.0)
+            context["elevation"] = elevation
+            
+            # Warn if using placeholder elevation (indicates DEM sampling failed)
+            if elevation == 8500.0:
+                # Check if near boundaries (within 0.1 degrees)
+                tolerance = 0.1
+                boundary_issues = []
+                if lat > wyoming_bounds['north'] - tolerance:
+                    boundary_issues.append(f"near northern boundary ({wyoming_bounds['north']}°N)")
+                if lat < wyoming_bounds['south'] + tolerance:
+                    boundary_issues.append(f"near southern boundary ({wyoming_bounds['south']}°N)")
+                if lon < wyoming_bounds['west'] + tolerance:
+                    boundary_issues.append(f"near western boundary ({wyoming_bounds['west']}°W)")
+                if lon > wyoming_bounds['east'] - tolerance:
+                    boundary_issues.append(f"near eastern boundary ({wyoming_bounds['east']}°W)")
+                
+                # Build warning message
+                warning_msg = f"Using default elevation (8500 ft) for location ({lat:.6f}, {lon:.6f})"
+                if boundary_issues:
+                    warning_msg += f" - Location is {', '.join(boundary_issues)}"
+                else:
+                    warning_msg += " - DEM sampling failed (may be outside DEM bounds or DEM file issue)"
+                
+                logger.warning(warning_msg)
+        
+        if outside_bounds:
+            # Location is outside Wyoming - set all terrain features to NaN
+            context["slope_degrees"] = np.nan
+            context["aspect_degrees"] = np.nan
+            context["canopy_cover_percent"] = np.nan
+            context["land_cover_code"] = np.nan
+            context["land_cover_type"] = "outside_bounds"
+        else:
+            # Sample terrain features from rasters
+            context["slope_degrees"] = self._sample_raster(self.slope, lon, lat, default=15.0)
+            context["aspect_degrees"] = self._sample_raster(self.aspect, lon, lat, default=180.0)
+            # Sample canopy cover and clamp to valid range (0-100%)
+            canopy_value = self._sample_raster(
+                self.canopy, lon, lat, default=30.0
+            )
+            # Clamp to valid percentage range (0-100%)
+            context["canopy_cover_percent"] = max(0.0, min(100.0, canopy_value))
+            
+            # Land cover type
+            landcover_code = self._sample_raster(self.landcover, lon, lat, default=0)
+            context["land_cover_type"] = self._decode_landcover(landcover_code)
+            context["land_cover_code"] = landcover_code
         
         # --- WATER DATA ---
         if self.water_sources is not None:
@@ -595,8 +609,14 @@ class DataContextBuilder:
         # Not in any pack territory
         return 0.5  # Background level
     
-    def _decode_landcover(self, code: int) -> str:
+    def _decode_landcover(self, code) -> str:
         """Decode NLCD land cover code to description"""
+        import pandas as pd
+        
+        # Handle NaN/None values
+        if pd.isna(code) or code is None:
+            return "outside_bounds"
+        
         landcover_map = {
             41: "deciduous_forest",
             42: "evergreen_forest",
@@ -632,25 +652,82 @@ class SNOTELClient:
         self.request_cache = {}  # Cache final results: {(lat, lon, date_str): result_dict}
         
         self._r_initialized = False
+        self._snotelr_warned = False  # Track if we've already warned about snotelr being unavailable
         self._init_r_snotelr()
     
     def _init_r_snotelr(self):
-        """Initialize R and load snotelr package"""
+        """
+        Initialize R and load snotelr package.
+        
+        Note: rpy2 uses Python's contextvars to store conversion rules. In worker threads,
+        these context variables are not automatically available. We try to initialize rpy2
+        properly in each thread, but R itself is not thread-safe, so this may still fail.
+        """
         try:
             import rpy2.robjects as ro  # type: ignore
             from rpy2.robjects.packages import importr  # type: ignore
+            # Note: pandas2ri is imported later when needed (in _fetch_snow_data)
+            # We don't need it here for initialization
             
             # Initialize R
             if not self._r_initialized:
                 # Try to import snotelr
                 try:
+                    # Note: pandas2ri.activate() is deprecated in newer rpy2 versions
+                    # We don't need to activate it here - it will be used with localconverter when needed
+                    # Attempting to activate can cause issues in some environments
+                    
                     self.snotelr = importr('snotelr')
                     self.ro = ro
                     self._r_initialized = True
                     logger.info("snotelr R package initialized successfully")
                 except Exception as e:
-                    logger.warning(f"Could not load snotelr R package: {e}")
-                    logger.info("Install with: R -e \"install.packages('snotelr', repos='https://cloud.r-project.org')\"")
+                    error_msg = str(e)
+                    import traceback
+                    import threading
+                    error_traceback = traceback.format_exc()
+                    
+                    # Check if we're in the main thread or a worker thread
+                    is_main_thread = threading.current_thread() is threading.main_thread()
+                    thread_info = "main thread" if is_main_thread else "worker thread"
+                    
+                    # Check if this is the rpy2 context issue with threading
+                    if "contextvars.ContextVar" in error_msg or "Conversion rules" in error_msg:
+                        # This is a known limitation: rpy2 context variables don't propagate to threads
+                        # R itself is also not thread-safe, so even if we fix the context issue,
+                        # using R in multiple threads simultaneously can cause crashes
+                        if not is_main_thread:
+                            logger.warning(
+                                f"Could not load snotelr R package in {thread_info} (rpy2 context issue). "
+                                "rpy2 uses contextvars that don't automatically propagate to worker threads. "
+                                "Additionally, R is not thread-safe. "
+                                "Falling back to elevation-based snow estimates for this thread."
+                            )
+                        else:
+                            # This shouldn't happen in main thread, but log it anyway
+                            logger.warning(
+                                f"Could not load snotelr R package in {thread_info} (rpy2 context issue). "
+                                "This is unexpected in the main thread. "
+                                "Falling back to elevation-based snow estimates."
+                            )
+                        logger.debug(f"Full error: {e}")
+                        logger.debug(f"Traceback:\n{error_traceback}")
+                        if not is_main_thread:
+                            logger.debug(
+                                "To use snotelr with parallel processing, consider: "
+                                "1) Use --workers 1 for sequential processing, or "
+                                "2) Use multiprocessing instead of threading (but rasterio datasets can't be pickled)"
+                            )
+                    else:
+                        # Other error - log it with more detail
+                        logger.warning(
+                            f"Could not load snotelr R package in {thread_info}: {e}"
+                        )
+                        logger.debug(f"Full traceback:\n{error_traceback}")
+                        logger.info("Install with: R -e \"install.packages('snotelr', repos='https://cloud.r-project.org')\"")
+                        logger.info("Or check if R and rpy2 are properly installed in your conda environment")
+                        if is_main_thread:
+                            logger.info("Since you're using --workers 1, this error is unexpected. Check R installation.")
                     self.snotelr = None
                     self.ro = None
         except ImportError:
@@ -773,7 +850,11 @@ class SNOTELClient:
         
         # Fetch data using snotelr R package
         if self.snotelr is None:
-            logger.warning("snotelr not available, using elevation estimate")
+            # Only warn once per DataContextBuilder instance to avoid log spam
+            if not self._snotelr_warned:
+                logger.warning("snotelr not available, using elevation estimate for all snow data")
+                logger.debug("This warning will only appear once per DataContextBuilder instance")
+                self._snotelr_warned = True
             result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
             self.request_cache[cache_key] = result
             return result

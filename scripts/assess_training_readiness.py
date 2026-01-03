@@ -7,7 +7,10 @@ for machine learning model training, including data volume, feature richness,
 feature distribution, and data quality.
 
 Usage:
-    python scripts/assess_training_readiness.py [--dataset PATH]
+    python scripts/assess_training_readiness.py [--dataset PATH] [--test-mode]
+    
+    --test-mode: Prefer test files over regular files when assessing all datasets.
+                 Use this when --limit was used in the pipeline to assess test files.
 """
 
 import argparse
@@ -18,7 +21,7 @@ import sys
 from typing import Optional
 from collections import Counter
 
-def assess_training_readiness(dataset_path: Optional[Path] = None):
+def assess_training_readiness(dataset_path: Optional[Path] = None, test_mode: bool = False):
     """
     Perform a comprehensive assessment of the dataset's readiness for model training.
     If dataset_path is None, it assesses all known datasets.
@@ -26,6 +29,7 @@ def assess_training_readiness(dataset_path: Optional[Path] = None):
     Args:
         dataset_path: Optional path to a specific integrated dataset CSV file.
                      If None, assesses all known datasets.
+        test_mode: If True, prefer test files over regular files when assessing all datasets.
     
     Returns:
         Tuple of (readiness_score, readiness_percentage)
@@ -57,18 +61,32 @@ def assess_training_readiness(dataset_path: Optional[Path] = None):
         
         datasets_to_assess = {}
         for display_name, base_name in base_datasets.items():
-            # Check for test file first
-            test_path = Path(f'data/processed/combined_{base_name}_presence_absence_test.csv')
             regular_path = Path(f'data/processed/combined_{base_name}_presence_absence.csv')
+            test_path = Path(f'data/processed/combined_{base_name}_presence_absence_test.csv')
             
-            if test_path.exists():
-                datasets_to_assess[f"{display_name} (TEST)"] = test_path
-            elif regular_path.exists():
-                datasets_to_assess[display_name] = regular_path
+            if test_mode:
+                # In test mode, prefer test files over regular files
+                if test_path.exists():
+                    datasets_to_assess[f"{display_name} (TEST)"] = test_path
+                elif regular_path.exists():
+                    # Fallback to regular file if test file doesn't exist
+                    datasets_to_assess[display_name] = regular_path
+            else:
+                # Default: prefer regular files over test files (test files are for testing only)
+                # Only use test files if regular file doesn't exist
+                if regular_path.exists():
+                    datasets_to_assess[display_name] = regular_path
+                elif test_path.exists():
+                    # Only use test file if regular file doesn't exist
+                    datasets_to_assess[f"{display_name} (TEST)"] = test_path
         
         if datasets_to_assess:
             test_count = sum(1 for name in datasets_to_assess.keys() if '(TEST)' in name)
-            if test_count > 0:
+            if test_mode:
+                print(f"\n⚠️  TEST MODE: Assessing test datasets (limited rows)")
+                if test_count > 0:
+                    print(f"   Found {test_count} test file(s)")
+            elif test_count > 0:
                 print(f"\nAssessing all known datasets ({test_count} test file(s) detected).")
             else:
                 print("\nAssessing all known datasets.")
@@ -342,9 +360,14 @@ def main():
         default=None,
         help='Path to a specific integrated dataset CSV file. If not provided, all known datasets will be assessed.'
     )
+    parser.add_argument(
+        '--test-mode',
+        action='store_true',
+        help='Prefer test files over regular files when assessing all datasets. Use this when --limit was used in the pipeline.'
+    )
     args = parser.parse_args()
     
-    score, score_pct = assess_training_readiness(args.dataset)
+    score, score_pct = assess_training_readiness(args.dataset, test_mode=args.test_mode)
     
     return 0 if score > 0 else 1
 

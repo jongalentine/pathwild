@@ -14,10 +14,9 @@ from pathlib import Path
 from shapely.geometry import Point, Polygon
 from shapely.ops import nearest_points
 import logging
+import time
 from multiprocessing import Pool, cpu_count
 from functools import partial
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -51,16 +50,20 @@ def _static_generate_worker(
     Opens rasters inside the worker process to avoid pickling issues.
     """
     import logging
+    import time
     worker_logger = logging.getLogger(f"{__name__}.worker.{seed}")
     
     try:
-        worker_logger.info(f"Worker {seed} starting: {n_samples} samples, {max_attempts} max attempts")
+        worker_logger.info(f"Worker {seed} starting: {n_samples} samples, {max_attempts:,} max attempts")
         
         if seed is not None:
             np.random.seed(seed)
         
         absence_points = []
         attempts = 0
+        start_time = time.time()
+        last_progress_time = start_time
+        last_progress_count = 0
         
         # Open rasters inside worker (avoids pickling issues)
         worker_logger.debug(f"Worker {seed}: Opening rasters...")
@@ -83,17 +86,37 @@ def _static_generate_worker(
                 worker_logger.warning(f"Worker {seed}: Failed to open slope: {e}")
         
         # Only load water sources if needed for this strategy
+        # OPTIMIZATION: Pre-convert to UTM and build spatial index once at startup
+        water_gdf_utm = None
+        water_sindex = None
         if water_path and strategy_name in ['environmental', 'unsuitable']:
             try:
                 worker_logger.debug(f"Worker {seed}: Loading water sources ({water_path})...")
-                water_gdf = gpd.read_file(water_path)
-                if water_gdf.crs != crs:
-                    water_gdf = water_gdf.to_crs(crs)
-                worker_logger.debug(f"Worker {seed}: Loaded {len(water_gdf)} water features")
-                # Don't build spatial index here - do it lazily when needed
+                water_gdf_temp = gpd.read_file(water_path)
+                worker_logger.debug(f"Worker {seed}: Loaded {len(water_gdf_temp)} water features")
+                
+                # Convert to UTM once at startup (optimization)
+                if water_gdf_temp.crs != utm_crs:
+                    worker_logger.debug(f"Worker {seed}: Converting water sources to UTM...")
+                    water_gdf_utm = water_gdf_temp.to_crs(utm_crs)
+                else:
+                    water_gdf_utm = water_gdf_temp
+                
+                # Build spatial index once at startup (optimization)
+                if len(water_gdf_utm) > 100:
+                    worker_logger.debug(f"Worker {seed}: Building spatial index for water sources...")
+                    try:
+                        water_sindex = water_gdf_utm.sindex
+                        worker_logger.debug(f"Worker {seed}: Spatial index built successfully")
+                    except Exception as e:
+                        worker_logger.warning(f"Worker {seed}: Failed to build spatial index: {e}")
+                        water_sindex = None
+                
+                worker_logger.debug(f"Worker {seed}: Water sources ready (UTM converted, index built)")
             except Exception as e:
                 worker_logger.warning(f"Worker {seed}: Failed to load water sources: {e}")
-                water_gdf = None
+                water_gdf_utm = None
+                water_sindex = None
         else:
             worker_logger.debug(f"Worker {seed}: Skipping water sources (not needed for {strategy_name})")
         
@@ -141,36 +164,74 @@ def _static_generate_worker(
                 return default
         
         def calculate_water_distance_static(point: Point) -> float:
-            """Calculate distance to nearest water source in miles (static version)."""
-            if water_gdf is None or len(water_gdf) == 0:
+            """Calculate distance to nearest water source in miles (static version).
+            
+            OPTIMIZED: Uses pre-converted UTM coordinates and spatial index for fast lookup.
+            """
+            if water_gdf_utm is None or len(water_gdf_utm) == 0:
                 return 0.5
+            
             try:
-                # Convert point and water_gdf to UTM for accurate distance calculation
-                # This avoids the geographic CRS warning and is more accurate
-                point_gdf = gpd.GeoDataFrame(geometry=[point], crs=crs)
-                point_utm = point_gdf.to_crs(utm_crs).geometry.iloc[0]
+                # OPTIMIZATION: Convert point to UTM using pyproj (faster than GeoDataFrame)
+                try:
+                    from pyproj import Transformer
+                    transformer = Transformer.from_crs(crs, utm_crs, always_xy=True)
+                    point_utm_x, point_utm_y = transformer.transform(point.x, point.y)
+                except ImportError:
+                    # Fallback to GeoDataFrame if pyproj not available
+                    point_gdf = gpd.GeoDataFrame(geometry=[point], crs=crs)
+                    point_utm = point_gdf.to_crs(utm_crs).geometry.iloc[0]
+                    point_utm_x, point_utm_y = point_utm.x, point_utm.y
                 
-                # Ensure water_gdf is in UTM (convert if needed)
-                water_gdf_utm = water_gdf
-                if water_gdf.crs != utm_crs:
-                    water_gdf_utm = water_gdf.to_crs(utm_crs)
+                from shapely.geometry import Point as ShapelyPoint
+                point_utm = ShapelyPoint(point_utm_x, point_utm_y)
                 
-                # For very large datasets, use sampling for performance
-                # unary_union on 958K+ features is extremely slow, and spatial index building can hang
+                # OPTIMIZATION: Use spatial index for nearest neighbor search (much faster)
+                if water_sindex is not None:
+                    try:
+                        # Find nearest water feature using spatial index
+                        # Query within a reasonable buffer (50km = ~31 miles)
+                        buffer_m = 50000  # 50km buffer
+                        bounds = (
+                            point_utm_x - buffer_m,
+                            point_utm_y - buffer_m,
+                            point_utm_x + buffer_m,
+                            point_utm_y + buffer_m
+                        )
+                        candidate_indices = list(water_sindex.intersection(bounds))
+                        
+                        if candidate_indices:
+                            # Calculate distance to candidates only (much faster than all features)
+                            candidates = water_gdf_utm.iloc[candidate_indices]
+                            distances_m = candidates.geometry.distance(point_utm)
+                            min_distance_m = distances_m.min()
+                        else:
+                            # No nearby water found, use a default
+                            min_distance_m = buffer_m
+                        
+                        # Convert meters to miles
+                        distance_mi = min_distance_m / 1609.34
+                        return float(distance_mi)
+                    except Exception as e:
+                        # Fall back to sampling if spatial index fails
+                        worker_logger.debug(f"Worker {seed}: Spatial index query failed, using fallback: {e}")
+                
+                # FALLBACK: Use sampling for very large datasets if spatial index unavailable
                 if len(water_gdf_utm) > 10000:
-                    # Always use sampling for large datasets - much faster and avoids index building
-                    sample_size = min(1000, len(water_gdf_utm))
+                    # Sample a smaller subset for performance
+                    sample_size = min(500, len(water_gdf_utm))  # Reduced from 1000 to 500
                     sample_gdf = water_gdf_utm.sample(n=sample_size, random_state=42)
-                    # Distance in UTM is in meters, convert to miles
                     distances_m = sample_gdf.geometry.distance(point_utm)
-                    distances_mi = distances_m / 1609.34  # meters to miles
-                    return float(distances_mi.min())
+                    min_distance_m = distances_m.min()
                 else:
                     # Small dataset: calculate distance to all
-                    # Distance in UTM is in meters, convert to miles
                     distances_m = water_gdf_utm.geometry.distance(point_utm)
-                    distances_mi = distances_m / 1609.34  # meters to miles
-                    return float(distances_mi.min())
+                    min_distance_m = distances_m.min()
+                
+                # Convert meters to miles
+                distance_mi = min_distance_m / 1609.34
+                return float(distance_mi)
+                
             except Exception as e:
                 # Return default if calculation fails
                 worker_logger.debug(f"Worker {seed}: Water distance calculation failed: {e}")
@@ -277,9 +338,30 @@ def _static_generate_worker(
         while len(absence_points) < n_samples and attempts < max_attempts:
             attempts += 1
             
-            # Log progress every 1000 attempts to show worker is alive
-            if attempts % 1000 == 0:
-                worker_logger.info(f"Worker {seed}: {attempts:,} attempts, {len(absence_points)}/{n_samples} points found")
+            # Log progress every 500 attempts or every 30 seconds, whichever comes first
+            current_time = time.time()
+            time_since_last_progress = current_time - last_progress_time
+            should_log = (
+                attempts % 500 == 0 or  # Every 500 attempts
+                time_since_last_progress >= 30.0 or  # Every 30 seconds
+                len(absence_points) > last_progress_count + 50  # Every 50 new points
+            )
+            
+            if should_log:
+                elapsed = current_time - start_time
+                rate = len(absence_points) / elapsed if elapsed > 0 else 0
+                remaining = n_samples - len(absence_points)
+                eta = remaining / rate if rate > 0 else 0
+                success_rate = (len(absence_points) / attempts * 100) if attempts > 0 else 0
+                
+                worker_logger.info(
+                    f"Worker {seed}: {len(absence_points):,}/{n_samples:,} points "
+                    f"({len(absence_points)/n_samples*100:.1f}%) - "
+                    f"{attempts:,} attempts ({success_rate:.2f}% success) - "
+                    f"{rate:.1f} pts/sec - ~{eta/60:.1f} min remaining"
+                )
+                last_progress_time = current_time
+                last_progress_count = len(absence_points)
             
             # Sample random point
             lon = np.random.uniform(study_area_bounds[0], study_area_bounds[2])
@@ -305,7 +387,15 @@ def _static_generate_worker(
             
             absence_points.append(point)
         
-        worker_logger.info(f"Worker {seed}: Completed - found {len(absence_points)}/{n_samples} points in {attempts} attempts")
+        elapsed = time.time() - start_time
+        success_rate = (len(absence_points) / attempts * 100) if attempts > 0 else 0
+        rate = len(absence_points) / elapsed if elapsed > 0 else 0
+        
+        worker_logger.info(
+            f"Worker {seed}: ✓ Completed - {len(absence_points):,}/{n_samples:,} points "
+            f"in {attempts:,} attempts ({success_rate:.2f}% success) "
+            f"in {elapsed/60:.1f} minutes ({rate:.1f} pts/sec)"
+        )
         
         # Close rasters
         if dem_raster:
@@ -548,12 +638,25 @@ class AbsenceGenerator(ABC):
                     logger.debug("Starting parallel worker pool...")
                     async_result = pool.starmap_async(_static_generate_worker, worker_args)
                     
-                    # Wait with a reasonable timeout (5 minutes per worker should be plenty)
-                    # For 10,000 attempts, should complete in < 1 minute even if slow
-                    timeout = max(300, max_attempts // 100)  # At least 5 minutes, or based on attempts
-                    logger.debug(f"Waiting for workers (timeout: {timeout}s)...")
+                    # Calculate timeout based on per-worker work, not total
+                    # Each worker processes samples_per_process samples with attempts_per_worker attempts
+                    # Estimate: ~1-2 seconds per sample (with retries), minimum 10 minutes for large batches
+                    samples_per_worker = samples_per_process + (1 if remaining_samples > 0 else 0)
+                    estimated_time_per_sample = 2.0  # Conservative: 2 seconds per sample
+                    base_timeout = samples_per_worker * estimated_time_per_sample
+                    # Add buffer for overhead and slow workers
+                    timeout = max(600, int(base_timeout * 1.5))  # At least 10 minutes, or 1.5x estimated time
+                    # Cap at 30 minutes to prevent infinite waits
+                    timeout = min(timeout, 1800)
+                    
+                    logger.info(f"Waiting for {n_processes} workers to complete...")
+                    logger.info(f"  Timeout: {timeout/60:.1f} minutes (estimated: {base_timeout/60:.1f} min)")
+                    logger.info(f"  Per worker: ~{samples_per_worker} samples, {attempts_per_worker:,} max attempts")
+                    
+                    start_time = time.time()
                     results = async_result.get(timeout=timeout)
-                    logger.info(f"All workers completed successfully")
+                    elapsed = time.time() - start_time
+                    logger.info(f"✓ All workers completed successfully in {elapsed/60:.1f} minutes")
             except TimeoutError:
                 logger.error(f"Workers timed out after {timeout}s - some workers may be stuck")
                 pool.terminate()  # Force kill stuck workers
