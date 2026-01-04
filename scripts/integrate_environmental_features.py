@@ -316,9 +316,9 @@ def _process_sequential(df, builder, date_col, batch_size, limit, dataset_path, 
     
     iterator = rows_to_process
     if HAS_TQDM:
-        iterator = tqdm(iterator, desc="Processing points")
+        iterator = tqdm(iterator, desc="Processing points", total=len(rows_to_process))
     else:
-        logger.info("Progress bar not available (install tqdm for progress updates)")
+        logger.info(f"Processing {len(rows_to_process):,} points...")
     
     for idx in iterator:
         try:
@@ -852,22 +852,52 @@ def main():
             logger.info(f"  - {f.name}")
         logger.info("")
         
-        # Process each file
+        # Process datasets in parallel (optimization 1)
+        # Limit concurrent datasets to avoid memory exhaustion
+        max_concurrent = min(len(dataset_files), 4)  # Limit to 4 concurrent datasets
+        
+        if max_concurrent > 1:
+            logger.info(f"Processing {len(dataset_files)} dataset(s) in parallel (max {max_concurrent} concurrent)")
+        else:
+            logger.info(f"Processing {len(dataset_files)} dataset(s)")
+        
         all_success = True
-        for i, dataset_path in enumerate(dataset_files, 1):
-            logger.info(f"{'='*70}")
-            logger.info(f"Processing dataset {i}/{len(dataset_files)}: {dataset_path.name}")
-            logger.info(f"{'='*70}")
+        failed_datasets = []
+        
+        # Use ThreadPoolExecutor for parallel dataset processing
+        with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+            # Submit all datasets
+            future_to_dataset = {
+                executor.submit(
+                    update_dataset,
+                    dataset_path,
+                    data_dir,
+                    args.batch_size,
+                    args.limit,
+                    args.workers,
+                    args.force
+                ): dataset_path
+                for dataset_path in dataset_files
+            }
             
-            success = update_dataset(
-                dataset_path, data_dir, args.batch_size, args.limit, args.workers, args.force
-            )
-            
-            if not success:
-                logger.error(f"Failed to process {dataset_path.name}")
-                all_success = False
-            else:
-                logger.info(f"✓ Successfully processed {dataset_path.name}\n")
+            # Process results as they complete
+            completed = 0
+            for future in as_completed(future_to_dataset):
+                dataset_path = future_to_dataset[future]
+                completed += 1
+                
+                try:
+                    success = future.result()
+                    if success:
+                        logger.info(f"✓ [{completed}/{len(dataset_files)}] Successfully processed {dataset_path.name}")
+                    else:
+                        logger.error(f"✗ [{completed}/{len(dataset_files)}] Failed to process {dataset_path.name}")
+                        all_success = False
+                        failed_datasets.append(dataset_path.name)
+                except Exception as e:
+                    logger.error(f"✗ [{completed}/{len(dataset_files)}] Error processing {dataset_path.name}: {e}")
+                    all_success = False
+                    failed_datasets.append(dataset_path.name)
         
         if all_success:
             logger.info(f"{'='*70}")
@@ -877,6 +907,8 @@ def main():
         else:
             logger.error(f"{'='*70}")
             logger.error(f"✗ Some datasets failed to process")
+            if failed_datasets:
+                logger.error(f"Failed datasets: {', '.join(failed_datasets)}")
             logger.error(f"{'='*70}")
             return 1
     else:

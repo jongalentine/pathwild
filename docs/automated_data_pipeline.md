@@ -265,9 +265,12 @@ The `run_data_pipeline.py` script orchestrates all pipeline steps automatically.
 - **Automatic step ordering** - Runs steps in correct sequence
 - **Dependency checking** - Verifies inputs exist before running steps
 - **Skip completed steps** - Detects already-complete steps and skips them
-- **Progress tracking** - Shows progress for each step
+- **Progress tracking** - Shows consistent progress reporting across all steps with tqdm progress bars and batch completion messages
 - **Error handling** - Stops pipeline on failure with clear error messages
 - **Force mode** - Option to force regeneration of all features
+- **Logging** - All pipeline output logged to timestamped files in `logs/` directory
+- **Retry logic** - Automatic retry with exponential backoff for transient API errors (5xx)
+- **Warning suppression** - Duplicate warnings suppressed to reduce log noise
 
 ### Command-Line Options
 

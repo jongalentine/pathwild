@@ -33,18 +33,33 @@ def process_shapefile(input_path: Path, dataset_name: str) -> pd.DataFrame:
     """
     Process a shapefile containing migration routes into presence points.
     
+    Converts coordinates to WGS84 (lat/lon) if the shapefile is in a different CRS.
+    
     Args:
         input_path: Path to shapefile (.shp)
         dataset_name: Name of the dataset (for metadata)
     
     Returns:
-        DataFrame with presence points
+        DataFrame with presence points in WGS84 (lat/lon)
     """
     logger.info(f"Processing shapefile: {input_path}")
     
     # Load shapefile
     gdf = gpd.read_file(input_path)
     logger.info(f"  Loaded {len(gdf):,} features")
+    logger.info(f"  Original CRS: {gdf.crs}")
+    
+    # Transform to WGS84 (EPSG:4326) if not already in that CRS
+    # This ensures we extract lat/lon coordinates, not UTM or other projected coordinates
+    if gdf.crs is None:
+        logger.warning("  Shapefile has no CRS defined. Assuming WGS84.")
+        gdf.set_crs('EPSG:4326', inplace=True)
+    elif gdf.crs != 'EPSG:4326':
+        logger.info(f"  Transforming from {gdf.crs} to WGS84 (EPSG:4326)...")
+        gdf = gdf.to_crs('EPSG:4326')
+        logger.info("  ✓ Transformation complete")
+    else:
+        logger.info("  Shapefile already in WGS84 (EPSG:4326)")
     
     # Extract points from geometries
     # Shapefiles may contain LineStrings (routes) or Points
@@ -53,7 +68,7 @@ def process_shapefile(input_path: Path, dataset_name: str) -> pd.DataFrame:
         geom = row.geometry
         
         if geom.geom_type == 'Point':
-            # Already a point
+            # Already a point - extract lat/lon (y/x in WGS84)
             point_data = {
                 'latitude': geom.y,
                 'longitude': geom.x,
@@ -75,6 +90,7 @@ def process_shapefile(input_path: Path, dataset_name: str) -> pd.DataFrame:
                 coords = list(geom.coords)
             
             # Create a point for each coordinate
+            # In WGS84, coords are (lon, lat) = (x, y)
             for i, (lon, lat) in enumerate(coords):
                 point_data = {
                     'latitude': lat,
@@ -93,6 +109,16 @@ def process_shapefile(input_path: Path, dataset_name: str) -> pd.DataFrame:
     
     df = pd.DataFrame(points)
     logger.info(f"  Extracted {len(df):,} presence points")
+    
+    # Validate coordinates are in valid lat/lon range
+    invalid_coords = (
+        (~df['latitude'].between(-90, 90)) |
+        (~df['longitude'].between(-180, 180))
+    ).sum()
+    if invalid_coords > 0:
+        logger.warning(f"  Found {invalid_coords:,} points with invalid lat/lon coordinates")
+        logger.warning(f"    Latitude range: {df['latitude'].min():.2f} to {df['latitude'].max():.2f}")
+        logger.warning(f"    Longitude range: {df['longitude'].min():.2f} to {df['longitude'].max():.2f}")
     
     return df
 

@@ -40,7 +40,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Helper function to find all datasets (matches integrate_environmental_features.py logic)
 def _find_all_datasets(processed_dir: Path, test_only: bool = False) -> list[Path]:
@@ -61,12 +61,98 @@ def _find_all_datasets(processed_dir: Path, test_only: bool = False) -> list[Pat
         dataset_files = [f for f in all_files if '_test' not in f.stem]
     return sorted(dataset_files)
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Configure logging - will be set up in main() after determining log file path
 logger = logging.getLogger(__name__)
+
+
+def setup_logging(log_file: Optional[Path] = None) -> None:
+    """
+    Set up logging to both console and file.
+    
+    Args:
+        log_file: Optional path to log file. If None, only logs to console.
+    """
+    # Clear any existing handlers
+    logger.handlers.clear()
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+    
+    # File handler (if log_file provided)
+    if log_file:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+        logger.info(f"Logging to: {log_file}")
+    
+    root_logger.setLevel(logging.INFO)
+
+
+def cleanup_old_logs(logs_dir: Path, max_age_days: int = 7) -> None:
+    """
+    Delete log files older than specified number of days.
+    
+    Args:
+        logs_dir: Directory containing log files
+        max_age_days: Maximum age in days (default: 7 = 1 week)
+    """
+    if not logs_dir.exists():
+        return
+    
+    cutoff_time = time.time() - (max_age_days * 24 * 60 * 60)
+    deleted_count = 0
+    
+    for log_file in logs_dir.glob('*.log'):
+        try:
+            if log_file.stat().st_mtime < cutoff_time:
+                log_file.unlink()
+                deleted_count += 1
+        except Exception as e:
+            # Use print instead of logger since logging may not be set up yet
+            print(f"Warning: Failed to delete old log file {log_file}: {e}", file=sys.stderr)
+    
+    if deleted_count > 0:
+        # Use print instead of logger since logging may not be set up yet
+        print(f"Cleaned up {deleted_count} log file(s) older than {max_age_days} days")
+
+
+def get_log_file_path(data_dir: Path, dataset_name: Optional[str] = None) -> Path:
+    """
+    Generate log file path based on dataset and timestamp.
+    
+    Args:
+        data_dir: Base data directory
+        dataset_name: Optional dataset name. If None, uses "all_datasets"
+    
+    Returns:
+        Path to log file
+    """
+    logs_dir = data_dir / 'logs'
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Generate timestamp
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    # Generate dataset identifier
+    if dataset_name:
+        dataset_id = dataset_name
+    else:
+        dataset_id = 'all_datasets'
+    
+    # Create log file name: pipeline_<dataset>_<timestamp>.log
+    log_filename = f"pipeline_{dataset_id}_{timestamp}.log"
+    
+    return logs_dir / log_filename
 
 
 class PipelineStep:
@@ -111,6 +197,19 @@ class PipelineStep:
     def is_complete(self) -> bool:
         """Check if this step has already been completed."""
         if not self.check_output_exists:
+            # For steps without output files (like analysis steps), check if input hasn't changed
+            # by comparing input file modification time to a marker file
+            if self.required_input and self.required_input.exists():
+                marker_file = self.required_input.parent / f".{self.required_input.stem}.{self.name}.complete"
+                if marker_file.exists():
+                    # Check if input file has been modified since marker was created
+                    input_mtime = self.required_input.stat().st_mtime
+                    marker_mtime = marker_file.stat().st_mtime
+                    if marker_mtime >= input_mtime:
+                        # Input hasn't changed since last successful run
+                        return True
+            # For steps without required_input (like assess_readiness), always run
+            # as they provide current status information
             return False
         
         # Check single expected output
@@ -147,20 +246,37 @@ class PipelineStep:
         start_time = time.time()
         
         try:
-            result = subprocess.run(
+            # Use Popen to capture output in real-time and log it
+            process = subprocess.Popen(
                 [sys.executable, str(self.script_path)] + self.command_args,
-                check=True,
-                capture_output=False,  # Show output in real-time
-                text=True
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,  # Combine stderr into stdout
+                text=True,
+                bufsize=1  # Line buffered
             )
+            
+            # Read output line by line and log it
+            for line in iter(process.stdout.readline, ''):
+                if line:
+                    # Remove trailing newline and log the line
+                    line = line.rstrip('\n\r')
+                    if line:  # Only log non-empty lines
+                        logger.info(line)
+            
+            # Wait for process to complete
+            returncode = process.wait()
             
             elapsed = time.time() - start_time
             
-            if result.returncode == 0:
+            if returncode == 0:
                 logger.info(f"  ✓ Completed in {elapsed:.1f}s")
+                # Create marker file for steps without output files (analysis steps)
+                if not self.check_output_exists and self.required_input and self.required_input.exists():
+                    marker_file = self.required_input.parent / f".{self.required_input.stem}.{self.name}.complete"
+                    marker_file.touch()  # Create/update marker file
                 return True
             else:
-                logger.error(f"  ✗ Failed with return code {result.returncode}")
+                logger.error(f"  ✗ Failed with return code {returncode}")
                 return False
                 
         except subprocess.CalledProcessError as e:
@@ -668,6 +784,15 @@ Examples:
     )
     
     args = parser.parse_args()
+    
+    # Set up logging to file and console
+    # Clean up old logs first (before setting up logging to avoid logging the cleanup)
+    logs_dir = args.data_dir / 'logs'
+    cleanup_old_logs(logs_dir, max_age_days=7)
+    
+    # Generate log file path and set up logging
+    log_file = get_log_file_path(args.data_dir, args.dataset)
+    setup_logging(log_file)
     
     skip_steps = []
     if args.skip_steps:

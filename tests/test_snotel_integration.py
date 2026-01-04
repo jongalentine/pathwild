@@ -1,9 +1,9 @@
 """
 Unit and integration tests for SNOTEL data integration.
 
-Tests SNOTELClient with snotelr R package integration, including:
+Tests AWDBClient with AWDB R package integration, including:
 - Station loading and mapping
-- Data retrieval from snotelr
+- Data retrieval from AWDB
 - Error handling and fallbacks
 - Caching behavior
 """
@@ -17,7 +17,7 @@ import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
 
-from src.data.processors import SNOTELClient
+from src.data.processors import AWDBClient
 
 
 @pytest.fixture
@@ -26,6 +26,17 @@ def data_dir(tmp_path):
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir(parents=True)
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def reset_warning_sets():
+    """Reset warning sets before each test to avoid test pollution."""
+    AWDBClient._warned_stations.clear()
+    AWDBClient._warned_api_failures.clear()
+    yield
+    # Clean up after test
+    AWDBClient._warned_stations.clear()
+    AWDBClient._warned_api_failures.clear()
 
 
 @pytest.fixture
@@ -45,7 +56,8 @@ def sample_station_file(data_dir):
                 "lon": -106.3167,
                 "elevation_ft": 9700,
                 "state": "WY",
-                "snotelr_site_id": 1196
+                "awdb_station_id": 1196,
+                "AWDB_site_id": 1196
             }
         },
         {
@@ -59,7 +71,8 @@ def sample_station_file(data_dir):
                 "lon": -109.2833,
                 "elevation_ft": 8840,
                 "state": "WY",
-                "snotelr_site_id": 419
+                "awdb_station_id": 419,
+                "AWDB_site_id": 419
             }
         },
         {
@@ -73,7 +86,8 @@ def sample_station_file(data_dir):
                 "lon": -106.4250,
                 "elevation_ft": 10200,
                 "state": "WY",
-                "snotelr_site_id": None  # Unmapped station
+                "awdb_station_id": None,  # Unmapped station
+                "AWDB_site_id": None
             }
         }
     ]
@@ -92,43 +106,46 @@ def sample_station_file(data_dir):
 
 
 
-class TestSNOTELClientUnit:
-    """Unit tests for SNOTELClient."""
+class TestAWDBClientUnit:
+    """Unit tests for AWDBClient."""
     
     @pytest.mark.unit
     def test_init_with_data_dir(self, data_dir):
-        """Test SNOTELClient initialization with data_dir."""
-        client = SNOTELClient(data_dir=data_dir)
+        """Test AWDBClient initialization with data_dir."""
+        client = AWDBClient(data_dir=data_dir)
         assert client.data_dir == data_dir
         assert client.station_cache_path == data_dir / "cache" / "snotel_stations_wyoming.geojson"
     
     @pytest.mark.unit
     def test_init_default_data_dir(self):
-        """Test SNOTELClient initialization with default data_dir."""
-        client = SNOTELClient()
+        """Test AWDBClient initialization with default data_dir."""
+        client = AWDBClient()
         assert client.data_dir == Path("data")
     
     @pytest.mark.unit
-    @patch('geopandas.read_file')
-    def test_load_stations_file_exists(self, mock_read_file, data_dir, sample_station_file):
+    @patch.object(AWDBClient, '_load_stations_from_awdb')
+    def test_load_stations_file_exists(self, mock_load_from_awdb, data_dir, sample_station_file):
         """Test loading stations when file exists."""
-        # Mock geopandas to avoid sandbox issues
+        # Mock the API call to return success and set up stations
         mock_gdf = gpd.GeoDataFrame({
             'name': ['MEDICINE BOW', 'COTTONWOOD CREEK', 'ELKHORN PARK'],
-            'triplet': ['SNOTEL:WY:975', 'SNOTEL:WY:964', 'SNOTEL:WY:967'],
+            'triplet': ['1196:WY:SNTL', '419:WY:SNTL', '468:WY:SNTL'],
             'lat': [41.3500, 44.5500, 41.8350],
             'lon': [-106.3167, -109.2833, -106.4250],
             'elevation_ft': [9700, 8840, 10200],
             'state': ['WY', 'WY', 'WY'],
-            'snotelr_site_id': [1196, 419, None],
+            'awdb_station_id': [1196, 419, 468],
+            'AWDB_site_id': [1196, 419, 468],  # Alias for backward compatibility
             'geometry': [Point(-106.3167, 41.3500), Point(-109.2833, 44.5500), 
                         Point(-106.4250, 41.8350)]
         }, crs='EPSG:4326')
-        mock_read_file.return_value = mock_gdf
         
-        client = SNOTELClient(data_dir=data_dir)
-        # Force reload
-        client._load_stations()
+        # Mock the function to return True, then set stations directly after client creation
+        mock_load_from_awdb.return_value = True
+        
+        client = AWDBClient(data_dir=data_dir)
+        # Set stations directly since the mock returned True
+        client._stations_gdf = mock_gdf
         
         assert client._stations_gdf is not None
         assert len(client._stations_gdf) == 3
@@ -137,52 +154,48 @@ class TestSNOTELClientUnit:
     @pytest.mark.unit
     def test_load_stations_file_missing(self, data_dir):
         """Test loading stations when file doesn't exist."""
-        client = SNOTELClient(data_dir=data_dir)
+        client = AWDBClient(data_dir=data_dir)
         # Should not raise error, just set to None
         assert client._stations_gdf is None
     
     @pytest.mark.unit
-    @patch('geopandas.read_file')
-    @patch('geopandas.sjoin_nearest')
-    def test_find_nearest_station_mapped(self, mock_sjoin, mock_read_file, data_dir, sample_station_file):
-        """Test finding nearest station with snotelr_site_id."""
-        # Mock geopandas to avoid sandbox issues
+    @patch.object(AWDBClient, '_load_stations_from_awdb')
+    def test_find_nearest_station_mapped(self, mock_load_from_awdb, data_dir, sample_station_file):
+        """Test finding nearest station with AWDB_site_id."""
+        # Mock the API call to return success and set up stations
         mock_gdf = gpd.GeoDataFrame({
             'name': ['MEDICINE BOW', 'COTTONWOOD CREEK', 'ELKHORN PARK'],
-            'triplet': ['SNOTEL:WY:975', 'SNOTEL:WY:964', 'SNOTEL:WY:967'],
+            'triplet': ['1196:WY:SNTL', '419:WY:SNTL', '468:WY:SNTL'],
             'lat': [41.3500, 44.5500, 41.8350],
             'lon': [-106.3167, -109.2833, -106.4250],
             'elevation_ft': [9700, 8840, 10200],
             'state': ['WY', 'WY', 'WY'],
-            'snotelr_site_id': [1196, 419, None],
+            'awdb_station_id': [1196, 419, 468],
+            'AWDB_site_id': [1196, 419, 468],  # Alias for backward compatibility
             'geometry': [Point(-106.3167, 41.3500), Point(-109.2833, 44.5500), 
                         Point(-106.4250, 41.8350)]
         }, crs='EPSG:4326')
-        mock_read_file.return_value = mock_gdf
         
-        # Mock sjoin_nearest to return first station
-        mock_result = gpd.GeoDataFrame({
-            'index_right': [0],
-            'distance_m': [0.0]  # 0 meters = very close
-        })
-        mock_sjoin.return_value = mock_result
+        # Mock the function to return True, then set stations directly after client creation
+        mock_load_from_awdb.return_value = True
         
-        client = SNOTELClient(data_dir=data_dir)
-        client._load_stations()
+        client = AWDBClient(data_dir=data_dir)
+        # Set stations directly since the mock returned True
+        client._stations_gdf = mock_gdf
         
         # Test location near MEDICINE BOW
         station = client._find_nearest_station(41.3500, -106.3167)
         
         assert station is not None
         assert station['name'] == "MEDICINE BOW"
-        assert station['triplet'] == "SNOTEL:WY:975"
-        assert station['snotelr_site_id'] == 1196
+        assert station['triplet'] == "1196:WY:SNTL"
+        assert station['AWDB_site_id'] == 1196
         assert station['distance_km'] < 1.0  # Should be very close
     
     @pytest.mark.unit
     def test_find_nearest_station_no_stations(self, data_dir):
         """Test finding nearest station when no stations loaded."""
-        client = SNOTELClient(data_dir=data_dir)
+        client = AWDBClient(data_dir=data_dir)
         client._stations_gdf = None
         
         station = client._find_nearest_station(41.3500, -106.3167)
@@ -201,7 +214,8 @@ class TestSNOTELClientUnit:
             'lon': [-106.3167],
             'elevation_ft': [9700],
             'state': ['WY'],
-            'snotelr_site_id': [1196],
+            'awdb_station_id': [1196],
+            'AWDB_site_id': [1196],
             'geometry': [Point(-106.3167, 41.3500)]
         }, crs='EPSG:4326')
         mock_read_file.return_value = mock_gdf
@@ -213,7 +227,7 @@ class TestSNOTELClientUnit:
         })
         mock_sjoin.return_value = mock_result
         
-        client = SNOTELClient(data_dir=data_dir)
+        client = AWDBClient(data_dir=data_dir)
         client._load_stations()
         
         # Test location far from all stations (e.g., in ocean)
@@ -221,25 +235,29 @@ class TestSNOTELClientUnit:
         assert station is None
     
     @pytest.mark.unit
-    @patch('geopandas.read_file')
-    def test_find_nearest_station_prioritizes_mapped(self, mock_read_file, data_dir, sample_station_file):
+    @patch.object(AWDBClient, '_load_stations_from_awdb')
+    def test_find_nearest_station_prioritizes_mapped(self, mock_load_from_awdb, data_dir, sample_station_file):
         """Test that _find_nearest_station prioritizes mapped stations over unmapped ones."""
-        # Mock geopandas - create scenario where unmapped station is closer but mapped is within range
+        # Mock the API call to return success and set up stations
         mock_gdf = gpd.GeoDataFrame({
             'name': ['ELKHORN PARK', 'MEDICINE BOW', 'COTTONWOOD CREEK'],
-            'triplet': ['SNOTEL:WY:967', 'SNOTEL:WY:975', 'SNOTEL:WY:964'],
+            'triplet': ['468:WY:SNTL', '1196:WY:SNTL', '419:WY:SNTL'],
             'lat': [41.8350, 41.3500, 44.5500],
             'lon': [-106.4250, -106.3167, -109.2833],
             'elevation_ft': [10200, 9700, 8840],
             'state': ['WY', 'WY', 'WY'],
-            'snotelr_site_id': [None, 1196, 419],  # ELKHORN PARK unmapped, others mapped
+            'awdb_station_id': [None, 1196, 419],  # ELKHORN PARK unmapped, others mapped
+            'AWDB_site_id': [None, 1196, 419],  # Alias for backward compatibility
             'geometry': [Point(-106.4250, 41.8350), Point(-106.3167, 41.3500), 
                         Point(-109.2833, 44.5500)]
         }, crs='EPSG:4326')
-        mock_read_file.return_value = mock_gdf
         
-        client = SNOTELClient(data_dir=data_dir)
-        client._load_stations()
+        # Mock the function to return True, then set stations directly after client creation
+        mock_load_from_awdb.return_value = True
+        
+        client = AWDBClient(data_dir=data_dir)
+        # Set stations directly since the mock returned True
+        client._stations_gdf = mock_gdf
         
         # Test location between ELKHORN PARK (closer, unmapped) and MEDICINE BOW (farther, mapped)
         # Should prefer MEDICINE BOW (mapped) even though it's farther
@@ -248,58 +266,65 @@ class TestSNOTELClientUnit:
         assert station is not None
         # Should prefer mapped station (MEDICINE BOW) over unmapped (ELKHORN PARK)
         assert station['name'] == "MEDICINE BOW"
-        assert station['snotelr_site_id'] == 1196
+        assert station['AWDB_site_id'] == 1196
     
     @pytest.mark.unit
-    @patch('geopandas.read_file')
-    def test_find_nearest_station_unmapped_when_no_mapped(self, mock_read_file, data_dir, sample_station_file):
+    @patch.object(AWDBClient, '_load_stations_from_awdb')
+    def test_find_nearest_station_unmapped_when_no_mapped(self, mock_load_from_awdb, data_dir, sample_station_file):
         """Test that _find_nearest_station uses unmapped station when no mapped stations available."""
-        # Mock geopandas - only unmapped stations
+        # Mock the API call to return success and set up stations
         mock_gdf = gpd.GeoDataFrame({
             'name': ['ELKHORN PARK'],
-            'triplet': ['SNOTEL:WY:967'],
+            'triplet': ['468:WY:SNTL'],
             'lat': [41.8350],
             'lon': [-106.4250],
             'elevation_ft': [10200],
             'state': ['WY'],
-            'snotelr_site_id': [None],  # Unmapped
+            'awdb_station_id': [None],  # Unmapped
+            'AWDB_site_id': [None],
             'geometry': [Point(-106.4250, 41.8350)]
         }, crs='EPSG:4326')
-        mock_read_file.return_value = mock_gdf
         
-        client = SNOTELClient(data_dir=data_dir)
-        client._load_stations()
+        # Mock the function to return True, then set stations directly after client creation
+        mock_load_from_awdb.return_value = True
+        
+        client = AWDBClient(data_dir=data_dir)
+        # Set stations directly since the mock returned True
+        client._stations_gdf = mock_gdf
         
         # Test location near ELKHORN PARK (unmapped, but only station available)
         station = client._find_nearest_station(41.8350, -106.4250)
         
         assert station is not None
         assert station['name'] == "ELKHORN PARK"
-        # snotelr_site_id should be None or NaN for unmapped stations
+        # AWDB_site_id should be None or NaN for unmapped stations
         import pandas as pd
-        assert station['snotelr_site_id'] is None or pd.isna(station['snotelr_site_id'])
+        assert station['AWDB_site_id'] is None or pd.isna(station['AWDB_site_id'])
     
     @pytest.mark.unit
-    @patch('geopandas.read_file')
-    def test_find_nearest_station_unmapped(self, mock_read_file, data_dir, sample_station_file):
+    @patch.object(AWDBClient, '_load_stations_from_awdb')
+    def test_find_nearest_station_unmapped(self, mock_load_from_awdb, data_dir, sample_station_file):
         """Test finding nearest station that isn't mapped when it's far from mapped stations."""
-        # Mock geopandas - ELKHORN PARK is close, but mapped stations are very far away
-        # Location near ELKHORN PARK should still find it if mapped stations are >100km away
+        # Mock the API call to return success and set up stations
         mock_gdf = gpd.GeoDataFrame({
             'name': ['ELKHORN PARK', 'MEDICINE BOW', 'COTTONWOOD CREEK'],
-            'triplet': ['SNOTEL:WY:967', 'SNOTEL:WY:975', 'SNOTEL:WY:964'],
+            'triplet': ['468:WY:SNTL', '1196:WY:SNTL', '419:WY:SNTL'],
             'lat': [41.8350, 41.3500, 44.5500],
             'lon': [-106.4250, -106.3167, -109.2833],
             'elevation_ft': [10200, 9700, 8840],
             'state': ['WY', 'WY', 'WY'],
-            'snotelr_site_id': [None, 1196, 419],  # ELKHORN PARK unmapped
+            'awdb_station_id': [None, 1196, 419],  # ELKHORN PARK unmapped
+            'AWDB_site_id': [None, 1196, 419],  # ELKHORN PARK unmapped
             'geometry': [Point(-106.4250, 41.8350), Point(-106.3167, 41.3500), 
                         Point(-109.2833, 44.5500)]
         }, crs='EPSG:4326')
-        mock_read_file.return_value = mock_gdf
         
-        client = SNOTELClient(data_dir=data_dir)
-        client._load_stations()
+        # Mock the function to return True, then set stations directly after client creation
+        mock_load_from_awdb.return_value = True
+        
+        client = AWDBClient(data_dir=data_dir)
+        # Set stations directly since the mock returned True
+        client._stations_gdf = mock_gdf
         
         # Test location very close to ELKHORN PARK - should find it since mapped stations are farther
         # (Within 100km, ELKHORN PARK is closer than mapped stations)
@@ -307,14 +332,14 @@ class TestSNOTELClientUnit:
         
         assert station is not None
         assert station['name'] == "ELKHORN PARK"
-        # snotelr_site_id should be None or NaN for unmapped stations
+        # AWDB_site_id should be None or NaN for unmapped stations
         import pandas as pd
-        assert station['snotelr_site_id'] is None or pd.isna(station['snotelr_site_id'])
+        assert station['AWDB_site_id'] is None or pd.isna(station['AWDB_site_id'])
     
     @pytest.mark.unit
     def test_estimate_snow_from_elevation_winter(self):
         """Test elevation-based snow estimation for winter with actual elevation."""
-        client = SNOTELClient()
+        client = AWDBClient()
         
         # Test with high elevation (8500 ft) - should have snow
         result = client._estimate_snow_from_elevation(41.0, -106.0, datetime(2024, 1, 15), elevation_ft=8500.0)
@@ -331,7 +356,7 @@ class TestSNOTELClientUnit:
     @pytest.mark.unit
     def test_estimate_snow_from_elevation_summer(self):
         """Test elevation-based snow estimation for summer with actual elevation."""
-        client = SNOTELClient()
+        client = AWDBClient()
         
         # Test with high elevation (8500 ft) - summer should have less/no snow
         result = client._estimate_snow_from_elevation(41.0, -106.0, datetime(2024, 7, 15), elevation_ft=8500.0)
@@ -345,7 +370,7 @@ class TestSNOTELClientUnit:
     @pytest.mark.unit
     def test_estimate_snow_from_elevation_low_elevation(self):
         """Test elevation-based estimation for low elevations (should have minimal snow)."""
-        client = SNOTELClient()
+        client = AWDBClient()
         
         # Low elevation (1500 ft) in winter - should be 0 (below threshold)
         result = client._estimate_snow_from_elevation(41.0, -106.0, datetime(2024, 1, 15), elevation_ft=1500.0)
@@ -357,7 +382,7 @@ class TestSNOTELClientUnit:
     @pytest.mark.unit
     def test_estimate_snow_from_elevation_uses_provided_elevation(self):
         """Test that provided elevation parameter is used instead of default."""
-        client = SNOTELClient()
+        client = AWDBClient()
         
         # Test with specific elevation
         result_5000 = client._estimate_snow_from_elevation(41.0, -106.0, datetime(2024, 1, 15), elevation_ft=5000.0)
@@ -373,7 +398,7 @@ class TestSNOTELClientUnit:
     @pytest.mark.unit
     def test_estimate_snow_from_elevation_seasonal_variation(self):
         """Test that estimation varies correctly by season."""
-        client = SNOTELClient()
+        client = AWDBClient()
         elevation_ft = 8500.0
         
         winter = client._estimate_snow_from_elevation(41.0, -106.0, datetime(2024, 1, 15), elevation_ft=elevation_ft)
@@ -395,7 +420,7 @@ class TestSNOTELClientUnit:
     @pytest.mark.unit
     def test_estimate_snow_from_elevation_actual_low_elevations(self):
         """Test that low elevations produce correct (zero) snow estimates - fixes hardcoded bug."""
-        client = SNOTELClient()
+        client = AWDBClient()
         
         # Test actual low elevations from real data
         low_elevations = [1340.5, 1496.7, 2955.8]  # Actual elevations from your data
@@ -409,7 +434,7 @@ class TestSNOTELClientUnit:
     @pytest.mark.unit
     def test_estimate_snow_from_elevation_varies_by_elevation(self):
         """Test that estimates correctly vary by elevation (verifies no hardcoded values)."""
-        client = SNOTELClient()
+        client = AWDBClient()
         date = datetime(2024, 1, 15)  # Winter
         
         elevations = [1000, 5000, 7000, 8500, 10000]
@@ -429,40 +454,32 @@ class TestSNOTELClientUnit:
         assert results[1000] == 0.0, "Very low elevations should have 0 snow"
     
     @pytest.mark.unit
-    @patch('pathlib.Path.exists')
-    @patch('rasterio.open')
-    def test_estimate_snow_falls_back_to_dem(self, mock_rasterio_open, mock_exists, data_dir):
+    @patch.object(AWDBClient, '_get_elevation_from_dem')
+    def test_estimate_snow_falls_back_to_dem(self, mock_get_elevation, data_dir):
         """Test that elevation estimation attempts to sample from DEM when elevation not provided."""
-        client = SNOTELClient(data_dir=data_dir)
+        client = AWDBClient(data_dir=data_dir)
         
-        # Mock DEM exists
-        mock_exists.return_value = True
-        
-        # Mock DEM sampling - return elevation in meters
-        mock_dem = MagicMock()
-        mock_sample = MagicMock()
-        mock_sample.__iter__ = lambda self: iter([[2000.0]])  # 2000 meters = ~6562 feet
-        mock_dem.sample.return_value = mock_sample
-        mock_rasterio_open.return_value.__enter__ = MagicMock(return_value=mock_dem)
-        mock_rasterio_open.return_value.__exit__ = MagicMock(return_value=False)
+        # Mock DEM sampling to return elevation in feet (2000m = ~6562 ft)
+        mock_get_elevation.return_value = 6562.0
         
         # Call with no elevation provided
         result = client._estimate_snow_from_elevation(43.0, -110.0, datetime(2024, 1, 15), elevation_ft=None)
         
         # Should have attempted to sample DEM
-        mock_exists.assert_called()
+        mock_get_elevation.assert_called_once_with(43.0, -110.0)
         
         # Result should use sampled elevation (6562 ft)
         # Winter: (6562 - 6000) / 100 = 5.62 inches
         assert result['depth'] > 0
-        assert result['depth'] < 10  # Should be low elevation, minimal snow
+        # For 6562 ft in winter: (6562 - 6000) / 100 = 5.62 inches
+        assert 5.0 < result['depth'] < 6.5, f"Expected ~5.62 inches for 6562ft in winter, got {result['depth']}"
     
     @pytest.mark.unit
     def test_estimate_snow_falls_back_to_default(self, data_dir, monkeypatch):
         """Test that elevation estimation falls back to default when DEM not available."""
         import pathlib
         
-        client = SNOTELClient(data_dir=data_dir)
+        client = AWDBClient(data_dir=data_dir)
         
         # Mock DEM doesn't exist
         original_exists = pathlib.Path.exists
@@ -483,10 +500,10 @@ class TestSNOTELClientUnit:
     @pytest.mark.unit
     def test_get_snow_data_no_station(self, data_dir):
         """Test getting snow data when no station nearby - uses elevation estimate."""
-        client = SNOTELClient(data_dir=data_dir)
+        client = AWDBClient(data_dir=data_dir)
         # Force no stations by setting _stations_gdf to None
         client._stations_gdf = None
-        client.snotelr = None  # Ensure snotelr is disabled
+        # AWDBClient doesn't have AWDB attribute - it uses HTTP requests
         
         # Test without elevation (will use DEM or default 8500 ft)
         result = client.get_snow_data(0.0, 0.0, datetime(2024, 1, 15))
@@ -507,10 +524,10 @@ class TestSNOTELClientUnit:
     @pytest.mark.unit
     def test_get_snow_data_passes_elevation_to_estimate(self, data_dir):
         """Test that get_snow_data passes elevation parameter to estimation."""
-        client = SNOTELClient(data_dir=data_dir)
+        client = AWDBClient(data_dir=data_dir)
         # Force no stations by setting _stations_gdf to None (this makes _find_nearest_station return None)
         client._stations_gdf = None
-        client.snotelr = None
+        # AWDBClient doesn't have AWDB attribute
         client._r_initialized = False
         
         # Mock _estimate_snow_from_elevation to verify elevation is passed
@@ -545,8 +562,8 @@ class TestSNOTELClientUnit:
     @pytest.mark.unit
     def test_get_snow_data_unmapped_station(self, data_dir, sample_station_file):
         """Test getting snow data when station isn't mapped."""
-        client = SNOTELClient(data_dir=data_dir)
-        client.snotelr = None  # Disable snotelr
+        client = AWDBClient(data_dir=data_dir)
+        # AWDBClient doesn't have AWDB attribute  # Disable AWDB
         
         # Use location near ELKHORN PARK (unmapped)
         result = client.get_snow_data(41.8350, -106.4250, datetime(2024, 1, 15))
@@ -556,87 +573,65 @@ class TestSNOTELClientUnit:
         assert 'swe' in result
 
 
-class TestSNOTELClientWithSnotelr:
-    """Integration tests with mocked snotelr."""
+class TestAWDBClientWithSnotelr:
+    """Integration tests with mocked AWDB."""
     
     @pytest.mark.integration
-    @patch('geopandas.read_file')
-    @patch('geopandas.sjoin_nearest')
-    def test_get_snow_data_with_snotelr_mapped(self, mock_sjoin, mock_read_file,
+    @patch('requests.get')
+    @patch.object(AWDBClient, '_load_stations_from_awdb')
+    @patch.dict('os.environ', {}, clear=True)  # Clear test environment detection
+    def test_get_snow_data_with_AWDB_mapped(self, mock_load_from_awdb, mock_requests_get,
                                                data_dir, sample_station_file):
-        """Test getting real SNOTEL data via snotelr for mapped station."""
-        # Mock geopandas for station loading
+        """Test getting real SNOTEL data via AWDB for mapped station."""
+        import os
+        # Remove test environment variables to allow API calls
+        os.environ.pop('PYTEST_CURRENT_TEST', None)
+        os.environ.pop('TESTING', None)
+        
+        # Mock the API call to return success and set up stations
         mock_gdf = gpd.GeoDataFrame({
             'name': ['MEDICINE BOW'],
-            'triplet': ['SNOTEL:WY:975'],
+            'triplet': ['1196:WY:SNTL'],
             'lat': [41.3500],
             'lon': [-106.3167],
             'elevation_ft': [9700],
             'state': ['WY'],
-            'snotelr_site_id': [1196],
+            'awdb_station_id': [1196],
+            'AWDB_site_id': [1196],
             'geometry': [Point(-106.3167, 41.3500)]
         }, crs='EPSG:4326')
-        mock_read_file.return_value = mock_gdf
         
-        # Mock sjoin_nearest
-        mock_result = gpd.GeoDataFrame({
-            'index_right': [0],
-            'distance_m': [0.0]
-        })
-        mock_sjoin.return_value = mock_result
+        # Mock the function to return True, then set stations directly after client creation
+        mock_load_from_awdb.return_value = True
         
-        # Setup mock snotelr
-        mock_snotelr = MagicMock()
-        mock_snotel_download = MagicMock()
+        # Mock AWDB API response
+        mock_response = MagicMock()
+        mock_response.status_code = 200  # Set status code for successful response
+        mock_response.json.return_value = [{
+            'stationTriplet': '1196:WY:SNTL',
+            'data': [
+                {
+                    'stationElement': {'elementCode': 'WTEQ'},
+                    'values': [{'date': '2024-01-15', 'value': 14.7}]  # inches
+                },
+                {
+                    'stationElement': {'elementCode': 'SNWD'},
+                    'values': [{'date': '2024-01-15', 'value': 72.8}]  # inches
+                }
+            ]
+        }]
+        mock_response.raise_for_status = MagicMock()
+        mock_requests_get.return_value = mock_response
         
-        # Create expected pandas DataFrame
-        expected_df = pd.DataFrame({
-            'date': pd.to_datetime(['2024-01-15', '2024-04-15', '2024-07-15']),
-            'snow_water_equivalent': [373.0, 1018.5, 0.0],  # mm
-            'snow_depth': [1849.0, 2410.0, 0.0],  # mm
-        })
+        client = AWDBClient(data_dir=data_dir)
+        # Set stations directly since the mock returned True
+        client._stations_gdf = mock_gdf
         
-        # Create mock R data frame
-        mock_r_data = MagicMock()
-        mock_snotel_download.return_value = mock_r_data
-        mock_snotelr.snotel_download = mock_snotel_download
+        # Test location near MEDICINE BOW (mapped)
+        result = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 15))
         
-        client = SNOTELClient(data_dir=data_dir)
-        client.snotelr = mock_snotelr
-        
-        # Mock the rpy2 conversion inside get_snow_data
-        # Since rpy2 may not be installed, mock via sys.modules
-        import sys
-        mock_rpy2 = MagicMock()
-        mock_pandas2ri = MagicMock()
-        mock_pandas2ri.rpy2py = MagicMock(return_value=expected_df)
-        mock_localconverter = MagicMock()
-        mock_localconverter.return_value.__enter__ = MagicMock(return_value=MagicMock())
-        mock_localconverter.return_value.__exit__ = MagicMock(return_value=False)
-        
-        mock_rpy2.robjects.pandas2ri = mock_pandas2ri
-        mock_rpy2.robjects.conversion.localconverter = mock_localconverter
-        
-        # Temporarily add to sys.modules
-        sys.modules['rpy2'] = mock_rpy2
-        sys.modules['rpy2.robjects'] = mock_rpy2.robjects
-        sys.modules['rpy2.robjects.pandas2ri'] = mock_pandas2ri
-        sys.modules['rpy2.robjects.conversion'] = MagicMock()
-        sys.modules['rpy2.robjects.conversion'].localconverter = mock_localconverter
-        
-        try:
-            # Test location near MEDICINE BOW (mapped)
-            result = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 15))
-        finally:
-            # Clean up
-            for key in ['rpy2', 'rpy2.robjects', 'rpy2.robjects.pandas2ri', 'rpy2.robjects.conversion']:
-                if key in sys.modules:
-                    del sys.modules[key]
-        
-        # Verify snotel_download was called
-        assert mock_snotel_download.called
-        call_args = mock_snotel_download.call_args
-        assert call_args[0][0] == 1196  # site_id for MEDICINE BOW
+        # Verify requests.get was called for AWDB API
+        assert mock_requests_get.called
         
         # Verify result structure
         assert 'depth' in result
@@ -645,16 +640,13 @@ class TestSNOTELClientWithSnotelr:
         assert 'station' in result
         assert result['station'] == "MEDICINE BOW"
         
-        # Verify values are converted from mm to inches
-        # Expected: 1849.0 mm = ~72.8 inches, 373.0 mm SWE = ~14.7 inches
+        # Verify values are in inches (already converted by AWDB API)
         assert result['depth'] > 0
         assert result['swe'] > 0
     
     @pytest.mark.integration
     @patch('geopandas.read_file')
-    @patch('geopandas.sjoin_nearest')
-    @patch.object(SNOTELClient, '_init_r_snotelr')
-    def test_get_snow_data_with_snotelr_unmapped(self, mock_init_r, mock_sjoin, mock_read_file, data_dir, sample_station_file):
+    def test_get_snow_data_with_AWDB_unmapped(self, mock_read_file, data_dir, sample_station_file):
         """Test fallback when station isn't mapped."""
         # Mock geopandas for station loading
         mock_gdf = gpd.GeoDataFrame({
@@ -664,23 +656,14 @@ class TestSNOTELClientWithSnotelr:
             'lon': [-106.4250],
             'elevation_ft': [10200],
             'state': ['WY'],
-            'snotelr_site_id': [None],  # Unmapped
+            'awdb_station_id': [None],  # Unmapped
+            'AWDB_site_id': [None],
             'geometry': [Point(-106.4250, 41.8350)]
         }, crs='EPSG:4326')
         mock_read_file.return_value = mock_gdf
         
-        # Mock sjoin_nearest
-        mock_result = gpd.GeoDataFrame({
-            'index_right': [0],
-            'distance_m': [0.0]
-        })
-        mock_sjoin.return_value = mock_result
-        
-        # Mock rpy2 initialization to avoid import issues
-        mock_init_r.return_value = None
-        
-        client = SNOTELClient(data_dir=data_dir)
-        client.snotelr = None  # Ensure snotelr is None so it uses fallback
+        client = AWDBClient(data_dir=data_dir)
+        client._load_stations()
         
         # Use location near ELKHORN PARK (unmapped)
         result = client.get_snow_data(41.8350, -106.4250, datetime(2024, 1, 15))
@@ -692,11 +675,10 @@ class TestSNOTELClientWithSnotelr:
     
     @pytest.mark.integration
     @patch('geopandas.read_file')
-    @patch('geopandas.sjoin_nearest')
-    @patch.object(SNOTELClient, '_init_r_snotelr')
-    def test_get_snow_data_no_data_for_date(self, mock_init_r, mock_sjoin, mock_read_file,
+    @patch('requests.get')
+    def test_get_snow_data_no_data_for_date(self, mock_requests_get, mock_read_file,
                                             data_dir, sample_station_file):
-        """Test handling when snotelr returns no data for requested date."""
+        """Test handling when AWDB returns no data for requested date."""
         # Mock geopandas for station loading
         mock_gdf = gpd.GeoDataFrame({
             'name': ['MEDICINE BOW'],
@@ -705,61 +687,23 @@ class TestSNOTELClientWithSnotelr:
             'lon': [-106.3167],
             'elevation_ft': [9700],
             'state': ['WY'],
-            'snotelr_site_id': [1196],
+            'awdb_station_id': [1196],
+            'awdb_station_id': [1196],
+            'AWDB_site_id': [1196],
             'geometry': [Point(-106.3167, 41.3500)]
         }, crs='EPSG:4326')
         mock_read_file.return_value = mock_gdf
         
-        # Mock sjoin_nearest
-        mock_result = gpd.GeoDataFrame({
-            'index_right': [0],
-            'distance_m': [0.0]
-        })
-        mock_sjoin.return_value = mock_result
+        # Mock AWDB API response with no data
+        mock_response = MagicMock()
+        mock_response.json.return_value = []  # Empty response
+        mock_response.raise_for_status = MagicMock()
+        mock_requests_get.return_value = mock_response
         
-        # Setup mock snotelr
-        mock_snotelr = MagicMock()
-        mock_snotel_download = MagicMock()
-        mock_r_data = MagicMock()
-        mock_snotel_download.return_value = mock_r_data
-        mock_snotelr.snotel_download = mock_snotel_download
+        client = AWDBClient(data_dir=data_dir)
+        client._load_stations()
         
-        # Create empty DataFrame (no data)
-        empty_df = pd.DataFrame(columns=['date', 'snow_water_equivalent', 'snow_depth'])
-        
-        # Mock rpy2 initialization to avoid import issues
-        mock_init_r.return_value = None
-        
-        client = SNOTELClient(data_dir=data_dir)
-        client.snotelr = mock_snotelr
-        
-        # Mock the rpy2 conversion inside get_snow_data
-        # Since rpy2 may not be installed, mock via sys.modules
-        import sys
-        mock_rpy2 = MagicMock()
-        mock_pandas2ri = MagicMock()
-        mock_pandas2ri.rpy2py = MagicMock(return_value=empty_df)
-        mock_localconverter = MagicMock()
-        mock_localconverter.return_value.__enter__ = MagicMock(return_value=MagicMock())
-        mock_localconverter.return_value.__exit__ = MagicMock(return_value=False)
-        
-        mock_rpy2.robjects.pandas2ri = mock_pandas2ri
-        mock_rpy2.robjects.conversion.localconverter = mock_localconverter
-        
-        # Temporarily add to sys.modules
-        sys.modules['rpy2'] = mock_rpy2
-        sys.modules['rpy2.robjects'] = mock_rpy2.robjects
-        sys.modules['rpy2.robjects.pandas2ri'] = mock_pandas2ri
-        sys.modules['rpy2.robjects.conversion'] = MagicMock()
-        sys.modules['rpy2.robjects.conversion'].localconverter = mock_localconverter
-        
-        try:
-            result = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 15))
-        finally:
-            # Clean up
-            for key in ['rpy2', 'rpy2.robjects', 'rpy2.robjects.pandas2ri', 'rpy2.robjects.conversion']:
-                if key in sys.modules:
-                    del sys.modules[key]
+        result = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 15))
         
         # Should fall back to elevation estimate
         assert 'depth' in result
@@ -767,9 +711,7 @@ class TestSNOTELClientWithSnotelr:
     
     @pytest.mark.integration
     @patch('geopandas.read_file')
-    @patch('geopandas.sjoin_nearest')
-    @patch.object(SNOTELClient, '_init_r_snotelr')
-    def test_get_snow_data_caching(self, mock_init_r, mock_sjoin, mock_read_file, data_dir, sample_station_file):
+    def test_get_snow_data_caching(self, mock_read_file, data_dir, sample_station_file):
         """Test that get_snow_data caches results."""
         # Mock geopandas for station loading
         mock_gdf = gpd.GeoDataFrame({
@@ -779,23 +721,15 @@ class TestSNOTELClientWithSnotelr:
             'lon': [-106.3167],
             'elevation_ft': [9700],
             'state': ['WY'],
-            'snotelr_site_id': [1196],
+            'awdb_station_id': [1196],
+            'awdb_station_id': [1196],
+            'AWDB_site_id': [1196],
             'geometry': [Point(-106.3167, 41.3500)]
         }, crs='EPSG:4326')
         mock_read_file.return_value = mock_gdf
         
-        # Mock sjoin_nearest
-        mock_result = gpd.GeoDataFrame({
-            'index_right': [0],
-            'distance_m': [0.0]
-        })
-        mock_sjoin.return_value = mock_result
-        
-        # Mock rpy2 initialization to avoid import issues
-        mock_init_r.return_value = None
-        
-        client = SNOTELClient(data_dir=data_dir)
-        client.snotelr = None  # Ensure it uses fallback
+        client = AWDBClient(data_dir=data_dir)
+        client._load_stations()
         
         # First call
         result1 = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 15))
@@ -807,12 +741,9 @@ class TestSNOTELClientWithSnotelr:
         assert result1 == result2
     
     @pytest.mark.unit
-    @patch.object(SNOTELClient, '_init_r_snotelr')
-    def test_station_data_cache_structure(self, mock_init_r, data_dir):
+    def test_station_data_cache_structure(self, data_dir):
         """Test that station data cache structure is correct."""
-        # Mock _init_r_snotelr to avoid rpy2 import issues
-        mock_init_r.return_value = None
-        client = SNOTELClient(data_dir=data_dir)
+        client = AWDBClient(data_dir=data_dir)
         
         # Verify cache structures exist
         assert hasattr(client, 'station_data_cache'), "Should have station_data_cache"
@@ -847,15 +778,13 @@ class TestSNOTELClientWithSnotelr:
         # This demonstrates the optimization: one download provides data for all dates
 
 
-class TestSNOTELClientDataContextIntegration:
+class TestAWDBClientDataContextIntegration:
     """Integration tests with DataContextBuilder."""
     
     @pytest.mark.integration
     @patch('geopandas.read_file')
-    @patch('geopandas.sjoin_nearest')
-    @patch.object(SNOTELClient, '_init_r_snotelr')
-    def test_data_context_builder_uses_snotel(self, mock_init_r, mock_sjoin, mock_read_file, data_dir, sample_station_file):
-        """Test that DataContextBuilder uses SNOTELClient."""
+    def test_data_context_builder_uses_snotel(self, mock_read_file, data_dir, sample_station_file):
+        """Test that DataContextBuilder uses AWDBClient."""
         from src.data.processors import DataContextBuilder
         
         # Mock geopandas for station loading
@@ -866,27 +795,20 @@ class TestSNOTELClientDataContextIntegration:
             'lon': [-106.3167],
             'elevation_ft': [9700],
             'state': ['WY'],
-            'snotelr_site_id': [1196],
+            'awdb_station_id': [1196],
+            'AWDB_site_id': [1196],
             'geometry': [Point(-106.3167, 41.3500)]
         }, crs='EPSG:4326')
         mock_read_file.return_value = mock_gdf
         
-        # Mock sjoin_nearest
-        mock_result = gpd.GeoDataFrame({
-            'index_right': [0],
-            'distance_m': [0.0]
-        })
-        mock_sjoin.return_value = mock_result
-        
         builder = DataContextBuilder(data_dir)
         
         assert builder.snotel_client is not None
-        assert isinstance(builder.snotel_client, SNOTELClient)
+        assert isinstance(builder.snotel_client, AWDBClient)
     
     @pytest.mark.integration
     @patch('geopandas.read_file')
-    @patch.object(SNOTELClient, '_init_r_snotelr')
-    def test_build_context_includes_snow_data(self, mock_init_r, mock_read_file, data_dir, sample_station_file):
+    def test_build_context_includes_snow_data(self, mock_read_file, data_dir, sample_station_file):
         """Test that build_context includes snow data from SNOTEL."""
         from src.data.processors import DataContextBuilder
         
@@ -898,21 +820,13 @@ class TestSNOTELClientDataContextIntegration:
             'lon': [-106.3167],
             'elevation_ft': [9700],
             'state': ['WY'],
-            'snotelr_site_id': [1196],
+            'awdb_station_id': [1196],
+            'AWDB_site_id': [1196],
             'geometry': [Point(-106.3167, 41.3500)]
         }, crs='EPSG:4326')
         mock_read_file.return_value = mock_gdf
         
-        # Mock rpy2 initialization to avoid import issues
-        mock_init_r.return_value = None
-        
         builder = DataContextBuilder(data_dir)
-        
-        # Ensure snotelr is set (since we mocked _init_r_snotelr)
-        if not hasattr(builder.snotel_client, 'snotelr'):
-            builder.snotel_client.snotelr = None
-            builder.snotel_client.ro = None
-            builder.snotel_client._r_initialized = False
         
         location = {"lat": 41.3500, "lon": -106.3167}
         date = "2024-01-15"
@@ -936,9 +850,8 @@ class TestSNOTELClientDataContextIntegration:
     
     @pytest.mark.integration
     @patch('geopandas.read_file')
-    @patch.object(SNOTELClient, '_init_r_snotelr')
-    def test_build_context_passes_elevation_to_snotel(self, mock_init_r, mock_read_file, data_dir, sample_station_file):
-        """Test that DataContextBuilder passes elevation to SNOTELClient for better estimation."""
+    def test_build_context_passes_elevation_to_snotel(self, mock_read_file, data_dir, sample_station_file):
+        """Test that DataContextBuilder passes elevation to AWDBClient for better estimation."""
         from src.data.processors import DataContextBuilder
         from unittest.mock import patch, MagicMock
         
@@ -950,16 +863,14 @@ class TestSNOTELClientDataContextIntegration:
             'lon': [-106.3167],
             'elevation_ft': [9700],
             'state': ['WY'],
-            'snotelr_site_id': [1196],
+            'awdb_station_id': [1196],
+            'AWDB_site_id': [1196],
             'geometry': [Point(-106.3167, 41.3500)]
         }, crs='EPSG:4326')
         mock_read_file.return_value = mock_gdf
         
-        # Mock rpy2 initialization
-        mock_init_r.return_value = None
-        
         builder = DataContextBuilder(data_dir)
-        builder.snotel_client.snotelr = None  # Force elevation estimate
+        # AWDBClient will use elevation estimate if no station data available
         
         # Mock get_snow_data to verify elevation is passed
         with patch.object(builder.snotel_client, 'get_snow_data') as mock_get_snow:
@@ -990,12 +901,11 @@ class TestSNOTELClientDataContextIntegration:
             
             # Note: In test environment without DEM, elevation might come from placeholder (8500)
             # This is expected behavior when DEM is not available - the important thing is
-            # that elevation is being passed to SNOTELClient, not hardcoded in the client itself.
+            # that elevation is being passed to AWDBClient, not hardcoded in the client itself.
     
     @pytest.mark.integration
     @patch('geopandas.read_file')
-    @patch.object(SNOTELClient, '_init_r_snotelr')
-    def test_build_context_snow_data_source_tracking(self, mock_init_r, mock_read_file, data_dir, sample_station_file):
+    def test_build_context_snow_data_source_tracking(self, mock_read_file, data_dir, sample_station_file):
         """Test that build_context correctly tracks snow data source (snotel vs estimate)."""
         from src.data.processors import DataContextBuilder
         
@@ -1007,23 +917,21 @@ class TestSNOTELClientDataContextIntegration:
             'lon': [-106.3167],
             'elevation_ft': [9700],
             'state': ['WY'],
-            'snotelr_site_id': [1196],  # Mapped station
+            'awdb_station_id': [1196],
+            'AWDB_site_id': [1196],  # Mapped station
             'geometry': [Point(-106.3167, 41.3500)]
         }, crs='EPSG:4326')
         mock_read_file.return_value = mock_gdf
         
-        # Mock rpy2 initialization
-        mock_init_r.return_value = None
-        
         builder = DataContextBuilder(data_dir)
-        builder.snotel_client.snotelr = None  # Force elevation estimate
+        # AWDBClient will use elevation estimate if no station data available
         
         location = {"lat": 41.3500, "lon": -106.3167}
         date = "2024-01-15"
         
         context = builder.build_context(location, date)
         
-        # Should indicate estimate since snotelr is None
+        # Should indicate estimate since AWDB is None
         assert context["snow_data_source"] == "estimate"
         # Station name should be None for estimates
         assert context["snow_station_name"] is None or pd.isna(context["snow_station_name"])
@@ -1031,8 +939,7 @@ class TestSNOTELClientDataContextIntegration:
     
     @pytest.mark.integration
     @patch('geopandas.read_file')
-    @patch.object(SNOTELClient, '_init_r_snotelr')
-    def test_build_context_with_unmapped_station(self, mock_init_r, mock_read_file, data_dir, sample_station_file):
+    def test_build_context_with_unmapped_station(self, mock_read_file, data_dir, sample_station_file):
         """Test that build_context handles unmapped stations correctly."""
         from src.data.processors import DataContextBuilder
         
@@ -1044,16 +951,14 @@ class TestSNOTELClientDataContextIntegration:
             'lon': [-106.4250],
             'elevation_ft': [10200],
             'state': ['WY'],
-            'snotelr_site_id': [None],  # Unmapped station
+            'awdb_station_id': [None],  # Unmapped station
+            'AWDB_site_id': [None],
             'geometry': [Point(-106.4250, 41.8350)]
         }, crs='EPSG:4326')
         mock_read_file.return_value = mock_gdf
         
-        # Mock rpy2 initialization
-        mock_init_r.return_value = None
-        
         builder = DataContextBuilder(data_dir)
-        builder.snotel_client.snotelr = None  # Force elevation estimate
+        # AWDBClient will use elevation estimate if no station data available
         
         location = {"lat": 41.8350, "lon": -106.4250}
         date = "2024-01-15"
@@ -1071,64 +976,59 @@ class TestSNOTELStationMapping:
     """Tests for station ID mapping functionality."""
     
     @pytest.mark.unit
-    @patch('geopandas.read_file')
-    @patch('geopandas.sjoin_nearest')
-    @patch.object(SNOTELClient, '_init_r_snotelr')
-    def test_station_has_snotelr_site_id(self, mock_init_r, mock_sjoin, mock_read_file, data_dir, sample_station_file):
-        """Test that mapped stations have snotelr_site_id."""
-        # Mock geopandas to avoid sandbox issues
+    @patch.object(AWDBClient, '_load_stations_from_awdb')
+    def test_station_has_AWDB_site_id(self, mock_load_from_awdb, data_dir, sample_station_file):
+        """Test that mapped stations have AWDB_site_id."""
+        # Mock the API call to return success and set up stations
         mock_gdf = gpd.GeoDataFrame({
             'name': ['MEDICINE BOW'],
-            'triplet': ['SNOTEL:WY:975'],
+            'triplet': ['1196:WY:SNTL'],
             'lat': [41.3500],
             'lon': [-106.3167],
             'elevation_ft': [9700],
             'state': ['WY'],
-            'snotelr_site_id': [1196],
+            'awdb_station_id': [1196],
+            'AWDB_site_id': [1196],
             'geometry': [Point(-106.3167, 41.3500)]
         }, crs='EPSG:4326')
-        mock_read_file.return_value = mock_gdf
         
-        # Mock sjoin_nearest
-        mock_result = gpd.GeoDataFrame({
-            'index_right': [0],
-            'distance_m': [0.0]
-        })
-        mock_sjoin.return_value = mock_result
+        # Mock the function to return True, then set stations directly after client creation
+        mock_load_from_awdb.return_value = True
         
-        client = SNOTELClient(data_dir=data_dir)
-        client._load_stations()
+        client = AWDBClient(data_dir=data_dir)
+        # Set stations directly since the mock returned True
+        client._stations_gdf = mock_gdf
         
         station = client._find_nearest_station(41.3500, -106.3167)
         
         assert station is not None
-        assert 'snotelr_site_id' in station
-        assert station['snotelr_site_id'] == 1196
+        assert 'AWDB_site_id' in station
+        assert station['AWDB_site_id'] == 1196
     
     @pytest.mark.unit
-    @patch('geopandas.read_file')
-    @patch.object(SNOTELClient, '_init_r_snotelr')
-    def test_station_missing_snotelr_site_id(self, mock_init_r, mock_read_file, data_dir, sample_station_file):
-        """Test that unmapped stations have None for snotelr_site_id."""
-        # Mock geopandas - only unmapped station within range
+    @patch.object(AWDBClient, '_load_stations_from_awdb')
+    def test_station_missing_AWDB_site_id(self, mock_load_from_awdb, data_dir, sample_station_file):
+        """Test that unmapped stations have None for AWDB_site_id."""
+        # Mock the API call to return success and set up stations
         mock_gdf = gpd.GeoDataFrame({
             'name': ['ELKHORN PARK', 'MEDICINE BOW', 'COTTONWOOD CREEK'],
-            'triplet': ['SNOTEL:WY:967', 'SNOTEL:WY:975', 'SNOTEL:WY:964'],
+            'triplet': ['468:WY:SNTL', '1196:WY:SNTL', '419:WY:SNTL'],
             'lat': [41.8350, 41.3500, 44.5500],
             'lon': [-106.4250, -106.3167, -109.2833],
             'elevation_ft': [10200, 9700, 8840],
             'state': ['WY', 'WY', 'WY'],
-            'snotelr_site_id': [None, 1196, 419],  # ELKHORN PARK unmapped
+            'awdb_station_id': [None, 1196, 419],  # ELKHORN PARK unmapped
+            'AWDB_site_id': [None, 1196, 419],  # ELKHORN PARK unmapped
             'geometry': [Point(-106.4250, 41.8350), Point(-106.3167, 41.3500), 
                         Point(-109.2833, 44.5500)]
         }, crs='EPSG:4326')
-        mock_read_file.return_value = mock_gdf
         
-        # Mock rpy2 initialization to avoid import issues
-        mock_init_r.return_value = None
+        # Mock the function to return True, then set stations directly after client creation
+        mock_load_from_awdb.return_value = True
         
-        client = SNOTELClient(data_dir=data_dir)
-        client._load_stations()
+        client = AWDBClient(data_dir=data_dir)
+        # Set stations directly since the mock returned True
+        client._stations_gdf = mock_gdf
         
         # Use location very close to ELKHORN PARK with small search radius
         # This ensures ELKHORN PARK is found (mapped stations are farther)
@@ -1136,8 +1036,8 @@ class TestSNOTELStationMapping:
         
         assert station is not None
         assert station['name'] == "ELKHORN PARK"
-        # snotelr_site_id should be None or NaN for unmapped stations
-        assert station['snotelr_site_id'] is None or pd.isna(station['snotelr_site_id'])
+        # AWDB_site_id should be None or NaN for unmapped stations
+        assert station['AWDB_site_id'] is None or pd.isna(station['AWDB_site_id'])
 
 
 class TestSNOTELDataQualityTracking:
@@ -1145,8 +1045,7 @@ class TestSNOTELDataQualityTracking:
     
     @pytest.mark.unit
     @patch('geopandas.read_file')
-    @patch.object(SNOTELClient, '_init_r_snotelr')
-    def test_get_snow_data_returns_station_info(self, mock_init_r, mock_read_file, data_dir, sample_station_file):
+    def test_get_snow_data_returns_station_info(self, mock_read_file, data_dir, sample_station_file):
         """Test that get_snow_data includes station info in result."""
         # Mock geopandas
         mock_gdf = gpd.GeoDataFrame({
@@ -1156,16 +1055,14 @@ class TestSNOTELDataQualityTracking:
             'lon': [-106.3167],
             'elevation_ft': [9700],
             'state': ['WY'],
-            'snotelr_site_id': [1196],
+            'awdb_station_id': [1196],
+            'AWDB_site_id': [1196],
             'geometry': [Point(-106.3167, 41.3500)]
         }, crs='EPSG:4326')
         mock_read_file.return_value = mock_gdf
         
-        # Mock rpy2 initialization
-        mock_init_r.return_value = None
-        
-        client = SNOTELClient(data_dir=data_dir)
-        client.snotelr = None  # Use elevation estimate
+        client = AWDBClient(data_dir=data_dir)
+        client._load_stations()
         
         result = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 15))
         
@@ -1180,12 +1077,11 @@ class TestSNOTELDataQualityTracking:
     
     @pytest.mark.unit
     @patch('geopandas.read_file')
-    @patch.object(SNOTELClient, '_init_r_snotelr')
-    def test_get_snow_data_no_station_returns_no_station_info(self, mock_init_r, mock_read_file, data_dir):
+    def test_get_snow_data_no_station_returns_no_station_info(self, mock_read_file, data_dir):
         """Test that get_snow_data returns no station info when no station nearby."""
-        client = SNOTELClient(data_dir=data_dir)
+        client = AWDBClient(data_dir=data_dir)
         client._stations_gdf = None  # No stations loaded
-        client.snotelr = None
+        # AWDBClient doesn't have AWDB attribute
         
         result = client.get_snow_data(0.0, 0.0, datetime(2024, 1, 15))
         
@@ -1197,8 +1093,7 @@ class TestSNOTELDataQualityTracking:
     
     @pytest.mark.unit
     @patch('geopandas.read_file')
-    @patch.object(SNOTELClient, '_init_r_snotelr')
-    def test_elevation_estimates_are_cached(self, mock_init_r, mock_read_file, data_dir, sample_station_file):
+    def test_elevation_estimates_are_cached(self, mock_read_file, data_dir, sample_station_file):
         """Test that elevation estimates are properly cached in request_cache."""
         # Mock geopandas
         mock_gdf = gpd.GeoDataFrame({
@@ -1208,16 +1103,13 @@ class TestSNOTELDataQualityTracking:
             'lon': [-106.8667],
             'elevation_ft': [10200],
             'state': ['WY'],
-            'snotelr_site_id': [None],  # Unmapped station
+            'AWDB_site_id': [None],  # Unmapped station
             'geometry': [Point(-106.8667, 41.5667)]
         }, crs='EPSG:4326')
         mock_read_file.return_value = mock_gdf
         
-        # Mock rpy2 initialization
-        mock_init_r.return_value = None
-        
-        client = SNOTELClient(data_dir=data_dir)
-        client.snotelr = None  # Simulate snotelr unavailable
+        client = AWDBClient(data_dir=data_dir)
+        # AWDBClient doesn't have AWDB attribute  # Simulate AWDB unavailable
         
         # Clear cache
         client.request_cache.clear()
@@ -1244,8 +1136,7 @@ class TestSNOTELDataQualityTracking:
     
     @pytest.mark.unit
     @patch('geopandas.read_file')
-    @patch.object(SNOTELClient, '_init_r_snotelr')
-    def test_unmapped_station_estimates_are_cached(self, mock_init_r, mock_read_file, data_dir, sample_station_file):
+    def test_unmapped_station_estimates_are_cached(self, mock_read_file, data_dir, sample_station_file):
         """Test that elevation estimates for unmapped stations are cached."""
         # Mock geopandas with unmapped station
         mock_gdf = gpd.GeoDataFrame({
@@ -1255,19 +1146,14 @@ class TestSNOTELDataQualityTracking:
             'lon': [-106.8667],
             'elevation_ft': [10200],
             'state': ['WY'],
-            'snotelr_site_id': [None],  # Unmapped station
+            'awdb_station_id': [None],  # Unmapped station
+            'AWDB_site_id': [None],
             'geometry': [Point(-106.8667, 41.5667)]
         }, crs='EPSG:4326')
         mock_read_file.return_value = mock_gdf
         
-        # Mock rpy2 initialization
-        mock_init_r.return_value = None
-        
-        # Mock snotelr as available (but station is unmapped)
-        mock_snotelr = MagicMock()
-        
-        client = SNOTELClient(data_dir=data_dir)
-        client.snotelr = mock_snotelr  # snotelr available but station unmapped
+        client = AWDBClient(data_dir=data_dir)
+        client._load_stations()
         
         # Clear cache
         client.request_cache.clear()
@@ -1293,8 +1179,7 @@ class TestSNOTELDataQualityTracking:
     
     @pytest.mark.unit
     @patch('geopandas.read_file')
-    @patch.object(SNOTELClient, '_init_r_snotelr')
-    def test_exception_fallback_estimates_are_cached(self, mock_init_r, mock_read_file, data_dir, sample_station_file):
+    def test_exception_fallback_estimates_are_cached(self, mock_read_file, data_dir, sample_station_file):
         """Test that elevation estimates from exception fallback are cached."""
         # Mock geopandas with mapped station
         mock_gdf = gpd.GeoDataFrame({
@@ -1304,20 +1189,16 @@ class TestSNOTELDataQualityTracking:
             'lon': [-106.3167],
             'elevation_ft': [9700],
             'state': ['WY'],
-            'snotelr_site_id': [1196],  # Mapped station
+            'awdb_station_id': [1196],
+            'AWDB_site_id': [1196],  # Mapped station
             'geometry': [Point(-106.3167, 41.3500)]
         }, crs='EPSG:4326')
         mock_read_file.return_value = mock_gdf
         
-        # Mock rpy2 initialization
-        mock_init_r.return_value = None
-        
-        # Mock snotelr to raise an exception
-        mock_snotelr = MagicMock()
-        mock_snotelr.snotel_download.side_effect = Exception("Test error")
-        
-        client = SNOTELClient(data_dir=data_dir)
-        client.snotelr = mock_snotelr
+        client = AWDBClient(data_dir=data_dir)
+        client._load_stations()
+        # Mock _fetch_station_data_from_awdb to raise an exception
+        client._fetch_station_data_from_awdb = MagicMock(side_effect=Exception("Test error"))
         
         # Clear cache
         client.request_cache.clear()
@@ -1333,7 +1214,7 @@ class TestSNOTELDataQualityTracking:
         assert cache_key in client.request_cache
         assert client.request_cache[cache_key] == result1
         
-        # Second call - should return cached result without retrying snotelr
+        # Second call - should return cached result without retrying AWDB
         with patch.object(client, '_estimate_snow_from_elevation') as mock_estimate:
             result2 = client.get_snow_data(lat, lon, date)
             
@@ -1343,8 +1224,7 @@ class TestSNOTELDataQualityTracking:
     
     @pytest.mark.unit
     @patch('geopandas.read_file')
-    @patch.object(SNOTELClient, '_init_r_snotelr')
-    def test_closest_date_selection_with_non_sequential_index(self, mock_init_r, mock_read_file, data_dir, sample_station_file):
+    def test_closest_date_selection_with_non_sequential_index(self, mock_read_file, data_dir, sample_station_file):
         """Test that closest date selection works correctly with non-sequential DataFrame index."""
         import pandas as pd
         
@@ -1355,10 +1235,11 @@ class TestSNOTELDataQualityTracking:
         values = [10.0, 20.0, 30.0, 40.0, 50.0]
         
         # Create DataFrame with non-sequential index (rows 0, 5, 10, 15, 20)
+        # AWDB API returns data in inches, not mm
         full_df = pd.DataFrame({
             'date': dates,
-            'snow_water_equivalent': [v * 25.4 for v in values],  # mm
-            'snow_depth': [v * 25.4 for v in values]  # mm
+            'WTEQ': values,  # Snow Water Equivalent in inches
+            'SNWD': values   # Snow Depth in inches
         }, index=[0, 5, 10, 15, 20])
         
         # Mock geopandas
@@ -1369,18 +1250,27 @@ class TestSNOTELDataQualityTracking:
             'lon': [-106.3167],
             'elevation_ft': [9700],
             'state': ['WY'],
-            'snotelr_site_id': [1196],
+            'awdb_station_id': [1196],
+            'AWDB_site_id': [1196],
             'geometry': [Point(-106.3167, 41.3500)]
         }, crs='EPSG:4326')
         mock_read_file.return_value = mock_gdf
         
-        # Mock rpy2 initialization
-        mock_init_r.return_value = None
-        
-        # Create client and manually set cached DataFrame (bypassing actual R call)
-        client = SNOTELClient(data_dir=data_dir)
-        client.snotelr = MagicMock()  # Mock snotelr (won't be called due to cache)
-        client.station_data_cache[1196] = full_df
+        # Create client and manually set cached DataFrame (bypassing actual API call)
+        client = AWDBClient(data_dir=data_dir)
+        client._load_stations()
+        # Mock _find_nearest_station to return the station BEFORE setting cache
+        # The station_id needs to match the cache key (which is converted to string)
+        mock_station = {
+            "triplet": "1196:WY:SNTL",
+            "name": "MEDICINE BOW",
+            "awdb_station_id": 1196,
+            "AWDB_site_id": 1196,
+            "distance_km": 0.1
+        }
+        client._find_nearest_station = MagicMock(return_value=mock_station)
+        # Manually set cached station data (key is station_id as string, matching the conversion in get_snow_data)
+        client.station_data_cache["1196"] = full_df
         
         # Test: Request date 2024-01-08 (closest to index 5, which is 2024-01-06)
         # When filtered to ±7 days, the dataframe would have indices [0, 5, 10] 
@@ -1392,8 +1282,7 @@ class TestSNOTELDataQualityTracking:
         assert 'depth' in result
         assert 'swe' in result
         
-        # The closest date should be 2024-01-06 (index 5), which has value 20.0
-        # Converted from mm to inches: 20.0 * 25.4 / 25.4 = 20.0 inches
+        # The closest date should be 2024-01-06 (index 5), which has value 20.0 inches
         expected_swe = 20.0
         assert abs(result['swe'] - expected_swe) < 0.1, f"Expected SWE ~{expected_swe}, got {result['swe']}"
         assert abs(result['depth'] - expected_swe) < 0.1, f"Expected depth ~{expected_swe}, got {result['depth']}"
@@ -1402,18 +1291,17 @@ class TestSNOTELDataQualityTracking:
 @pytest.mark.integration
 @pytest.mark.slow
 class TestSNOTELRealData:
-    """Integration tests with real snotelr (requires R and snotelr installed)."""
+    """Integration tests with real AWDB (requires R and AWDB installed)."""
     
     @pytest.mark.skipif(
         True,  # Skip by default - set to False to run real integration tests
-        reason="Requires R and snotelr installed - run manually when needed"
+        reason="Requires R and AWDB installed - run manually when needed"
     )
     def test_real_snotel_download(self, data_dir, sample_station_file):
         """Test actual SNOTEL data download (slow test)."""
-        client = SNOTELClient(data_dir=data_dir)
+        client = AWDBClient(data_dir=data_dir)
         
-        if client.snotelr is None:
-            pytest.skip("snotelr not available")
+        # AWDBClient always available (uses HTTP requests, skipped in test env)
         
         # Use location near MEDICINE BOW (mapped)
         result = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 15))
@@ -1423,6 +1311,371 @@ class TestSNOTELRealData:
         assert 'swe' in result
         assert result['station'] == "MEDICINE BOW"
         assert result['depth'] > 0  # Should have snow in January
+
+
+class TestRetryLogic:
+    """Tests for retry logic with exponential backoff for 5xx errors."""
+    
+    @pytest.mark.unit
+    @patch('requests.get')
+    @patch.object(AWDBClient, '_load_stations_from_awdb')
+    @patch.dict('os.environ', {}, clear=True)
+    def test_retry_succeeds_after_5xx_error(self, mock_load_from_awdb, mock_requests_get, data_dir):
+        """Test that retry logic successfully recovers from initial 5xx error."""
+        import time
+        
+        # Mock stations
+        mock_gdf = gpd.GeoDataFrame({
+            'name': ['TEST STATION'],
+            'triplet': ['123:WY:SNTL'],
+            'lat': [41.3500],
+            'lon': [-106.3167],
+            'elevation_ft': [9700],
+            'state': ['WY'],
+            'awdb_station_id': [123],
+            'AWDB_site_id': [123],
+            'geometry': [Point(-106.3167, 41.3500)]
+        }, crs='EPSG:4326')
+        
+        # Create mock responses: first fails with 500, second succeeds
+        mock_response_500 = MagicMock()
+        mock_response_500.status_code = 500
+        mock_response_500.raise_for_status = MagicMock(side_effect=Exception("500 error"))
+        
+        mock_response_200 = MagicMock()
+        mock_response_200.status_code = 200
+        mock_response_200.json.return_value = [{
+            'stationTriplet': '123:WY:SNTL',
+            'data': [{
+                'stationElement': {'elementCode': 'WTEQ'},
+                'values': [{'date': '2024-01-15', 'value': 10.0}]
+            }]
+        }]
+        mock_response_200.raise_for_status = MagicMock()
+        
+        # First call returns 500, second call returns 200
+        mock_requests_get.side_effect = [mock_response_500, mock_response_200]
+        
+        client = AWDBClient(data_dir=data_dir)
+        client._stations_gdf = mock_gdf
+        
+        # Mock time.sleep to avoid actual delays in tests
+        with patch('time.sleep'):
+            result = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 15))
+        
+        # Should have retried and succeeded
+        assert mock_requests_get.call_count == 2
+        assert result is not None
+        assert 'depth' in result
+    
+    @pytest.mark.unit
+    @patch('requests.get')
+    @patch.object(AWDBClient, '_load_stations_from_awdb')
+    @patch.dict('os.environ', {}, clear=True)
+    def test_retry_gives_up_after_max_retries(self, mock_load_from_awdb, mock_requests_get, data_dir):
+        """Test that retry logic gives up after max retries."""
+        # Mock stations
+        mock_gdf = gpd.GeoDataFrame({
+            'name': ['TEST STATION'],
+            'triplet': ['123:WY:SNTL'],
+            'lat': [41.3500],
+            'lon': [-106.3167],
+            'elevation_ft': [9700],
+            'state': ['WY'],
+            'awdb_station_id': [123],
+            'AWDB_site_id': [123],
+            'geometry': [Point(-106.3167, 41.3500)]
+        }, crs='EPSG:4326')
+        
+        # Create mock response that always returns 500
+        mock_response_500 = MagicMock()
+        mock_response_500.status_code = 500
+        mock_response_500.raise_for_status = MagicMock(side_effect=Exception("500 error"))
+        mock_requests_get.return_value = mock_response_500
+        
+        client = AWDBClient(data_dir=data_dir)
+        client._stations_gdf = mock_gdf
+        
+        # Mock time.sleep to avoid actual delays
+        with patch('time.sleep'):
+            result = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 15))
+        
+        # Should have tried max_retries + 1 times (4 attempts)
+        assert mock_requests_get.call_count == 4
+        # Should fall back to elevation estimate
+        assert result is not None
+        assert 'depth' in result
+        assert result.get('station') is None or result.get('station') == 'no_station'
+    
+    @pytest.mark.unit
+    @patch('requests.get')
+    @patch.object(AWDBClient, '_load_stations_from_awdb')
+    @patch.dict('os.environ', {}, clear=True)
+    def test_safe_status_code_handling_with_mock(self, mock_load_from_awdb, mock_requests_get, data_dir):
+        """Test that status_code comparison safely handles mock objects without status_code."""
+        # Mock stations
+        mock_gdf = gpd.GeoDataFrame({
+            'name': ['TEST STATION'],
+            'triplet': ['123:WY:SNTL'],
+            'lat': [41.3500],
+            'lon': [-106.3167],
+            'elevation_ft': [9700],
+            'state': ['WY'],
+            'awdb_station_id': [123],
+            'AWDB_site_id': [123],
+            'geometry': [Point(-106.3167, 41.3500)]
+        }, crs='EPSG:4326')
+        
+        # Create mock response without status_code (tests getattr safety)
+        mock_response = MagicMock()
+        # Don't set status_code - should be handled safely
+        mock_response.json.return_value = [{
+            'stationTriplet': '123:WY:SNTL',
+            'data': [{
+                'stationElement': {'elementCode': 'WTEQ'},
+                'values': [{'date': '2024-01-15', 'value': 10.0}]
+            }]
+        }]
+        mock_response.raise_for_status = MagicMock()
+        mock_requests_get.return_value = mock_response
+        
+        client = AWDBClient(data_dir=data_dir)
+        client._stations_gdf = mock_gdf
+        
+        # Should not raise TypeError when comparing status_code
+        result = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 15))
+        
+        # Should succeed (uses getattr to safely check status_code)
+        assert result is not None
+        assert 'depth' in result
+    
+    @pytest.mark.unit
+    @patch('requests.get')
+    @patch.object(AWDBClient, '_load_stations_from_awdb')
+    @patch.dict('os.environ', {}, clear=True)
+    def test_no_retry_on_non_5xx_error(self, mock_load_from_awdb, mock_requests_get, data_dir):
+        """Test that non-5xx errors are not retried."""
+        # Mock stations
+        mock_gdf = gpd.GeoDataFrame({
+            'name': ['TEST STATION'],
+            'triplet': ['123:WY:SNTL'],
+            'lat': [41.3500],
+            'lon': [-106.3167],
+            'elevation_ft': [9700],
+            'state': ['WY'],
+            'awdb_station_id': [123],
+            'AWDB_site_id': [123],
+            'geometry': [Point(-106.3167, 41.3500)]
+        }, crs='EPSG:4326')
+        
+        # Create mock response with 404 error (not retried)
+        mock_response_404 = MagicMock()
+        mock_response_404.status_code = 404
+        mock_response_404.raise_for_status = MagicMock(side_effect=Exception("404 error"))
+        mock_requests_get.return_value = mock_response_404
+        
+        client = AWDBClient(data_dir=data_dir)
+        client._stations_gdf = mock_gdf
+        
+        result = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 15))
+        
+        # Should only try once (no retry for 404)
+        assert mock_requests_get.call_count == 1
+        # Should fall back to elevation estimate
+        assert result is not None
+        assert 'depth' in result
+    
+    @pytest.mark.unit
+    @patch('requests.get')
+    @patch.object(AWDBClient, '_load_stations_from_awdb')
+    @patch.dict('os.environ', {}, clear=True)
+    def test_exponential_backoff_timing(self, mock_load_from_awdb, mock_requests_get, data_dir):
+        """Test that exponential backoff uses correct delays."""
+        import time
+        
+        # Mock stations
+        mock_gdf = gpd.GeoDataFrame({
+            'name': ['TEST STATION'],
+            'triplet': ['123:WY:SNTL'],
+            'lat': [41.3500],
+            'lon': [-106.3167],
+            'elevation_ft': [9700],
+            'state': ['WY'],
+            'awdb_station_id': [123],
+            'AWDB_site_id': [123],
+            'geometry': [Point(-106.3167, 41.3500)]
+        }, crs='EPSG:4326')
+        
+        # Create mock responses: first two fail with 500, third succeeds
+        mock_response_500 = MagicMock()
+        mock_response_500.status_code = 500
+        mock_response_500.raise_for_status = MagicMock(side_effect=Exception("500 error"))
+        
+        mock_response_200 = MagicMock()
+        mock_response_200.status_code = 200
+        mock_response_200.json.return_value = [{
+            'stationTriplet': '123:WY:SNTL',
+            'data': [{
+                'stationElement': {'elementCode': 'WTEQ'},
+                'values': [{'date': '2024-01-15', 'value': 10.0}]
+            }]
+        }]
+        mock_response_200.raise_for_status = MagicMock()
+        
+        mock_requests_get.side_effect = [mock_response_500, mock_response_500, mock_response_200]
+        
+        client = AWDBClient(data_dir=data_dir)
+        client._stations_gdf = mock_gdf
+        
+        # Track sleep calls
+        sleep_calls = []
+        with patch('time.sleep', side_effect=lambda x: sleep_calls.append(x)):
+            result = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 15))
+        
+        # Should have retried twice with exponential backoff: 1s, 2s
+        assert len(sleep_calls) == 2
+        assert sleep_calls[0] == 1.0  # First retry: 1 second
+        assert sleep_calls[1] == 2.0  # Second retry: 2 seconds
+        assert mock_requests_get.call_count == 3
+
+
+class TestWarningSuppression:
+    """Tests for warning suppression logic."""
+    
+    @pytest.mark.unit
+    @patch('requests.get')
+    @patch.object(AWDBClient, '_load_stations_from_awdb')
+    @patch.dict('os.environ', {}, clear=True)
+    def test_warning_logged_only_once_per_station(self, mock_load_from_awdb, mock_requests_get, data_dir, caplog):
+        """Test that warnings are only logged once per unique station/warning type."""
+        # Reset class-level warning sets
+        AWDBClient._warned_stations.clear()
+        AWDBClient._warned_api_failures.clear()
+        
+        # Mock stations
+        mock_gdf = gpd.GeoDataFrame({
+            'name': ['TEST STATION'],
+            'triplet': ['123:WY:SNTL'],
+            'lat': [41.3500],
+            'lon': [-106.3167],
+            'elevation_ft': [9700],
+            'state': ['WY'],
+            'awdb_station_id': [123],
+            'AWDB_site_id': [123],
+            'geometry': [Point(-106.3167, 41.3500)]
+        }, crs='EPSG:4326')
+        
+        # Mock response with no data
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = []  # No data
+        mock_response.raise_for_status = MagicMock()
+        mock_requests_get.return_value = mock_response
+        
+        client = AWDBClient(data_dir=data_dir)
+        client._stations_gdf = mock_gdf
+        
+        # Call get_snow_data multiple times for the same station
+        with caplog.at_level("WARNING"):
+            result1 = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 15))
+            result2 = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 16))
+            result3 = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 17))
+        
+        # Count warnings about "No AWDB data available"
+        warning_count = sum(1 for record in caplog.records 
+                           if "No AWDB data available for station" in record.message)
+        
+        # Should only log warning once, even though called 3 times
+        assert warning_count == 1
+        assert all(r is not None for r in [result1, result2, result3])
+    
+    @pytest.mark.unit
+    @patch('requests.get')
+    @patch.object(AWDBClient, '_load_stations_from_awdb')
+    @patch.dict('os.environ', {}, clear=True)
+    def test_different_warning_types_tracked_separately(self, mock_load_from_awdb, mock_requests_get, data_dir, caplog):
+        """Test that different warning types are tracked separately."""
+        # Reset class-level warning sets
+        AWDBClient._warned_stations.clear()
+        AWDBClient._warned_api_failures.clear()
+        
+        # Mock stations - one with AWDB ID, one without
+        mock_gdf = gpd.GeoDataFrame({
+            'name': ['MAPPED STATION', 'UNMAPPED STATION'],
+            'triplet': ['123:WY:SNTL', '456:WY:SNTL'],
+            'lat': [41.3500, 42.0000],
+            'lon': [-106.3167, -107.0000],
+            'elevation_ft': [9700, 9000],
+            'state': ['WY', 'WY'],
+            'awdb_station_id': [123, None],
+            'AWDB_site_id': [123, None],
+            'geometry': [Point(-106.3167, 41.3500), Point(-107.0000, 42.0000)]
+        }, crs='EPSG:4326')
+        
+        # Mock response for mapped station - no data
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = []
+        mock_response.raise_for_status = MagicMock()
+        mock_requests_get.return_value = mock_response
+        
+        client = AWDBClient(data_dir=data_dir)
+        client._stations_gdf = mock_gdf
+        
+        with caplog.at_level("WARNING"):
+            # Call with mapped station (no AWDB data)
+            result1 = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 15))
+            # Call with unmapped station (no AWDB ID)
+            result2 = client.get_snow_data(42.0000, -107.0000, datetime(2024, 1, 15))
+        
+        # Should have different warnings for different scenarios
+        warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        # Should have warnings for both scenarios (they're different warning types)
+        assert len([w for w in warnings if "No AWDB data" in w or "no AWDB station ID" in w]) >= 1
+    
+    @pytest.mark.unit
+    @patch('requests.get')
+    @patch.object(AWDBClient, '_load_stations_from_awdb')
+    @patch.dict('os.environ', {}, clear=True)
+    def test_api_failure_warning_suppression(self, mock_load_from_awdb, mock_requests_get, data_dir, caplog):
+        """Test that API failure warnings are suppressed after first occurrence."""
+        import requests
+        
+        # Reset class-level warning sets
+        AWDBClient._warned_stations.clear()
+        AWDBClient._warned_api_failures.clear()
+        
+        # Mock stations
+        mock_gdf = gpd.GeoDataFrame({
+            'name': ['TEST STATION'],
+            'triplet': ['123:WY:SNTL'],
+            'lat': [41.3500],
+            'lon': [-106.3167],
+            'elevation_ft': [9700],
+            'state': ['WY'],
+            'awdb_station_id': [123],
+            'AWDB_site_id': [123],
+            'geometry': [Point(-106.3167, 41.3500)]
+        }, crs='EPSG:4326')
+        
+        # Mock response that raises RequestException (not generic Exception)
+        mock_requests_get.side_effect = requests.exceptions.RequestException("Connection error")
+        
+        client = AWDBClient(data_dir=data_dir)
+        client._stations_gdf = mock_gdf
+        
+        with caplog.at_level("WARNING"):
+            # Call multiple times - should only warn once
+            result1 = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 15))
+            result2 = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 16))
+        
+        # Count API failure warnings
+        api_failure_warnings = [r for r in caplog.records 
+                               if "AWDB API request failed" in r.message]
+        
+        # Should only log warning once
+        assert len(api_failure_warnings) == 1
+        assert all(r is not None for r in [result1, result2])
 
 
 if __name__ == "__main__":

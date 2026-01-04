@@ -28,7 +28,6 @@ from src.data.absence_generators import (
     RandomBackgroundGenerator,
     TemporalAbsenceGenerator
 )
-from src.data.processors import DataContextBuilder
 
 # Configure logging
 logging.basicConfig(
@@ -139,60 +138,6 @@ def validate_absence_data(
     return True
 
 
-def enrich_with_features(
-    df: pd.DataFrame,
-    data_dir: Path,
-    date_column: Optional[str] = None,
-    default_date: str = "2024-10-15"
-) -> pd.DataFrame:
-    """
-    Enrich dataframe with environmental features using DataContextBuilder.
-    
-    Args:
-        df: DataFrame with latitude, longitude columns
-        data_dir: Path to data directory
-        date_column: Optional column name with dates
-        default_date: Default date to use if date_column not available
-        
-    Returns:
-        DataFrame with added environmental features
-    """
-    logger.info("Enriching with environmental features...")
-    
-    context_builder = DataContextBuilder(data_dir)
-    
-    enriched_rows = []
-    
-    for idx, row in df.iterrows():
-        if idx % 100 == 0:
-            logger.info(f"  Processing {idx:,}/{len(df):,}")
-        
-        location = {"lat": row['latitude'], "lon": row['longitude']}
-        
-        # Use date from column if available, otherwise default
-        if date_column and date_column in row and pd.notna(row[date_column]):
-            date = str(pd.to_datetime(row[date_column]).date())
-        else:
-            date = default_date
-        
-        try:
-            context = context_builder.build_context(location, date)
-            
-            # Create new row with all features
-            new_row = row.to_dict()
-            for key, value in context.items():
-                # Skip geometry objects
-                if key not in ['dem_grid', 'water_sources']:
-                    new_row[key] = value
-            
-            enriched_rows.append(new_row)
-        except Exception as e:
-            logger.warning(f"Error enriching row {idx}: {e}")
-            # Add row with defaults
-            new_row = row.to_dict()
-            enriched_rows.append(new_row)
-    
-    return pd.DataFrame(enriched_rows)
 
 
 def main():
@@ -223,11 +168,6 @@ def main():
         type=float,
         default=1.0,
         help='Ratio of absence to presence points (default: 1.0)'
-    )
-    parser.add_argument(
-        '--skip-enrichment',
-        action='store_true',
-        help='Skip environmental feature enrichment (faster for testing)'
     )
     parser.add_argument(
         '--n-processes',
@@ -390,15 +330,8 @@ def main():
         random_state=42
     ).reset_index(drop=True)
     
-    # Enrich with environmental features
-    if not args.skip_enrichment:
-        training_data = enrich_with_features(
-            training_data,
-            data_dir,
-            date_column=date_column if 'date_column' in locals() else None
-        )
-    else:
-        logger.info("Skipping environmental feature enrichment")
+    # Note: Environmental feature enrichment is now handled by integrate_environmental_features.py
+    # This avoids duplication and reduces processing time
     
     # Save
     logger.info(f"\nSaving combined dataset to {output_file}")

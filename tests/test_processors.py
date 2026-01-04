@@ -1,7 +1,7 @@
 """
 Tests for processors module.
 
-Tests DataContextBuilder, SNOTELClient, WeatherClient, and SatelliteClient.
+Tests DataContextBuilder, AWDBClient, WeatherClient, and SatelliteClient.
 """
 import pytest
 from unittest.mock import Mock, patch, MagicMock
@@ -14,34 +14,34 @@ from shapely.geometry import Point, box
 
 from src.data.processors import (
     DataContextBuilder,
-    SNOTELClient,
+    AWDBClient,
     WeatherClient,
     SatelliteClient
 )
 
 
-class TestSNOTELClient:
-    """Test SNOTELClient for snow data retrieval (updated for snotelr implementation)."""
+class TestAWDBClient:
+    """Test AWDBClient for snow data retrieval (using AWDB REST API)."""
     
     @pytest.mark.unit
     def test_init(self):
-        """Test SNOTELClient initialization."""
-        client = SNOTELClient()
+        """Test AWDBClient initialization."""
+        client = AWDBClient()
         assert client.data_dir == Path("data")
         assert client.station_cache_path == Path("data/cache/snotel_stations_wyoming.geojson")
         assert client.request_cache == {}
     
     @pytest.mark.unit
     def test_init_with_data_dir(self, tmp_path):
-        """Test SNOTELClient initialization with custom data_dir."""
-        client = SNOTELClient(data_dir=tmp_path)
+        """Test AWDBClient initialization with custom data_dir."""
+        client = AWDBClient(data_dir=tmp_path)
         assert client.data_dir == tmp_path
         assert client.station_cache_path == tmp_path / "cache" / "snotel_stations_wyoming.geojson"
     
     @pytest.mark.unit
     def test_get_snow_data_no_station(self):
         """Test getting snow data when no station is found."""
-        client = SNOTELClient()
+        client = AWDBClient()
         client._find_nearest_station = Mock(return_value=None)
         
         result = client.get_snow_data(43.0, -110.0, datetime(2026, 1, 15))
@@ -54,12 +54,12 @@ class TestSNOTELClient:
     
     @pytest.mark.unit
     def test_get_snow_data_unmapped_station(self):
-        """Test getting snow data when station isn't mapped to snotelr."""
-        client = SNOTELClient()
+        """Test getting snow data when station isn't mapped to AWDB."""
+        client = AWDBClient()
         client._find_nearest_station = Mock(return_value={
             "triplet": "SNOTEL:WY:967",
             "name": "ELKHORN PARK",
-            "snotelr_site_id": None  # Unmapped
+            "awdb_station_id": None  # Unmapped
         })
         
         result = client.get_snow_data(43.0, -110.0, datetime(2026, 1, 15))
@@ -70,15 +70,16 @@ class TestSNOTELClient:
         assert "crust" in result
     
     @pytest.mark.unit
-    def test_get_snow_data_snotelr_not_available(self):
-        """Test fallback when snotelr is not available."""
-        client = SNOTELClient()
-        client.snotelr = None
+    @patch('requests.get')
+    def test_get_snow_data_awdb_api_error(self, mock_get):
+        """Test fallback when AWDB API is not available."""
+        client = AWDBClient()
         client._find_nearest_station = Mock(return_value={
-            "triplet": "SNOTEL:WY:975",
-            "name": "MEDICINE BOW",
-            "snotelr_site_id": 1196
+            "triplet": "1119:WY:SNTL",
+            "name": "BLACK HALL MOUNTAIN",
+            "awdb_station_id": "1119"
         })
+        mock_get.side_effect = Exception("API error")
         
         result = client.get_snow_data(43.0, -110.0, datetime(2026, 1, 15))
         
@@ -89,7 +90,7 @@ class TestSNOTELClient:
     @pytest.mark.unit
     def test_estimate_snow_from_elevation_winter(self):
         """Test snow estimation for winter months with actual elevation."""
-        client = SNOTELClient()
+        client = AWDBClient()
         
         # Test with high elevation (should have snow)
         result = client._estimate_snow_from_elevation(43.0, -110.0, datetime(2026, 1, 15), elevation_ft=8500.0)
@@ -104,7 +105,7 @@ class TestSNOTELClient:
     @pytest.mark.unit
     def test_estimate_snow_from_elevation_summer(self):
         """Test snow estimation for summer months with actual elevation."""
-        client = SNOTELClient()
+        client = AWDBClient()
         
         # Test with high elevation (summer may have no snow)
         result = client._estimate_snow_from_elevation(43.0, -110.0, datetime(2026, 7, 15), elevation_ft=8500.0)
@@ -117,7 +118,7 @@ class TestSNOTELClient:
     @pytest.mark.unit
     def test_estimate_snow_from_elevation_spring(self):
         """Test snow estimation for spring months with actual elevation."""
-        client = SNOTELClient()
+        client = AWDBClient()
         
         result = client._estimate_snow_from_elevation(43.0, -110.0, datetime(2026, 4, 15), elevation_ft=8500.0)
         
@@ -128,7 +129,7 @@ class TestSNOTELClient:
     @pytest.mark.unit
     def test_estimate_snow_from_elevation_low_elevation_zero_snow(self):
         """Test that low elevations correctly estimate zero snow."""
-        client = SNOTELClient()
+        client = AWDBClient()
         
         # Low elevation locations (like the problematic ones)
         result_1500 = client._estimate_snow_from_elevation(43.0, -110.0, datetime(2026, 1, 15), elevation_ft=1500.0)
@@ -141,7 +142,7 @@ class TestSNOTELClient:
     @pytest.mark.unit
     def test_estimate_snow_from_elevation_uses_provided_elevation(self):
         """Test that provided elevation is used correctly."""
-        client = SNOTELClient()
+        client = AWDBClient()
         
         # Test different elevations produce different results
         result_6000 = client._estimate_snow_from_elevation(43.0, -110.0, datetime(2026, 1, 15), elevation_ft=6000.0)
@@ -160,7 +161,7 @@ class TestSNOTELClient:
     @pytest.mark.unit
     def test_get_snow_data_caching(self):
         """Test that get_snow_data caches results."""
-        client = SNOTELClient()
+        client = AWDBClient()
         client._find_nearest_station = Mock(return_value=None)
         
         # First call

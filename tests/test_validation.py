@@ -16,9 +16,8 @@ class TestValidation:
         for subdir in ["dem", "terrain", "landcover", "hydrology"]:
             (data_dir / subdir).mkdir()
         
-        # Mock SNOTELClient initialization to avoid rpy2 import issues
-        with patch('src.data.processors.SNOTELClient._init_r_snotelr'):
-            return ElkPredictionEngine(str(data_dir))
+        # AWDBClient no longer needs mocking - it uses HTTP requests which are skipped in test environment
+        return ElkPredictionEngine(str(data_dir))
     
     def test_known_good_habitat_scores_high(self, engine):
         """Test that known good elk habitat scores highly"""

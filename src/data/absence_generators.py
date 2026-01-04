@@ -54,7 +54,7 @@ def _static_generate_worker(
     worker_logger = logging.getLogger(f"{__name__}.worker.{seed}")
     
     try:
-        worker_logger.info(f"Worker {seed} starting: {n_samples} samples, {max_attempts:,} max attempts")
+        worker_logger.debug(f"Worker {seed} starting: {n_samples} samples, {max_attempts:,} max attempts")
         
         if seed is not None:
             np.random.seed(seed)
@@ -176,7 +176,8 @@ def _static_generate_worker(
                 try:
                     from pyproj import Transformer
                     transformer = Transformer.from_crs(crs, utm_crs, always_xy=True)
-                    point_utm_x, point_utm_y = transformer.transform(point.x, point.y)
+                    # Ensure scalar values to avoid deprecation warning
+                    point_utm_x, point_utm_y = transformer.transform(float(point.x), float(point.y))
                 except ImportError:
                     # Fallback to GeoDataFrame if pyproj not available
                     point_gdf = gpd.GeoDataFrame(geometry=[point], crs=crs)

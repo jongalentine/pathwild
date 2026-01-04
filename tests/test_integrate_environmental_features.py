@@ -884,6 +884,7 @@ class TestBatchProcessing:
             assert result == 0
             
             # Should have been called twice (once for each dataset)
+            # Note: With parallel processing, calls may be concurrent, but count should still be 2
             assert mock_update_dataset.call_count == 2
             
             # Check that both datasets were processed
@@ -891,6 +892,73 @@ class TestBatchProcessing:
             processed_paths = [call[0][0] for call in call_args_list]
             assert dataset1 in processed_paths
             assert dataset2 in processed_paths
+            
+        finally:
+            sys.argv = original_argv
+    
+    @patch.object(integrate_module, 'update_dataset')
+    def test_main_processes_datasets_in_parallel(self, mock_update_dataset, tmp_path, monkeypatch):
+        """Test that main() processes multiple datasets in parallel (optimization 1)."""
+        processed_dir = tmp_path / "data" / "processed"
+        processed_dir.mkdir(parents=True)
+        data_dir = tmp_path / "data"
+        
+        # Create multiple dataset files (4 datasets to test parallel processing)
+        datasets = [
+            processed_dir / "combined_north_bighorn_presence_absence.csv",
+            processed_dir / "combined_southern_bighorn_presence_absence.csv",
+            processed_dir / "combined_national_refuge_presence_absence.csv",
+            processed_dir / "combined_southern_gye_presence_absence.csv"
+        ]
+        
+        # Create minimal CSV files
+        df = pd.DataFrame({
+            'latitude': [43.0],
+            'longitude': [-110.0],
+            'elevation': [8500.0]
+        })
+        for dataset in datasets:
+            df.to_csv(dataset, index=False)
+        
+        # Track call order and timing to verify parallel execution
+        import time
+        call_times = []
+        
+        def track_calls(*args, **kwargs):
+            call_times.append(time.time())
+            time.sleep(0.1)  # Small delay to make parallel execution more apparent
+            return True
+        
+        mock_update_dataset.side_effect = track_calls
+        
+        # Mock sys.argv to simulate no dataset argument
+        import sys
+        original_argv = sys.argv.copy()
+        try:
+            sys.argv = ['integrate_environmental_features.py', '--data-dir', str(data_dir), '--processed-dir', str(processed_dir)]
+            
+            # Call main function
+            start_time = time.time()
+            result = integrate_module.main()
+            total_time = time.time() - start_time
+            
+            # Should succeed
+            assert result == 0
+            
+            # Should have been called 4 times (once for each dataset)
+            assert mock_update_dataset.call_count == 4
+            
+            # With parallel processing, total time should be less than 4 × delay
+            # Sequential would take ~0.4s (4 × 0.1s), parallel should take ~0.2s (overlap)
+            # Be lenient - just verify it's not 4× the delay
+            assert total_time < 0.35, \
+                f"Parallel processing should be faster than sequential. Total time: {total_time:.3f}s"
+            
+            # Verify all datasets were processed
+            call_args_list = mock_update_dataset.call_args_list
+            processed_paths = [call[0][0] for call in call_args_list]
+            for dataset in datasets:
+                assert dataset in processed_paths
             
         finally:
             sys.argv = original_argv

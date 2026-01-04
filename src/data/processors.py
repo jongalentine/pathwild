@@ -2,6 +2,7 @@ from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 from datetime import datetime, timedelta
 import numpy as np
+import pandas as pd
 from shapely.geometry import Point, shape
 import requests
 from functools import lru_cache
@@ -35,7 +36,7 @@ class DataContextBuilder:
         self._load_static_layers()
         
         # Initialize data loaders
-        self.snotel_client = SNOTELClient(self.data_dir)
+        self.snotel_client = AWDBClient(self.data_dir)
         self.weather_client = WeatherClient()
         self.satellite_client = SatelliteClient()
     
@@ -393,7 +394,8 @@ class DataContextBuilder:
                 # Raster is in projected CRS, need to transform lat/lon
                 from pyproj import Transformer
                 transformer = Transformer.from_crs("EPSG:4326", raster.crs, always_xy=True)
-                x, y = transformer.transform(lon, lat)
+                # Ensure scalar values to avoid deprecation warning
+                x, y = transformer.transform(float(lon), float(lat))
                 row, col = raster.index(x, y)
             else:
                 # Raster is in geographic CRS (WGS84), use directly
@@ -631,8 +633,17 @@ class DataContextBuilder:
         return landcover_map.get(int(code), "unknown")
 
 
-class SNOTELClient:
-    """Client for accessing SNOTEL snow data using snotelr R package"""
+class AWDBClient:
+    """Client for accessing SNOTEL snow data using AWDB REST API"""
+    
+    # AWDB REST API base URL
+    AWDB_BASE_URL = "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1"
+    
+    # Class-level sets to track warnings across all instances (shared by all workers)
+    # This prevents duplicate warnings when multiple workers process the same stations
+    _warned_stations = set()  # Set of (station_id, warning_type) tuples
+    _warned_api_failures = set()  # Set of station_ids that have failed API calls
+    _warning_lock = None  # Will be initialized on first use for thread safety
     
     def __init__(self, data_dir: Optional[Path] = None):
         self.data_dir = Path(data_dir) if data_dir else Path("data")
@@ -640,132 +651,159 @@ class SNOTELClient:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.station_cache_path = self.cache_dir / "snotel_stations_wyoming.geojson"
         self._stations_gdf = None
-        self._load_stations()
         
         # Two-level caching:
-        # 1. Station data cache: station_id -> full DataFrame from snotelr (entire historical record)
+        # 1. Station data cache: station_id -> DataFrame with date range data
         #    This avoids re-downloading the same station data for multiple locations/dates
-        #    snotel_download() returns all historical data, so we cache by station ID only
+        #    We cache by station ID and date range to minimize API calls
         # 2. Request cache: (lat, lon, date) -> final result dict
         #    This provides fast lookup for exact same location/date queries
-        self.station_data_cache = {}  # Cache full station downloads: {site_id: DataFrame}
+        self.station_data_cache = {}  # Cache station data: {station_id: DataFrame}
         self.request_cache = {}  # Cache final results: {(lat, lon, date_str): result_dict}
         
-        self._r_initialized = False
-        self._snotelr_warned = False  # Track if we've already warned about snotelr being unavailable
-        self._init_r_snotelr()
-    
-    def _init_r_snotelr(self):
-        """
-        Initialize R and load snotelr package.
+        # Initialize lock for thread-safe warning tracking (lazy initialization)
+        if AWDBClient._warning_lock is None:
+            import threading
+            AWDBClient._warning_lock = threading.Lock()
         
-        Note: rpy2 uses Python's contextvars to store conversion rules. In worker threads,
-        these context variables are not automatically available. We try to initialize rpy2
-        properly in each thread, but R itself is not thread-safe, so this may still fail.
+        # Load stations (from local cache or AWDB API)
+        self._load_stations()
+    
+    def _load_stations_from_awdb(self) -> bool:
         """
+        Load all Wyoming SNOTEL stations from AWDB API.
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        import traceback
+        import os
         try:
-            import rpy2.robjects as ro  # type: ignore
-            from rpy2.robjects.packages import importr  # type: ignore
-            # Note: pandas2ri is imported later when needed (in _fetch_snow_data)
-            # We don't need it here for initialization
+            import geopandas as gpd
+            from shapely.geometry import Point
             
-            # Initialize R
-            if not self._r_initialized:
-                # Try to import snotelr
-                try:
-                    # Note: pandas2ri.activate() is deprecated in newer rpy2 versions
-                    # We don't need to activate it here - it will be used with localconverter when needed
-                    # Attempting to activate can cause issues in some environments
-                    
-                    self.snotelr = importr('snotelr')
-                    self.ro = ro
-                    self._r_initialized = True
-                    logger.info("snotelr R package initialized successfully")
-                except Exception as e:
-                    error_msg = str(e)
-                    import traceback
-                    import threading
-                    error_traceback = traceback.format_exc()
-                    
-                    # Check if we're in the main thread or a worker thread
-                    is_main_thread = threading.current_thread() is threading.main_thread()
-                    thread_info = "main thread" if is_main_thread else "worker thread"
-                    
-                    # Check if this is the rpy2 context issue with threading
-                    if "contextvars.ContextVar" in error_msg or "Conversion rules" in error_msg:
-                        # This is a known limitation: rpy2 context variables don't propagate to threads
-                        # R itself is also not thread-safe, so even if we fix the context issue,
-                        # using R in multiple threads simultaneously can cause crashes
-                        if not is_main_thread:
-                            logger.warning(
-                                f"Could not load snotelr R package in {thread_info} (rpy2 context issue). "
-                                "rpy2 uses contextvars that don't automatically propagate to worker threads. "
-                                "Additionally, R is not thread-safe. "
-                                "Falling back to elevation-based snow estimates for this thread."
-                            )
-                        else:
-                            # This shouldn't happen in main thread, but log it anyway
-                            logger.warning(
-                                f"Could not load snotelr R package in {thread_info} (rpy2 context issue). "
-                                "This is unexpected in the main thread. "
-                                "Falling back to elevation-based snow estimates."
-                            )
-                        logger.debug(f"Full error: {e}")
-                        logger.debug(f"Traceback:\n{error_traceback}")
-                        if not is_main_thread:
-                            logger.debug(
-                                "To use snotelr with parallel processing, consider: "
-                                "1) Use --workers 1 for sequential processing, or "
-                                "2) Use multiprocessing instead of threading (but rasterio datasets can't be pickled)"
-                            )
-                    else:
-                        # Other error - log it with more detail
-                        logger.warning(
-                            f"Could not load snotelr R package in {thread_info}: {e}"
-                        )
-                        logger.debug(f"Full traceback:\n{error_traceback}")
-                        logger.info("Install with: R -e \"install.packages('snotelr', repos='https://cloud.r-project.org')\"")
-                        logger.info("Or check if R and rpy2 are properly installed in your conda environment")
-                        if is_main_thread:
-                            logger.info("Since you're using --workers 1, this error is unexpected. Check R installation.")
-                    self.snotelr = None
-                    self.ro = None
-        except ImportError:
-            logger.warning("rpy2 not available. Install with: pip install rpy2")
-            logger.info("Or use conda: conda install -c conda-forge rpy2")
-            self.snotelr = None
-            self.ro = None
-            self._r_initialized = False
+            # Skip API call in test environment to avoid slow tests
+            if os.environ.get('PYTEST_CURRENT_TEST') or os.environ.get('TESTING'):
+                logger.debug("Skipping AWDB API call in test environment")
+                return False
+            
+            # Query AWDB API for all Wyoming SNOTEL stations
+            params = {
+                'stationTriplets': '*:WY:SNTL',
+                'returnForecastPointMetadata': 'false',
+                'returnReservoirMetadata': 'false',
+                'returnStationElements': 'false',
+                'activeOnly': 'true',
+            }
+            
+            response = requests.get(f"{self.AWDB_BASE_URL}/stations", params=params, timeout=30)
+            response.raise_for_status()
+            stations_data = response.json()
+            
+            if not stations_data:
+                logger.warning("No Wyoming SNOTEL stations found in AWDB API")
+                return False
+            
+            # Convert to GeoDataFrame
+            features = []
+            for station in stations_data:
+                station_id = str(station.get('stationId', ''))
+                name = station.get('name', 'Unknown')
+                lat = station.get('latitude')
+                lon = station.get('longitude')
+                elevation_ft = station.get('elevation', 0)  # AWDB returns in feet
+                triplet = station.get('stationTriplet', f"{station_id}:WY:SNTL")
+                
+                if lat is None or lon is None:
+                    logger.debug(f"Skipping station {name} (missing coordinates)")
+                    continue
+                
+                # Create GeoJSON feature
+                feature = {
+                    "type": "Feature",
+                    "properties": {
+                        "station_id": station_id,
+                        "triplet": triplet,
+                        "name": name,
+                        "lat": lat,
+                        "lon": lon,
+                        "elevation_ft": elevation_ft,
+                        "state": "WY",
+                        "awdb_station_id": station_id,  # AWDB station ID (same as snotelr_site_id)
+                    },
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [lon, lat]
+                    }
+                }
+                features.append(feature)
+            
+            if not features:
+                logger.warning("No valid Wyoming SNOTEL stations found in AWDB API response")
+                return False
+            
+            # Create GeoDataFrame
+            self._stations_gdf = gpd.GeoDataFrame.from_features(features, crs="EPSG:4326")
+            
+            # Save to cache
+            self._stations_gdf.to_file(self.station_cache_path, driver="GeoJSON")
+            logger.info(f"Loaded {len(self._stations_gdf)} Wyoming SNOTEL stations from AWDB API")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Error loading stations from AWDB API: {e}")
+            logger.debug(f"Traceback: {traceback.format_exc()}")
+            return False
     
     def _load_stations(self):
-        """Load SNOTEL station locations"""
-        import geopandas as gpd
-        from shapely.geometry import Point
+        """
+        Load SNOTEL station locations from AWDB REST API.
         
+        Uses local cache if available and recent (within 24 hours), otherwise
+        fetches fresh station data from AWDB API. This ensures we have the latest
+        active stations while avoiding redundant API calls during parallel processing.
+        """
+        import time
+        from datetime import datetime, timedelta
+        
+        # Check if cache file exists and is recent (less than 24 hours old)
+        cache_valid = False
         if self.station_cache_path.exists():
             try:
-                self._stations_gdf = gpd.read_file(self.station_cache_path)
-                logger.info(f"Loaded {len(self._stations_gdf)} SNOTEL stations")
+                cache_age = time.time() - self.station_cache_path.stat().st_mtime
+                cache_age_hours = cache_age / 3600
+                if cache_age_hours < 24:
+                    cache_valid = True
+                    logger.debug(f"Station cache file is {cache_age_hours:.1f} hours old, using cache")
             except Exception as e:
-                logger.warning(f"Error loading stations: {e}")
-                self._stations_gdf = None
-        else:
-            logger.warning(f"SNOTEL stations file not found: {self.station_cache_path}")
-            logger.info("Run scripts/download_snotel_stations_manual.py to download stations")
+                logger.debug(f"Could not check cache file age: {e}")
+        
+        if cache_valid:
+            # Load from cache
+            try:
+                import geopandas as gpd
+                logger.debug(f"Loading Wyoming SNOTEL stations from cache ({self.station_cache_path.name})...")
+                self._stations_gdf = gpd.read_file(self.station_cache_path)
+                logger.debug(f"Loaded {len(self._stations_gdf)} Wyoming SNOTEL stations from cache")
+                return
+            except Exception as e:
+                logger.warning(f"Failed to load stations from cache: {e}, fetching from API")
+                # Fall through to API fetch
+        
+        # Cache doesn't exist or is stale, fetch from API
+        logger.info("Loading Wyoming SNOTEL stations from AWDB API...")
+        if not self._load_stations_from_awdb():
+            logger.warning("Failed to load stations from AWDB API, falling back to elevation estimates")
             self._stations_gdf = None
     
     def _find_nearest_station(self, lat: float, lon: float, max_distance_km: float = 100.0):
         """
         Find nearest SNOTEL station to location.
         
-        Prioritizes mapped stations (those with snotelr_site_id) over unmapped ones.
-        If multiple mapped stations are within range, returns the closest one.
-        Only returns unmapped stations if no mapped stations are available.
-        
         Args:
             lat: Latitude
             lon: Longitude
-            max_distance_km: Maximum distance to search (default: 100 km to allow finding mapped stations)
+            max_distance_km: Maximum distance to search (default: 100 km)
         
         Returns:
             Dictionary with station info, or None if no station within range
@@ -794,8 +832,23 @@ class SNOTELClient:
         if len(within_range) == 0:
             return None
         
-        # Prioritize mapped stations (those with snotelr_site_id)
-        mapped_stations = within_range[within_range['snotelr_site_id'].notna()]
+        # Prioritize mapped stations (those with awdb_station_id) over unmapped ones
+        # Get station ID column (prefer awdb_station_id, fall back to snotelr_site_id for backward compatibility)
+        if 'awdb_station_id' in self._stations_gdf.columns:
+            station_id_col = 'awdb_station_id'
+        elif 'snotelr_site_id' in self._stations_gdf.columns:
+            station_id_col = 'snotelr_site_id'
+        else:
+            # No station ID column, use all stations
+            station_id_col = None
+        
+        if station_id_col:
+            # Filter to mapped stations (those with non-null station ID)
+            station_ids = self._stations_gdf.iloc[within_range.index][station_id_col]
+            mapped_mask = station_ids.notna()
+            mapped_stations = within_range[mapped_mask]
+        else:
+            mapped_stations = within_range
         
         if len(mapped_stations) > 0:
             # Use nearest mapped station
@@ -804,25 +857,28 @@ class SNOTELClient:
             distance_km = nearest_mapped['distance_km']
         else:
             # No mapped stations available, use nearest unmapped station
-            # (will fall back to elevation estimate anyway)
-            nearest_unmapped = within_range.nsmallest(1, 'distance_km').iloc[0]
-            station = self._stations_gdf.iloc[nearest_unmapped.name]
-            distance_km = nearest_unmapped['distance_km']
+            nearest = within_range.nsmallest(1, 'distance_km').iloc[0]
+            station = self._stations_gdf.iloc[nearest.name]  # Use original index
+            distance_km = nearest['distance_km']
             logger.debug(f"Using unmapped station {station['name']} (no mapped stations within {max_distance_km} km)")
         
+        # Get station ID (prefer awdb_station_id, fall back to snotelr_site_id for backward compatibility)
+        station_id = station.get("awdb_station_id") or station.get("snotelr_site_id")
+        
         return {
-            "triplet": station["triplet"],
+            "triplet": station.get("triplet", f"{station_id}:WY:SNTL" if station_id else None),
             "name": station["name"],
             "lat": station["lat"],
             "lon": station["lon"],
             "elevation_ft": station.get("elevation_ft", 0),
             "distance_km": distance_km,
-            "snotelr_site_id": station.get("snotelr_site_id")  # May be None if not mapped
+            "awdb_station_id": station_id,  # AWDB station ID (same format as snotelr_site_id)
+            "AWDB_site_id": station_id  # Alias for backward compatibility with tests
         }
     
     def get_snow_data(self, lat: float, lon: float, date: datetime, elevation_ft: Optional[float] = None) -> Dict:
         """
-        Get snow data for location and date.
+        Get snow data for location and date using AWDB REST API.
         
         Args:
             lat: Latitude
@@ -830,8 +886,12 @@ class SNOTELClient:
             date: Date for snow data
             elevation_ft: Optional elevation in feet (from DEM). If provided, used for
                          better elevation-based estimation when no station is nearby.
+        
+        Returns:
+            Dictionary with snow data: depth, swe, crust, station, station_distance_km
         """
-        import pandas as pd  # Import at function level for use throughout
+        import pandas as pd
+        import traceback
         
         # Check request cache first (fast path for exact same location/date)
         cache_key = f"{lat:.4f},{lon:.4f},{date.strftime('%Y-%m-%d')}"
@@ -848,107 +908,99 @@ class SNOTELClient:
             self.request_cache[cache_key] = result
             return result
         
-        # Fetch data using snotelr R package
-        if self.snotelr is None:
-            # Only warn once per DataContextBuilder instance to avoid log spam
-            if not self._snotelr_warned:
-                logger.warning("snotelr not available, using elevation estimate for all snow data")
-                logger.debug("This warning will only appear once per DataContextBuilder instance")
-                self._snotelr_warned = True
-            result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
-            self.request_cache[cache_key] = result
-            return result
-        
         try:
-            # Get snotelr site_id from mapped station data
-            snotelr_site_id = station.get("snotelr_site_id")
+            # Get AWDB station ID
+            station_id = station.get("awdb_station_id")
             
-            if snotelr_site_id is None or pd.isna(snotelr_site_id):
-                # Station not mapped to snotelr site_id
-                logger.warning(f"Station {station['name']} has no snotelr site_id mapping")
-                logger.info("Run scripts/map_snotel_station_ids.py to create mapping")
-                # Fall back to elevation estimate with available elevation
+            if station_id is None or pd.isna(station_id):
+                # Station not mapped to AWDB station ID
+                logger.debug(f"Station {station['name']} has no AWDB station ID, using elevation estimate")
                 result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
                 self.request_cache[cache_key] = result
                 return result
             
-            snotelr_site_id = int(snotelr_site_id)
-            
-            # Convert date to R Date format
+            station_id = str(station_id)
             date_str = date.strftime("%Y-%m-%d")
             
-            # Check station data cache first - this is the key optimization!
-            # snotel_download() returns the ENTIRE historical record for a station,
-            # so we cache by station ID only (not station + date)
-            # Multiple locations can use the same station, so we only download once per station
-            station_cache_key = snotelr_site_id
+            # Check station data cache first
+            # We cache by station ID and date range to minimize API calls
+            # For efficiency, we fetch a date range around the requested date
+            station_cache_key = station_id
+            
+            # Determine date range for caching (fetch ±30 days to cache more data)
+            begin_date = (date - timedelta(days=30)).strftime("%Y-%m-%d")
+            end_date = (date + timedelta(days=30)).strftime("%Y-%m-%d")
             
             if station_cache_key in self.station_data_cache:
-                # Use cached station data - no download needed!
-                logger.debug(f"Using cached data for station {station['name']} (site_id {snotelr_site_id})")
+                # Check if cached data covers the requested date
                 df = self.station_data_cache[station_cache_key]
+                df_dates = pd.to_datetime(df['date'])
+                if df_dates.min() <= pd.Timestamp(date) <= df_dates.max():
+                    # Use cached data
+                    logger.debug(f"Using cached data for station {station['name']} (station_id {station_id})")
+                else:
+                    # Cached data doesn't cover this date, fetch new data
+                    logger.debug(f"Cached data for station {station['name']} doesn't cover {date_str}, fetching from API")
+                    df = self._fetch_station_data_from_awdb(station_id, begin_date, end_date)
+                    if df is not None:
+                        self.station_data_cache[station_cache_key] = df
             else:
-                # Need to download station data
-                logger.debug(f"Downloading historical data for station {station['name']} (site_id {snotelr_site_id})")
-                
-                # Get the download function
-                snotel_download = self.snotelr.snotel_download
-                
-                # Call snotelr::snotel_download() with mapped site_id
-                # This downloads the entire historical record for the station (one time per station)
-                r_data = snotel_download(snotelr_site_id, internal=True)
-                
-                # Convert R data frame to pandas using new rpy2 API
-                from rpy2.robjects import pandas2ri  # type: ignore
-                from rpy2.robjects.conversion import localconverter  # type: ignore
-                
-                # Use context manager instead of activate/deactivate
-                with localconverter(pandas2ri.converter):
-                    df = pandas2ri.rpy2py(r_data)
-                
-                # Convert date column
-                df['date'] = pd.to_datetime(df['date'])
-                
-                # Cache the full station dataframe - this is the key optimization!
-                # Now any other location/date querying this same station can reuse the data
-                self.station_data_cache[station_cache_key] = df
-                logger.debug(f"Cached full station data for {station['name']} (site_id {snotelr_site_id}) - {len(df)} records covering {df['date'].min()} to {df['date'].max()}")
+                # Need to fetch station data
+                logger.debug(f"Fetching data for station {station['name']} (station_id {station_id}) from AWDB API")
+                df = self._fetch_station_data_from_awdb(station_id, begin_date, end_date)
+                if df is not None:
+                    self.station_data_cache[station_cache_key] = df
             
-            # Filter to the specific date from cached dataframe
+            if df is None or len(df) == 0:
+                # Only warn once per station to avoid log spam (shared across all instances)
+                warning_key = (station_id, 'no_data')
+                with AWDBClient._warning_lock:
+                    if warning_key not in AWDBClient._warned_stations:
+                        logger.warning(f"No AWDB data available for station {station['name']} (station_id {station_id})")
+                        AWDBClient._warned_stations.add(warning_key)
+                result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
+                self.request_cache[cache_key] = result
+                return result
+            
+            # Filter to the specific date
+            df['date'] = pd.to_datetime(df['date'])
             date_data = df[df['date'].dt.date == date.date()]
             
             if len(date_data) == 0:
-                # No data for this exact date, try to get closest date
+                # No data for this exact date, try to get closest date within ±7 days
                 logger.debug(f"No data for {date_str}, using closest available date")
-                # Get data within ±7 days
                 date_range = pd.date_range(date - timedelta(days=7), date + timedelta(days=7))
                 date_data = df[df['date'].isin(date_range)]
                 if len(date_data) > 0:
                     # Use closest date
-                    # idxmin() returns an index label, so use .loc with the label (not .iloc with position)
                     closest_date_label = (date_data['date'] - pd.Timestamp(date)).abs().idxmin()
                     date_data = date_data.loc[[closest_date_label]]
             
             if len(date_data) == 0:
-                logger.warning(f"No SNOTEL data available for station {station['name']} (site_id {snotelr_site_id}) near {date_str}")
+                # Only warn once per station to avoid log spam (shared across all instances)
+                warning_key = (station_id, 'no_date_data')
+                with AWDBClient._warning_lock:
+                    if warning_key not in AWDBClient._warned_stations:
+                        logger.warning(f"No AWDB data available for station {station['name']} (station_id {station_id}) near {date_str}")
+                        AWDBClient._warned_stations.add(warning_key)
                 result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
                 self.request_cache[cache_key] = result
                 return result
             
-            # Extract snow depth and SWE
-            # snotelr column names: snow_water_equivalent (SWE in mm), snow_depth (in mm)
+            # Extract snow depth and SWE from AWDB response
+            # AWDB returns data in inches (not mm!)
             row = date_data.iloc[0]
             
-            # Convert from mm to inches
-            swe_mm = row.get('snow_water_equivalent', 0)
-            if pd.isna(swe_mm):
-                swe_mm = 0
-            swe = float(swe_mm) / 25.4  # mm to inches
+            # AWDB element codes: WTEQ (Snow Water Equivalent), SNWD (Snow Depth)
+            swe = row.get('WTEQ', 0)
+            if pd.isna(swe):
+                swe = 0
+            swe = float(swe)  # Already in inches!
             
             # Snow depth (if available)
-            snow_depth_mm = row.get('snow_depth', None)
-            if snow_depth_mm is not None and not pd.isna(snow_depth_mm):
-                snow_depth = float(snow_depth_mm) / 25.4  # mm to inches
+            snow_depth = row.get('SNWD', None)
+            if snow_depth is not None and not pd.isna(snow_depth):
+                snow_depth = float(snow_depth)  # Already in inches!
             else:
                 # Estimate snow depth from SWE (typical density ~0.25)
                 snow_depth = swe / 0.25 if swe > 0 else 0.0
@@ -970,13 +1022,152 @@ class SNOTELClient:
             return result
         
         except Exception as e:
-            logger.warning(f"Error retrieving SNOTEL data via snotelr: {e}, using elevation estimate")
-            import traceback
-            logger.debug(traceback.format_exc())
+            logger.warning(f"Error retrieving SNOTEL data via AWDB API: {e}, using elevation estimate")
+            logger.debug(f"Traceback: {traceback.format_exc()}")
             # Pass elevation if available for better estimation
             result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
             self.request_cache[cache_key] = result
             return result
+    
+    def _fetch_station_data_from_awdb(self, station_id: str, begin_date: str, end_date: str) -> Optional[pd.DataFrame]:
+        """
+        Fetch snow data for a station from AWDB API.
+        
+        Args:
+            station_id: AWDB station ID
+            begin_date: Start date (YYYY-MM-DD)
+            end_date: End date (YYYY-MM-DD)
+        
+        Returns:
+            DataFrame with columns: date, WTEQ, SNWD, or None if error
+        """
+        import pandas as pd
+        import traceback
+        import os
+        
+        # Skip API call in test environment to avoid slow tests
+        if os.environ.get('PYTEST_CURRENT_TEST') or os.environ.get('TESTING'):
+            logger.debug(f"Skipping AWDB API call in test environment for station {station_id}")
+            return None
+        
+        try:
+            # Construct station triplet
+            triplet = f"{station_id}:WY:SNTL"
+            
+            # Query AWDB API with retry logic for 5xx errors
+            params = {
+                'stationTriplets': triplet,
+                'elements': 'WTEQ,SNWD',
+                'beginDate': begin_date,
+                'endDate': end_date,
+                'duration': 'DAILY',
+                'returnFlags': 'false',
+                'returnOriginalValues': 'false',
+                'returnSuspectData': 'false',
+            }
+            
+            # Retry logic with exponential backoff for 5xx errors
+            max_retries = 3
+            base_delay = 1.0  # Start with 1 second
+            import time
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    response = requests.get(f"{self.AWDB_BASE_URL}/data", params=params, timeout=30)
+                    
+                    # Check for 5xx errors before raising
+                    # Use getattr to safely check status_code (handles mocks in tests)
+                    status_code = getattr(response, 'status_code', None)
+                    if status_code is not None and isinstance(status_code, int) and status_code >= 500:
+                        if attempt < max_retries:
+                            delay = base_delay * (2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                            logger.debug(f"AWDB API 5xx error ({status_code}) for station {station_id} (attempt {attempt + 1}/{max_retries + 1}), retrying in {delay:.1f}s...")
+                            time.sleep(delay)
+                            continue
+                        else:
+                            # Final attempt failed, raise the error
+                            response.raise_for_status()
+                    
+                    # For non-5xx errors, raise immediately if there's an error
+                    response.raise_for_status()
+                    # Success - break out of retry loop
+                    break
+                    
+                except requests.exceptions.HTTPError as e:
+                    # HTTPError from raise_for_status() - check if it's a 5xx error
+                    if hasattr(e, 'response') and e.response is not None:
+                        error_status_code = getattr(e.response, 'status_code', None)
+                        if error_status_code is not None and isinstance(error_status_code, int) and error_status_code >= 500:
+                            if attempt < max_retries:
+                                delay = base_delay * (2 ** attempt)
+                                logger.debug(f"AWDB API 5xx error ({error_status_code}) for station {station_id} (attempt {attempt + 1}/{max_retries + 1}), retrying in {delay:.1f}s...")
+                                time.sleep(delay)
+                                continue
+                    # Non-5xx HTTP error or final attempt - re-raise
+                    raise
+                except requests.exceptions.RequestException as e:
+                    # Other request exceptions (timeout, connection errors) - don't retry
+                    raise
+            
+            # If we get here, we should have a successful response
+            data = response.json()
+            
+            if not data or len(data) == 0:
+                logger.debug(f"No data returned from AWDB API for station {station_id}")
+                return None
+            
+            # Parse AWDB response structure
+            # Response is: [{"stationTriplet": "...", "data": [{"stationElement": {...}, "values": [...]}]}]
+            station_data = data[0]
+            elements_data = station_data.get('data', [])
+            
+            # Build DataFrame from response
+            records = []
+            wteq_values = {}
+            snwd_values = {}
+            
+            for element_data in elements_data:
+                element_code = element_data['stationElement']['elementCode']
+                values = element_data.get('values', [])
+                
+                for value_obj in values:
+                    date_str = value_obj['date']
+                    value = value_obj.get('value')
+                    
+                    if element_code == 'WTEQ':
+                        wteq_values[date_str] = value
+                    elif element_code == 'SNWD':
+                        snwd_values[date_str] = value
+            
+            # Combine all dates
+            all_dates = set(wteq_values.keys()) | set(snwd_values.keys())
+            
+            for date_str in sorted(all_dates):
+                records.append({
+                    'date': date_str,
+                    'WTEQ': wteq_values.get(date_str),
+                    'SNWD': snwd_values.get(date_str),
+                })
+            
+            if not records:
+                logger.debug(f"No data records parsed from AWDB API response for station {station_id}")
+                return None
+            
+            df = pd.DataFrame(records)
+            logger.debug(f"Fetched {len(df)} records from AWDB API for station {station_id} ({begin_date} to {end_date})")
+            return df
+            
+        except requests.exceptions.RequestException as e:
+            # Only warn once per station to avoid log spam (shared across all instances)
+            with AWDBClient._warning_lock:
+                if station_id not in AWDBClient._warned_api_failures:
+                    logger.warning(f"AWDB API request failed for station {station_id}: {e}")
+                    AWDBClient._warned_api_failures.add(station_id)
+            return None
+        except Exception as e:
+            logger.warning(f"Error parsing AWDB API response for station {station_id}: {e}")
+            logger.debug(f"Traceback: {traceback.format_exc()}")
+            return None
     
     def _estimate_snow_from_elevation(self, lat: float, lon: float, 
                                      date: datetime, elevation_ft: Optional[float] = None) -> Dict:
