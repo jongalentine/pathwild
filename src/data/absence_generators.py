@@ -339,13 +339,14 @@ def _static_generate_worker(
         while len(absence_points) < n_samples and attempts < max_attempts:
             attempts += 1
             
-            # Log progress every 500 attempts or every 30 seconds, whichever comes first
+            # Log progress every 1000 attempts or every 60 seconds, whichever comes first
+            # Reduced frequency to match integration step style (less verbose)
             current_time = time.time()
             time_since_last_progress = current_time - last_progress_time
             should_log = (
-                attempts % 500 == 0 or  # Every 500 attempts
-                time_since_last_progress >= 30.0 or  # Every 30 seconds
-                len(absence_points) > last_progress_count + 50  # Every 50 new points
+                attempts % 1000 == 0 or  # Every 1000 attempts (less frequent)
+                time_since_last_progress >= 60.0 or  # Every 60 seconds (less frequent)
+                len(absence_points) > last_progress_count + 100  # Every 100 new points
             )
             
             if should_log:
@@ -355,10 +356,10 @@ def _static_generate_worker(
                 eta = remaining / rate if rate > 0 else 0
                 success_rate = (len(absence_points) / attempts * 100) if attempts > 0 else 0
                 
+                # Format consistent with integrate_environmental_features.py worker logs
                 worker_logger.info(
                     f"Worker {seed}: {len(absence_points):,}/{n_samples:,} points "
                     f"({len(absence_points)/n_samples*100:.1f}%) - "
-                    f"{attempts:,} attempts ({success_rate:.2f}% success) - "
                     f"{rate:.1f} pts/sec - ~{eta/60:.1f} min remaining"
                 )
                 last_progress_time = current_time
@@ -392,9 +393,9 @@ def _static_generate_worker(
         success_rate = (len(absence_points) / attempts * 100) if attempts > 0 else 0
         rate = len(absence_points) / elapsed if elapsed > 0 else 0
         
+        # Format consistent with integrate_environmental_features.py completion logs
         worker_logger.info(
             f"Worker {seed}: ✓ Completed - {len(absence_points):,}/{n_samples:,} points "
-            f"in {attempts:,} attempts ({success_rate:.2f}% success) "
             f"in {elapsed/60:.1f} minutes ({rate:.1f} pts/sec)"
         )
         

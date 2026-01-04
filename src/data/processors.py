@@ -661,6 +661,10 @@ class AWDBClient:
         self.station_data_cache = {}  # Cache station data: {station_id: DataFrame}
         self.request_cache = {}  # Cache final results: {(lat, lon, date_str): result_dict}
         
+        # Cache size limits to prevent unbounded memory growth
+        self.MAX_STATION_CACHE_SIZE = 100  # Keep only 100 most recent stations
+        self.MAX_REQUEST_CACHE_SIZE = 10000  # Keep only 10k most recent requests
+        
         # Initialize lock for thread-safe warning tracking (lazy initialization)
         if AWDBClient._warning_lock is None:
             import threading
@@ -668,6 +672,29 @@ class AWDBClient:
         
         # Load stations (from local cache or AWDB API)
         self._load_stations()
+    
+    def _trim_caches(self):
+        """
+        Trim caches to prevent unbounded memory growth.
+        Uses LRU-style eviction (removes oldest entries first).
+        """
+        # Trim station data cache
+        if len(self.station_data_cache) > self.MAX_STATION_CACHE_SIZE:
+            excess = len(self.station_data_cache) - self.MAX_STATION_CACHE_SIZE
+            # Remove oldest entries (simple: remove first N keys)
+            keys_to_remove = list(self.station_data_cache.keys())[:excess]
+            for key in keys_to_remove:
+                del self.station_data_cache[key]
+            logger.debug(f"Trimmed station cache: removed {excess} entries, {len(self.station_data_cache)} remaining")
+        
+        # Trim request cache
+        if len(self.request_cache) > self.MAX_REQUEST_CACHE_SIZE:
+            excess = len(self.request_cache) - self.MAX_REQUEST_CACHE_SIZE
+            # Remove oldest entries (simple: remove first N keys)
+            keys_to_remove = list(self.request_cache.keys())[:excess]
+            for key in keys_to_remove:
+                del self.request_cache[key]
+            logger.debug(f"Trimmed request cache: removed {excess} entries, {len(self.request_cache)} remaining")
     
     def _load_stations_from_awdb(self) -> bool:
         """
@@ -906,6 +933,7 @@ class AWDBClient:
             # No station nearby, use elevation-based estimate
             result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
             self.request_cache[cache_key] = result
+            self._trim_caches()  # Prevent unbounded growth
             return result
         
         try:
@@ -917,6 +945,7 @@ class AWDBClient:
                 logger.debug(f"Station {station['name']} has no AWDB station ID, using elevation estimate")
                 result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
                 self.request_cache[cache_key] = result
+                self._trim_caches()  # Prevent unbounded growth
                 return result
             
             station_id = str(station_id)
@@ -944,12 +973,14 @@ class AWDBClient:
                     df = self._fetch_station_data_from_awdb(station_id, begin_date, end_date)
                     if df is not None:
                         self.station_data_cache[station_cache_key] = df
+                        self._trim_caches()  # Prevent unbounded growth
             else:
                 # Need to fetch station data
                 logger.debug(f"Fetching data for station {station['name']} (station_id {station_id}) from AWDB API")
                 df = self._fetch_station_data_from_awdb(station_id, begin_date, end_date)
                 if df is not None:
                     self.station_data_cache[station_cache_key] = df
+                    self._trim_caches()  # Prevent unbounded growth
             
             if df is None or len(df) == 0:
                 # Only warn once per station to avoid log spam (shared across all instances)
@@ -1019,6 +1050,7 @@ class AWDBClient:
             
             # Cache result for this specific location/date (fast lookup)
             self.request_cache[cache_key] = result
+            self._trim_caches()  # Prevent unbounded growth
             return result
         
         except Exception as e:
@@ -1027,6 +1059,7 @@ class AWDBClient:
             # Pass elevation if available for better estimation
             result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
             self.request_cache[cache_key] = result
+            self._trim_caches()  # Prevent unbounded growth
             return result
     
     def _fetch_station_data_from_awdb(self, station_id: str, begin_date: str, end_date: str) -> Optional[pd.DataFrame]:
@@ -1066,14 +1099,33 @@ class AWDBClient:
                 'returnSuspectData': 'false',
             }
             
-            # Retry logic with exponential backoff for 5xx errors
+            # Retry logic with exponential backoff for 5xx errors, timeouts, and connection errors
             max_retries = 3
             base_delay = 1.0  # Start with 1 second
             import time
+            import threading
+            
+            # Rate limiting: ensure minimum 100ms between API requests (shared across all instances)
+            if not hasattr(AWDBClient, '_rate_limit_lock'):
+                AWDBClient._rate_limit_lock = threading.Lock()
+                AWDBClient._last_request_time = 0
+                AWDBClient.MIN_REQUEST_INTERVAL = 0.1  # 100ms between requests (10 req/sec max)
             
             for attempt in range(max_retries + 1):
                 try:
-                    response = requests.get(f"{self.AWDB_BASE_URL}/data", params=params, timeout=30)
+                    # Rate limiting: ensure minimum interval between requests
+                    # CRITICAL: Only hold lock for time check, not during API call!
+                    with AWDBClient._rate_limit_lock:
+                        elapsed = time.time() - AWDBClient._last_request_time
+                        if elapsed < AWDBClient.MIN_REQUEST_INTERVAL:
+                            sleep_time = AWDBClient.MIN_REQUEST_INTERVAL - elapsed
+                            time.sleep(sleep_time)
+                        # Update last request time BEFORE making the call
+                        AWDBClient._last_request_time = time.time()
+                    
+                    # Make API call OUTSIDE the lock to avoid serializing all workers
+                    # Reduced timeout from 30s to 10s for faster failure detection
+                    response = requests.get(f"{self.AWDB_BASE_URL}/data", params=params, timeout=10)
                     
                     # Check for 5xx errors before raising
                     # Use getattr to safely check status_code (handles mocks in tests)
@@ -1105,8 +1157,18 @@ class AWDBClient:
                                 continue
                     # Non-5xx HTTP error or final attempt - re-raise
                     raise
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                    # Retry timeouts and connection errors (network issues are often transient)
+                    if attempt < max_retries:
+                        delay = base_delay * (2 ** attempt)
+                        error_type = "timeout" if isinstance(e, requests.exceptions.Timeout) else "connection error"
+                        logger.debug(f"AWDB API {error_type} for station {station_id} (attempt {attempt + 1}/{max_retries + 1}), retrying in {delay:.1f}s...")
+                        time.sleep(delay)
+                        continue
+                    # Final attempt failed - re-raise
+                    raise
                 except requests.exceptions.RequestException as e:
-                    # Other request exceptions (timeout, connection errors) - don't retry
+                    # Other request exceptions - don't retry
                     raise
             
             # If we get here, we should have a successful response

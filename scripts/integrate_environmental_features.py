@@ -428,7 +428,13 @@ def _process_parallel(df, data_dir, date_col, batch_size, limit, dataset_path, n
         logger.info("Force mode: Processing all rows")
     
     # Prepare batches
-    chunk_size = max(100, len(df) // (n_workers * 4))  # 4 chunks per worker
+    # Use batch_size parameter, but ensure reasonable chunking for parallel processing
+    # Cap at 5000 rows per batch to avoid extremely long-running batches
+    MAX_BATCH_SIZE = 5000
+    effective_batch_size = min(batch_size, MAX_BATCH_SIZE)
+    # Create enough batches for parallel processing (at least 2 batches per worker)
+    min_batches = n_workers * 2
+    chunk_size = max(100, min(effective_batch_size, len(df) // min_batches))
     batches = []
     
     # Convert data_dir to string for pickling (Path objects can sometimes cause issues)
@@ -623,9 +629,10 @@ def process_batch(args):
                 rate = processed / elapsed if elapsed > 0 else 0
                 remaining = len(batch_data) - processed
                 eta = remaining / rate if rate > 0 else 0
+                # Use .1f to show decimals (prevents "0 rows/sec" when rate is 0.4)
                 worker_logger.info(f"Worker: {processed:,}/{len(batch_data):,} rows "
                                  f"({processed/len(batch_data)*100:.1f}%) - "
-                                 f"{rate:.0f} rows/sec - ~{eta/60:.1f} min remaining")
+                                 f"{rate:.1f} rows/sec - ~{eta/60:.1f} min remaining")
                 
         except Exception as e:
             worker_logger.warning(f"Error processing row {idx}: {e}")
@@ -633,7 +640,7 @@ def process_batch(args):
     
     total_time = time.time() - batch_start_time
     worker_logger.info(f"Worker completed batch: {processed:,} rows in {total_time/60:.1f} minutes "
-                      f"({processed/total_time:.0f} rows/sec)")
+                      f"({processed/total_time:.1f} rows/sec)")
     
     return results
 
@@ -718,7 +725,10 @@ def update_dataset(dataset_path: Path, data_dir: Path, batch_size: int = 1000, l
             logger.info(f"Auto-detected optimal batch size: {batch_size}")
     
     # Determine if we should use parallel processing
-    use_parallel = n_workers > 1 and len(df) > 1000
+    # Use parallel if we have multiple workers and enough rows to benefit from parallelization
+    # Threshold: >= 5000 rows (parallel overhead ~50s, only beneficial for larger datasets)
+    # For small datasets (<5000 rows), sequential is faster due to data loading overhead
+    use_parallel = n_workers > 1 and len(df) >= 5000
     
     if use_parallel:
         logger.info(f"Using parallel processing with {n_workers} workers")
