@@ -8,6 +8,7 @@ import requests
 from functools import lru_cache
 import logging
 import warnings
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +38,12 @@ class DataContextBuilder:
         
         # Initialize data loaders
         self.snotel_client = AWDBClient(self.data_dir)
-        self.weather_client = WeatherClient()
-        self.satellite_client = SatelliteClient()
+        self.weather_client = WeatherClient(data_dir=self.data_dir, use_real_data=True)
+        # TODO: NDVI data currently uses placeholders. For production, implement pre-downloaded
+        # raster files (similar to DEM/landcover) for training, and consider cloud-based
+        # solutions for inference. AppEEARS async API is not suitable for inference (requires
+        # minutes to process requests). See docs/dataset_gap_analysis.md for details.
+        self.satellite_client = SatelliteClient(use_real_data=False)
     
     def _load_static_layers(self):
         """Load data that doesn't change over time"""
@@ -1314,86 +1319,517 @@ class AWDBClient:
 
 
 class WeatherClient:
-    """Client for weather data"""
+    """Client for weather data using PRISM (historical) and Open-Meteo (forecasts)"""
     
-    def __init__(self):
-        self.api_key = None  # Set from environment
+    def __init__(self, data_dir: Optional[Path] = None, use_real_data: bool = True):
+        """
+        Initialize weather client.
+        
+        Args:
+            data_dir: Data directory for PRISM cache
+            use_real_data: If False, uses placeholder values (for testing/fallback)
+        """
+        self.use_real_data = use_real_data
         self.cache = {}
+        
+        if use_real_data:
+            try:
+                from .prism_client import PRISMClient
+                from .openmeteo_client import OpenMeteoClient
+                
+                if data_dir is None:
+                    data_dir = Path("data")
+                self.prism_client = PRISMClient(data_dir / "prism")
+                self.openmeteo_client = OpenMeteoClient()
+            except ImportError:
+                logger.warning("PRISM/Open-Meteo clients not available, using placeholder values")
+                self.use_real_data = False
     
     def get_weather(self, lat: float, lon: float, date: datetime) -> Dict:
         """Get weather for location and date"""
+        
+        # Check cache
+        cache_key = f"{lat:.4f},{lon:.4f},{date.strftime('%Y-%m-%d')}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
         
         # Check if date is in future (forecast) or past (historical)
         today = datetime.now().date()
         target_date = date.date()
         
         if target_date > today:
-            return self._get_forecast(lat, lon, date)
+            result = self._get_forecast(lat, lon, date)
         else:
-            return self._get_historical(lat, lon, date)
+            result = self._get_historical(lat, lon, date)
+        
+        # Cache result
+        self.cache[cache_key] = result
+        return result
     
     def _get_forecast(self, lat: float, lon: float, date: datetime) -> Dict:
-        """Get weather forecast"""
-        # In production: use NOAA API, weather.gov
-        # Placeholder with reasonable defaults
+        """Get weather forecast using Open-Meteo"""
+        if not self.use_real_data:
+            # Placeholder fallback
+            return {
+                "temp": 45.0,
+                "temp_high": 55.0,
+                "temp_low": 35.0,
+                "precip_7d": 0.3,
+                "cloud_cover": 30,
+                "wind_mph": 10
+            }
         
-        return {
-            "temp": 45.0,
-            "temp_high": 55.0,
-            "temp_low": 35.0,
-            "precip_7d": 0.3,
-            "cloud_cover": 30,
-            "wind_mph": 10
-        }
+        try:
+            # Get forecast for target date
+            forecast = self.openmeteo_client.get_forecast_for_date(
+                lat, lon, date.strftime("%Y-%m-%d")
+            )
+            
+            if forecast:
+                # Get 7-day precipitation window
+                start_date = date - timedelta(days=7)
+                forecasts_7d = self.openmeteo_client.get_forecast_for_location(lat, lon)
+                precip_7d = sum(
+                    f.get("precipitation_inches", 0) or 0
+                    for f in forecasts_7d[:7]
+                )
+                
+                return {
+                    "temp": forecast.get("temp_mean_f", 45.0),
+                    "temp_high": forecast.get("temp_max_f", 55.0),
+                    "temp_low": forecast.get("temp_min_f", 35.0),
+                    "precip_7d": precip_7d,
+                    "cloud_cover": 30,  # Open-Meteo doesn't provide this in free tier
+                    "wind_mph": 10  # Open-Meteo doesn't provide this in free tier
+                }
+            else:
+                raise ValueError("Forecast not available for target date")
+                
+        except Exception as e:
+            logger.warning(f"Failed to get Open-Meteo forecast: {e}, using placeholder")
+            return {
+                "temp": 45.0,
+                "temp_high": 55.0,
+                "temp_low": 35.0,
+                "precip_7d": 0.3,
+                "cloud_cover": 30,
+                "wind_mph": 10
+            }
     
     def _get_historical(self, lat: float, lon: float, date: datetime) -> Dict:
-        """Get historical weather"""
-        # In production: use NOAA NCDC, weather archives
-        # Placeholder
+        """Get historical weather using PRISM, falling back to Open-Meteo for recent dates"""
+        if not self.use_real_data:
+            # Placeholder fallback
+            return {
+                "temp": 42.0,
+                "temp_high": 52.0,
+                "temp_low": 32.0,
+                "precip_7d": 0.5,
+                "cloud_cover": 40,
+                "wind_mph": 12
+            }
         
-        return {
-            "temp": 42.0,
-            "temp_high": 52.0,
-            "temp_low": 32.0,
-            "precip_7d": 0.5,
-            "cloud_cover": 40,
-            "wind_mph": 12
-        }
+        try:
+            # Get temperature for date from PRISM
+            temp_data = self.prism_client.get_temperature(lat, lon, date)
+            
+            # Check if PRISM returned None (data not available - likely too recent)
+            if temp_data is None or all(v is None for v in temp_data.values()):
+                # Fall back to Open-Meteo for historical data (supports recent past)
+                logger.info(f"PRISM data not available for {date.strftime('%Y-%m-%d')}, using Open-Meteo historical data")
+                return self._get_historical_from_openmeteo(lat, lon, date)
+            
+            # Get 7-day precipitation
+            start_date = date - timedelta(days=7)
+            precip_mm = 0.0
+            current_date = start_date
+            while current_date <= date:
+                ppt = self.prism_client.get_precipitation(lat, lon, current_date)
+                if ppt is not None:
+                    precip_mm += ppt
+                current_date += timedelta(days=1)
+            
+            # Convert mm to inches
+            precip_7d = precip_mm / 25.4
+            
+            # Convert temps to Fahrenheit
+            # PRISM returns temp_mean_c, temp_min_c, temp_max_c
+            temp_mean_f = None
+            temp_high_f = None
+            temp_low_f = None
+            
+            if temp_data.get("temp_mean_c") is not None:
+                temp_mean_f = (temp_data["temp_mean_c"] * 9/5) + 32
+            if temp_data.get("temp_max_c") is not None:
+                temp_high_f = (temp_data["temp_max_c"] * 9/5) + 32
+            elif temp_data.get("temp_max_f") is not None:
+                # Handle case where PRISM client already converted
+                temp_high_f = temp_data["temp_max_f"]
+            if temp_data.get("temp_min_c") is not None:
+                temp_low_f = (temp_data["temp_min_c"] * 9/5) + 32
+            elif temp_data.get("temp_min_f") is not None:
+                # Handle case where PRISM client already converted
+                temp_low_f = temp_data["temp_min_f"]
+            
+            return {
+                "temp": temp_mean_f if temp_mean_f is not None else 42.0,
+                "temp_high": temp_high_f if temp_high_f is not None else 52.0,
+                "temp_low": temp_low_f if temp_low_f is not None else 32.0,
+                "precip_7d": precip_7d,
+                "cloud_cover": 40,  # PRISM doesn't provide this
+                "wind_mph": 12  # PRISM doesn't provide this
+            }
+            
+        except Exception as e:
+            # If PRISM fails, try Open-Meteo as fallback
+            logger.warning(f"Failed to get PRISM weather: {e}, trying Open-Meteo fallback")
+            try:
+                return self._get_historical_from_openmeteo(lat, lon, date)
+            except Exception as e2:
+                logger.warning(f"Open-Meteo fallback also failed: {e2}, using placeholder")
+                return {
+                    "temp": 42.0,
+                    "temp_high": 52.0,
+                    "temp_low": 32.0,
+                    "precip_7d": 0.5,
+                    "cloud_cover": 40,
+                    "wind_mph": 12
+                }
+    
+    def _get_historical_from_openmeteo(self, lat: float, lon: float, date: datetime) -> Dict:
+        """Get historical weather from Open-Meteo API (for recent dates not in PRISM yet)"""
+        try:
+            # Get historical data for the date and 7-day window
+            start_date = date - timedelta(days=7)
+            historical = self.openmeteo_client.get_historical(
+                lat, lon,
+                start_date.strftime("%Y-%m-%d"),
+                date.strftime("%Y-%m-%d")
+            )
+            
+            # Parse the response
+            daily = historical.get("daily", {})
+            dates = daily.get("time", [])
+            temp_max = daily.get("temperature_2m_max", [])
+            temp_min = daily.get("temperature_2m_min", [])
+            temp_mean = daily.get("temperature_2m_mean", [])
+            precipitation = daily.get("precipitation_sum", [])
+            
+            # Find the target date in the response
+            target_date_str = date.strftime("%Y-%m-%d")
+            temp_mean_f = 42.0
+            temp_high_f = 52.0
+            temp_low_f = 32.0
+            
+            if target_date_str in dates:
+                idx = dates.index(target_date_str)
+                if idx < len(temp_mean):
+                    temp_mean_f = temp_mean[idx] or 42.0
+                if idx < len(temp_max):
+                    temp_high_f = temp_max[idx] or 52.0
+                if idx < len(temp_min):
+                    temp_low_f = temp_min[idx] or 32.0
+            
+            # Sum precipitation over the 7-day window
+            precip_7d = sum(precipitation) if precipitation else 0.5
+            
+            return {
+                "temp": temp_mean_f,
+                "temp_high": temp_high_f,
+                "temp_low": temp_low_f,
+                "precip_7d": precip_7d,
+                "cloud_cover": 30,  # Open-Meteo doesn't provide in free tier
+                "wind_mph": 10  # Open-Meteo doesn't provide in free tier
+            }
+        except Exception as e:
+            logger.error(f"Open-Meteo historical data fetch failed: {e}")
+            raise
 
 
 class SatelliteClient:
-    """Client for satellite imagery (NDVI, etc.)"""
+    """Client for satellite imagery (NDVI) using AppEEARS"""
     
-    def __init__(self):
+    def __init__(self, use_real_data: bool = True, appeears_username: Optional[str] = None, 
+                 appeears_password: Optional[str] = None):
+        """
+        Initialize satellite client.
+        
+        Args:
+            use_real_data: If False, uses placeholder values (for testing/fallback)
+            appeears_username: AppEEARS username (or from env)
+            appeears_password: AppEEARS password (or from env)
+        """
+        self.use_real_data = use_real_data
         self.cache = {}
+        self.appeears_client = None
+        
+        if use_real_data:
+            try:
+                from .appeears_client import AppEEARSClient
+                import os
+                
+                username = appeears_username or os.getenv("APPEEARS_USERNAME")
+                password = appeears_password or os.getenv("APPEEARS_PASSWORD")
+                
+                if username and password:
+                    self.appeears_client = AppEEARSClient(username, password)
+                else:
+                    logger.warning("AppEEARS credentials not available, using placeholder NDVI")
+                    self.use_real_data = False
+            except ImportError:
+                logger.warning("AppEEARS client not available, using placeholder NDVI")
+                self.use_real_data = False
+            except Exception as e:
+                logger.warning(f"Failed to initialize AppEEARS client: {e}, using placeholder NDVI")
+                self.use_real_data = False
     
     def get_ndvi(self, lat: float, lon: float, date: datetime) -> Dict:
-        """Get NDVI for location and date"""
-        # In production: use Google Earth Engine, Landsat, Sentinel
+        """
+        Get NDVI for location and date.
         
-        # Placeholder with seasonal variation
-        month = date.month
+        Note: For batch processing, use extract_ndvi_batch() method instead
+        as it's more efficient than calling this for individual points.
+        """
+        # Check cache
+        cache_key = f"{lat:.4f},{lon:.4f},{date.strftime('%Y-%m-%d')}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
         
-        if month in [6, 7, 8]:  # Summer - high NDVI
-            ndvi = 0.70
-        elif month in [9, 10]:  # Fall - declining
-            ndvi = 0.55
-        elif month in [11, 12, 1, 2, 3]:  # Winter - low
-            ndvi = 0.30
-        else:  # Spring - increasing
-            ndvi = 0.50
+        if not self.use_real_data or not self.appeears_client:
+            # Placeholder fallback with seasonal variation
+            month = date.month
+            if month in [6, 7, 8]:  # Summer - high NDVI
+                ndvi = 0.70
+            elif month in [9, 10]:  # Fall - declining
+                ndvi = 0.55
+            elif month in [11, 12, 1, 2, 3]:  # Winter - low
+                ndvi = 0.30
+            else:  # Spring - increasing
+                ndvi = 0.50
+            
+            result = {
+                "ndvi": ndvi,
+                "age_days": 8,
+                "irg": 0.01 if month in [4, 5] else -0.005 if month in [9, 10] else 0.0,
+                "cloud_free": True
+            }
+            self.cache[cache_key] = result
+            return result
         
-        return {
-            "ndvi": ndvi,
-            "age_days": 8,
-            "irg": 0.01 if month in [4, 5] else -0.005 if month in [9, 10] else 0.0,
-            "cloud_free": True
-        }
+        try:
+            # Check if AppEEARS client is available
+            if self.appeears_client is None:
+                raise ValueError("AppEEARS client not initialized. Check credentials.")
+            
+            # Use AppEEARS to get NDVI
+            points = [(lat, lon, date.strftime("%Y-%m-%d"))]
+            try:
+                # Use shorter timeout for single-point requests (5 minutes)
+                ndvi_df = self.appeears_client.get_ndvi_for_points(
+                    points,
+                    product="modis_ndvi",
+                    date_buffer_days=7,
+                    max_wait_minutes=5
+                )
+            except (TimeoutError, RuntimeError) as e:
+                logger.warning(f"AppEEARS request timed out or failed: {e}, using placeholder NDVI")
+                # Fall back to placeholder
+                month = date.month
+                if month in [6, 7, 8]:  # Summer - high NDVI
+                    ndvi = 0.70
+                elif month in [9, 10]:  # Fall - decreasing NDVI
+                    ndvi = 0.55
+                elif month in [11, 12, 1, 2, 3]:  # Winter/Early Spring - low NDVI
+                    ndvi = 0.30
+                else:  # Spring - increasing NDVI
+                    ndvi = 0.50
+                
+                result = {
+                    "ndvi": ndvi,
+                    "age_days": 16,
+                    "irg": 0.0,
+                    "cloud_free": False
+                }
+                self.cache[cache_key] = result
+                return result
+            
+            if len(ndvi_df) > 0 and pd.notna(ndvi_df.iloc[0]["ndvi"]):
+                ndvi_value = ndvi_df.iloc[0]["ndvi"]
+                qa_flags = ndvi_df.iloc[0].get("qa_flags", 0)
+                
+                # Calculate IRG (simple approximation - would need time series for accurate)
+                month = date.month
+                irg = 0.01 if month in [4, 5] else -0.005 if month in [9, 10] else 0.0
+                
+                result = {
+                    "ndvi": float(ndvi_value),
+                    "age_days": 8,  # Approximate (would need image date from AppEEARS)
+                    "irg": irg,
+                    "cloud_free": qa_flags == 0 if qa_flags is not None else True
+                }
+            else:
+                # Fallback to placeholder if no data
+                month = date.month
+                if month in [6, 7, 8]:
+                    ndvi = 0.70
+                elif month in [9, 10]:
+                    ndvi = 0.55
+                elif month in [11, 12, 1, 2, 3]:
+                    ndvi = 0.30
+                else:
+                    ndvi = 0.50
+                
+                result = {
+                    "ndvi": ndvi,
+                    "age_days": 16,
+                    "irg": 0.0,
+                    "cloud_free": False
+                }
+            
+            self.cache[cache_key] = result
+            return result
+            
+        except Exception as e:
+            logger.warning(f"Failed to get NDVI from AppEEARS: {e}, using placeholder")
+            # Fallback to placeholder
+            month = date.month
+            if month in [6, 7, 8]:
+                ndvi = 0.70
+            elif month in [9, 10]:
+                ndvi = 0.55
+            elif month in [11, 12, 1, 2, 3]:
+                ndvi = 0.30
+            else:
+                ndvi = 0.50
+            
+            result = {
+                "ndvi": ndvi,
+                "age_days": 16,
+                "irg": 0.0,
+                "cloud_free": False
+            }
+            self.cache[cache_key] = result
+            return result
+    
+    def extract_ndvi_batch(
+        self,
+        points: List[Tuple[float, float, datetime]],
+        batch_size: int = 100
+    ) -> pd.DataFrame:
+        """
+        Extract NDVI for multiple points efficiently using batch processing.
+        
+        Args:
+            points: List of (lat, lon, date) tuples
+            batch_size: Number of points per AppEEARS request
+            
+        Returns:
+            DataFrame with latitude, longitude, date, ndvi, qa_flags columns
+        """
+        if not self.use_real_data or not self.appeears_client:
+            # Return placeholder DataFrame
+            import pandas as pd
+            data = []
+            for lat, lon, date in points:
+                month = date.month
+                if month in [6, 7, 8]:
+                    ndvi = 0.70
+                elif month in [9, 10]:
+                    ndvi = 0.55
+                elif month in [11, 12, 1, 2, 3]:
+                    ndvi = 0.30
+                else:
+                    ndvi = 0.50
+                
+                data.append({
+                    "latitude": lat,
+                    "longitude": lon,
+                    "date": date.strftime("%Y-%m-%d"),
+                    "ndvi": ndvi,
+                    "qa_flags": 0
+                })
+            return pd.DataFrame(data)
+        
+        try:
+            # Convert to AppEEARS format
+            appeears_points = [
+                (lat, lon, date.strftime("%Y-%m-%d"))
+                for lat, lon, date in points
+            ]
+            
+            # Process in batches
+            all_results = []
+            for i in range(0, len(appeears_points), batch_size):
+                batch = appeears_points[i:i + batch_size]
+                try:
+                    # Use longer timeout for batch requests (15 minutes)
+                    batch_results = self.appeears_client.get_ndvi_for_points(
+                        batch,
+                        product="modis_ndvi",
+                        date_buffer_days=7,
+                        max_wait_minutes=15
+                    )
+                    all_results.append(batch_results)
+                except (TimeoutError, RuntimeError) as e:
+                    logger.warning(f"AppEEARS batch request timed out or failed: {e}, skipping batch")
+                    # Continue with other batches rather than failing completely
+                    continue
+            
+            if not all_results:
+                # All batches failed - return empty DataFrame
+                logger.warning("All AppEEARS batch requests failed, returning empty DataFrame")
+                return pd.DataFrame(columns=["latitude", "longitude", "date", "ndvi", "qa_flags"])
+            
+            return pd.concat(all_results, ignore_index=True)
+            
+        except Exception as e:
+            logger.error(f"Failed to extract NDVI batch: {e}")
+            # Return placeholder DataFrame
+            import pandas as pd
+            data = []
+            for lat, lon, date in points:
+                month = date.month
+                if month in [6, 7, 8]:
+                    ndvi = 0.70
+                elif month in [9, 10]:
+                    ndvi = 0.55
+                elif month in [11, 12, 1, 2, 3]:
+                    ndvi = 0.30
+                else:
+                    ndvi = 0.50
+                
+                data.append({
+                    "latitude": lat,
+                    "longitude": lon,
+                    "date": date.strftime("%Y-%m-%d"),
+                    "ndvi": ndvi,
+                    "qa_flags": None
+                })
+            return pd.DataFrame(data)
     
     def get_integrated_ndvi(self, lat: float, lon: float, 
                            start_date: datetime, end_date: datetime) -> float:
         """Get integrated NDVI over date range"""
-        # In production: sum NDVI across all dates
+        if not self.use_real_data or not self.appeears_client:
+            return 60.0  # Placeholder
         
-        # Placeholder
-        return 60.0  # Typical summer iNDVI
+        try:
+            # Sample every 16 days (Landsat revisit cycle)
+            current_date = start_date
+            ndvi_values = []
+            
+            while current_date <= end_date:
+                ndvi_data = self.get_ndvi(lat, lon, current_date)
+                if ndvi_data.get("ndvi") is not None:
+                    ndvi_values.append(ndvi_data["ndvi"])
+                current_date += timedelta(days=16)
+            
+            if not ndvi_values:
+                return 60.0
+            
+            # Integrated NDVI = sum of NDVI values
+            return sum(ndvi_values)
+            
+        except Exception as e:
+            logger.warning(f"Failed to get integrated NDVI: {e}")
+            return 60.0

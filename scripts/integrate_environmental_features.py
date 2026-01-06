@@ -681,6 +681,9 @@ def update_dataset(dataset_path: Path, data_dir: Path, batch_size: int = 1000, l
     logger.info("Initializing DataContextBuilder...")
     try:
         builder = DataContextBuilder(data_dir)
+        # Note: NDVI data uses placeholders (integration deferred - see TODO in processors.py)
+        # Weather data uses real APIs (PRISM/Open-Meteo) when available
+        
         logger.info("✓ DataContextBuilder initialized")
     except Exception as e:
         logger.error(f"Failed to initialize DataContextBuilder: {e}")
@@ -725,16 +728,20 @@ def update_dataset(dataset_path: Path, data_dir: Path, batch_size: int = 1000, l
             logger.info(f"Auto-detected optimal batch size: {batch_size}")
     
     # Determine if we should use parallel processing
-    # Use parallel if we have multiple workers and enough rows to benefit from parallelization
-    # Threshold: >= 5000 rows (parallel overhead ~50s, only beneficial for larger datasets)
-    # For small datasets (<5000 rows), sequential is faster due to data loading overhead
-    use_parallel = n_workers > 1 and len(df) >= 5000
+    # Standardized threshold: sequential for datasets < 5000 rows
+    # This matches the logic in generate_absence_data.py
+    # For small datasets, sequential is faster due to data loading overhead
+    PARALLEL_THRESHOLD = 5000
+    use_parallel = n_workers > 1 and len(df) >= PARALLEL_THRESHOLD
     
     if use_parallel:
-        logger.info(f"Using parallel processing with {n_workers} workers")
+        logger.info(f"Dataset size ({len(df):,}) >= {PARALLEL_THRESHOLD:,} rows - using parallel processing with {n_workers} workers")
         updated_count, error_count = _process_parallel(df, data_dir, date_col, batch_size, limit, dataset_path, n_workers, force)
     else:
-        logger.info("Using sequential processing")
+        if len(df) < PARALLEL_THRESHOLD:
+            logger.info(f"Dataset size ({len(df):,}) < {PARALLEL_THRESHOLD:,} rows - using sequential processing")
+        else:
+            logger.info("Using sequential processing")
         updated_count, error_count = _process_sequential(df, builder, date_col, batch_size, limit, dataset_path, force)
     
     # Final save

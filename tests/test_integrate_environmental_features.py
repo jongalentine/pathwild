@@ -444,9 +444,10 @@ class TestParallelProcessing:
         assert mock_builder_class.call_count > 0, \
             f"Expected DataContextBuilder to be called, got {mock_builder_class.call_count}"
     
+    @patch.object(integrate_module, 'DataContextBuilder')
     @patch('src.data.processors.DataContextBuilder')
     @patch('builtins.print')  # Suppress print statements from DataContextBuilder
-    def test_parallel_incremental_only_processes_placeholders(self, mock_print, mock_builder_class, large_dataset, mock_data_dir):
+    def test_parallel_incremental_only_processes_placeholders(self, mock_print, mock_src_builder_class, mock_builder_class, large_dataset, mock_data_dir):
         """Test that parallel incremental mode only processes placeholders."""
         dataset_path, df = large_dataset
         
@@ -484,8 +485,8 @@ class TestParallelProcessing:
         })
         df = pd.concat([df, real_data], ignore_index=True)
         
-        # Mock the builder
-        mock_builder = Mock()
+        # Mock the builder - ensure it doesn't execute any real initialization
+        mock_builder = Mock(spec=[])  # Empty spec to prevent attribute access issues
         mock_builder.build_context = Mock(return_value={
             'elevation': 2500.0,
             'slope_degrees': 5.0,
@@ -513,7 +514,19 @@ class TestParallelProcessing:
             'irg': 0.1,
             'summer_integrated_ndvi': 75.0
         })
+        # Set attributes that DataContextBuilder might check
+        mock_builder.dem = None
+        mock_builder.slope = None
+        mock_builder.aspect = None
+        mock_builder.landcover = None
+        mock_builder.canopy = None
+        mock_builder.water_sources = None
+        mock_builder.roads = None
+        mock_builder.trails = None
+        
+        # Configure both mocks
         mock_builder_class.return_value = mock_builder
+        mock_src_builder_class.return_value = mock_builder  # Also patch the src.data.processors version
         
         # Process in incremental mode with 4 workers
         updated_count, error_count = _process_parallel(

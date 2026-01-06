@@ -1,12 +1,44 @@
 import pytest
 from pathlib import Path
+from unittest.mock import Mock, patch
 from src.inference.engine import ElkPredictionEngine
 
 class TestElkPredictionEngine:
     
     @pytest.fixture
-    def engine(self, tmp_path):
-        """Create test engine with mock data directory"""
+    def mock_context(self):
+        """Create a mock context that DataContextBuilder.build_context returns"""
+        return {
+            "elevation": 8500.0,
+            "slope": 15.0,
+            "aspect": 180.0,
+            "landcover": "Mixed Forest",
+            "nlcd_code": 43,
+            "canopy_cover": 45.0,
+            "water_distance_miles": 0.93,  # ~1.5 km in miles
+            "water_reliability": 1.0,  # High reliability (0-1 scale)
+            "road_distance_miles": 1.86,  # ~3.0 km in miles
+            "trail_distance_miles": 1.24,  # ~2.0 km in miles
+            "ndvi": 0.65,
+            "ndvi_age_days": 5,
+            "irg": 0.01,
+            "summer_integrated_ndvi": 70.0,
+            "temperature_f": 50.0,
+            "temp_high": 60.0,
+            "temp_low": 40.0,
+            "precip_last_7_days_inches": 0.5,
+            "cloud_cover_percent": 30,
+            "snow_depth_inches": 0.0,
+            "snow_water_equiv_inches": 0.0,
+            "snow_crust_detected": False,
+            "snow_data_source": "snotel",
+            "snow_station_name": "TEST_STATION",
+            "snow_station_distance_km": 5.0
+        }
+    
+    @pytest.fixture
+    def engine(self, tmp_path, mock_context):
+        """Create test engine with mock data directory and mocked DataContextBuilder"""
         data_dir = tmp_path / "data"
         data_dir.mkdir()
         
@@ -16,6 +48,10 @@ class TestElkPredictionEngine:
         (data_dir / "landcover").mkdir()
         
         engine = ElkPredictionEngine(str(data_dir))
+        
+        # Mock the DataContextBuilder's build_context method to return quickly
+        engine.data_builder.build_context = Mock(return_value=mock_context)
+        
         return engine
     
     def test_simple_prediction(self, engine):

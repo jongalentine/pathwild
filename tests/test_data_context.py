@@ -1,5 +1,7 @@
 import pytest
 from pathlib import Path
+from unittest.mock import Mock
+from datetime import datetime
 from src.data.processors import DataContextBuilder
 
 class TestDataContextBuilder:
@@ -17,6 +19,81 @@ class TestDataContextBuilder:
         (data_dir / "hydrology").mkdir()
         
         builder = DataContextBuilder(data_dir)
+        
+        # Mock clients to prevent API calls that could be slow
+        # Make mocks return seasonally-appropriate values
+        def get_snow_data(lat, lon, date, elevation_ft=None):
+            """Return seasonally-varying snow data"""
+            month = date.month if isinstance(date, datetime) else datetime.fromisoformat(str(date)).month
+            if month in [12, 1, 2, 3]:  # Winter - deep snow
+                return {
+                    'depth': 30.0,
+                    'swe': 8.0,
+                    'crust': False,
+                    'station': None,
+                    'station_distance_km': None
+                }
+            elif month in [4, 5]:  # Spring - melting
+                return {
+                    'depth': 15.0,
+                    'swe': 4.0,
+                    'crust': True,
+                    'station': None,
+                    'station_distance_km': None
+                }
+            else:  # Summer/Fall - no snow
+                return {
+                    'depth': 0.0,
+                    'swe': 0.0,
+                    'crust': False,
+                    'station': None,
+                    'station_distance_km': None
+                }
+        
+        def get_weather(lat, lon, date):
+            """Return seasonally-varying weather data"""
+            month = date.month if isinstance(date, datetime) else datetime.fromisoformat(str(date)).month
+            if month in [12, 1, 2]:  # Winter - cold
+                return {
+                    'temp': 20.0, 'temp_high': 30.0, 'temp_low': 10.0,
+                    'precip_7d': 0.3, 'cloud_cover': 40
+                }
+            elif month in [6, 7, 8]:  # Summer - warm
+                return {
+                    'temp': 70.0, 'temp_high': 85.0, 'temp_low': 55.0,
+                    'precip_7d': 0.2, 'cloud_cover': 20
+                }
+            else:  # Spring/Fall - moderate
+                return {
+                    'temp': 45.0, 'temp_high': 55.0, 'temp_low': 35.0,
+                    'precip_7d': 0.5, 'cloud_cover': 30
+                }
+        
+        def get_ndvi(lat, lon, date):
+            """Return seasonally-varying NDVI data"""
+            month = date.month if isinstance(date, datetime) else datetime.fromisoformat(str(date)).month
+            if month in [6, 7, 8]:  # Summer - high NDVI
+                return {
+                    'ndvi': 0.75, 'age_days': 5, 'irg': 0.01, 'cloud_free': True
+                }
+            elif month in [11, 12, 1, 2, 3]:  # Winter - low NDVI
+                return {
+                    'ndvi': 0.25, 'age_days': 10, 'irg': 0.0, 'cloud_free': True
+                }
+            elif month in [4, 5]:  # Spring - increasing
+                return {
+                    'ndvi': 0.55, 'age_days': 7, 'irg': 0.02, 'cloud_free': True
+                }
+            else:  # Fall - decreasing
+                return {
+                    'ndvi': 0.50, 'age_days': 8, 'irg': -0.01, 'cloud_free': True
+                }
+        
+        builder.snotel_client.get_snow_data = Mock(side_effect=get_snow_data)
+        builder.weather_client.get_weather = Mock(side_effect=get_weather)
+        builder.satellite_client.get_ndvi = Mock(side_effect=get_ndvi)
+        builder.satellite_client.get_integrated_ndvi = Mock(return_value=70.0)
+        
         return builder
     
     def test_context_structure(self, builder):

@@ -828,6 +828,23 @@ class TestAWDBClientDataContextIntegration:
         
         builder = DataContextBuilder(data_dir)
         
+        # Mock clients to prevent API calls
+        builder.snotel_client.get_snow_data = Mock(return_value={
+            'depth': 20.0,
+            'swe': 5.0,
+            'crust': False,
+            'station': 'MEDICINE BOW',
+            'station_distance_km': 10.5
+        })
+        builder.weather_client.get_weather = Mock(return_value={
+            'temp': 30.0, 'temp_high': 35.0, 'temp_low': 25.0,
+            'precip_7d': 0.5, 'cloud_cover': 20
+        })
+        builder.satellite_client.get_ndvi = Mock(return_value={
+            'ndvi': 0.3, 'age_days': 5, 'irg': 0.0, 'cloud_free': True
+        })
+        builder.satellite_client.get_integrated_ndvi = Mock(return_value=45.0)
+        
         location = {"lat": 41.3500, "lon": -106.3167}
         date = "2024-01-15"
         
@@ -870,7 +887,16 @@ class TestAWDBClientDataContextIntegration:
         mock_read_file.return_value = mock_gdf
         
         builder = DataContextBuilder(data_dir)
-        # AWDBClient will use elevation estimate if no station data available
+        
+        # Mock all clients to prevent API calls that could be slow
+        builder.weather_client.get_weather = Mock(return_value={
+            'temp': 30.0, 'temp_high': 35.0, 'temp_low': 25.0,
+            'precip_7d': 0.5, 'cloud_cover': 20
+        })
+        builder.satellite_client.get_ndvi = Mock(return_value={
+            'ndvi': 0.3, 'age_days': 5, 'irg': 0.0, 'cloud_free': True
+        })
+        builder.satellite_client.get_integrated_ndvi = Mock(return_value=45.0)
         
         # Mock get_snow_data to verify elevation is passed
         with patch.object(builder.snotel_client, 'get_snow_data') as mock_get_snow:
@@ -924,7 +950,23 @@ class TestAWDBClientDataContextIntegration:
         mock_read_file.return_value = mock_gdf
         
         builder = DataContextBuilder(data_dir)
-        # AWDBClient will use elevation estimate if no station data available
+        
+        # Mock clients to prevent API calls - mock AWDB to return None (no station)
+        builder.snotel_client.get_snow_data = Mock(return_value={
+            'depth': 15.0,
+            'swe': 3.0,
+            'crust': False,
+            'station': None,  # No station - should use estimate
+            'station_distance_km': None
+        })
+        builder.weather_client.get_weather = Mock(return_value={
+            'temp': 30.0, 'temp_high': 35.0, 'temp_low': 25.0,
+            'precip_7d': 0.5, 'cloud_cover': 20
+        })
+        builder.satellite_client.get_ndvi = Mock(return_value={
+            'ndvi': 0.3, 'age_days': 5, 'irg': 0.0, 'cloud_free': True
+        })
+        builder.satellite_client.get_integrated_ndvi = Mock(return_value=45.0)
         
         location = {"lat": 41.3500, "lon": -106.3167}
         date = "2024-01-15"
@@ -958,7 +1000,23 @@ class TestAWDBClientDataContextIntegration:
         mock_read_file.return_value = mock_gdf
         
         builder = DataContextBuilder(data_dir)
-        # AWDBClient will use elevation estimate if no station data available
+        
+        # Mock clients to prevent API calls - unmapped station should return estimate
+        builder.snotel_client.get_snow_data = Mock(return_value={
+            'depth': 18.0,
+            'swe': 4.0,
+            'crust': False,
+            'station': None,  # Unmapped station returns estimate
+            'station_distance_km': None
+        })
+        builder.weather_client.get_weather = Mock(return_value={
+            'temp': 30.0, 'temp_high': 35.0, 'temp_low': 25.0,
+            'precip_7d': 0.5, 'cloud_cover': 20
+        })
+        builder.satellite_client.get_ndvi = Mock(return_value={
+            'ndvi': 0.3, 'age_days': 5, 'irg': 0.0, 'cloud_free': True
+        })
+        builder.satellite_client.get_integrated_ndvi = Mock(return_value=45.0)
         
         location = {"lat": 41.8350, "lon": -106.4250}
         date = "2024-01-15"
@@ -1527,12 +1585,24 @@ class TestRetryLogic:
         client = AWDBClient(data_dir=data_dir)
         client._stations_gdf = mock_gdf
         
+        # Reset rate limiting state to avoid rate limit sleeps interfering with test
+        AWDBClient._last_request_time = 0
+        
+        # Mock time.time() to avoid rate limiting (make elapsed time always > MIN_INTERVAL)
+        mock_time_current = 1000.0
+        def mock_time():
+            nonlocal mock_time_current
+            mock_time_current += 1.0  # Always increment by > MIN_INTERVAL (0.1s)
+            return mock_time_current
+        
         # Track sleep calls
         sleep_calls = []
         with patch('time.sleep', side_effect=lambda x: sleep_calls.append(x)):
-            result = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 15))
+            with patch('time.time', side_effect=mock_time):
+                result = client.get_snow_data(41.3500, -106.3167, datetime(2024, 1, 15))
         
         # Should have retried twice with exponential backoff: 1s, 2s
+        # (No rate limiting sleeps because we mocked time.time() to always be > MIN_INTERVAL apart)
         assert len(sleep_calls) == 2
         assert sleep_calls[0] == 1.0  # First retry: 1 second
         assert sleep_calls[1] == 2.0  # Second retry: 2 seconds

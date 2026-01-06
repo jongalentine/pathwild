@@ -98,13 +98,13 @@ def setup_logging(log_file: Optional[Path] = None) -> None:
     root_logger.setLevel(logging.INFO)
 
 
-def cleanup_old_logs(logs_dir: Path, max_age_days: int = 7) -> None:
+def cleanup_old_logs(logs_dir: Path, max_age_days: int = 3) -> None:
     """
     Delete log files older than specified number of days.
     
     Args:
         logs_dir: Directory containing log files
-        max_age_days: Maximum age in days (default: 7 = 1 week)
+        max_age_days: Maximum age in days (default: 3 = 1 week)
     """
     if not logs_dir.exists():
         return

@@ -1,5 +1,6 @@
 import pytest
 from pathlib import Path
+from unittest.mock import Mock
 from src.inference.engine import ElkPredictionEngine
 import json
 
@@ -7,8 +8,39 @@ class TestIntegration:
     """End-to-end integration tests"""
     
     @pytest.fixture
-    def engine(self, tmp_path):
-        """Create engine with test data"""
+    def mock_context(self):
+        """Create a mock context that DataContextBuilder.build_context returns"""
+        return {
+            "elevation": 8500.0,
+            "slope": 15.0,
+            "aspect": 180.0,
+            "landcover": "Mixed Forest",
+            "nlcd_code": 43,
+            "canopy_cover": 45.0,
+            "water_distance_miles": 0.93,  # ~1.5 km in miles
+            "water_reliability": 1.0,  # High reliability (0-1 scale)
+            "road_distance_miles": 1.86,  # ~3.0 km in miles
+            "trail_distance_miles": 1.24,  # ~2.0 km in miles
+            "ndvi": 0.65,
+            "ndvi_age_days": 5,
+            "irg": 0.01,
+            "summer_integrated_ndvi": 70.0,
+            "temperature_f": 50.0,
+            "temp_high": 60.0,
+            "temp_low": 40.0,
+            "precip_last_7_days_inches": 0.5,
+            "cloud_cover_percent": 30,
+            "snow_depth_inches": 0.0,
+            "snow_water_equiv_inches": 0.0,
+            "snow_crust_detected": False,
+            "snow_data_source": "snotel",
+            "snow_station_name": "TEST_STATION",
+            "snow_station_distance_km": 5.0
+        }
+    
+    @pytest.fixture
+    def engine(self, tmp_path, mock_context):
+        """Create engine with test data and mocked DataContextBuilder"""
         data_dir = tmp_path / "data"
         data_dir.mkdir()
         
@@ -18,6 +50,10 @@ class TestIntegration:
             (data_dir / subdir).mkdir()
         
         engine = ElkPredictionEngine(str(data_dir))
+        
+        # Mock the DataContextBuilder's build_context method to return quickly
+        engine.data_builder.build_context = Mock(return_value=mock_context)
+        
         return engine
     
     def test_full_prediction_workflow(self, engine):
@@ -117,7 +153,7 @@ class TestIntegration:
             assert 0 <= hotspot["score"] <= 100
             assert hotspot["estimated_elk"]["min"] <= hotspot["estimated_elk"]["max"]
     
-    def test_weighted_vs_unweighted(self, engine):
+    def test_weighted_vs_unweighted(self, engine, mock_context):
         """Test that weights affect scores"""
         request = {
             "location": {
@@ -146,6 +182,9 @@ class TestIntegration:
             engine.data_dir,
             weights={"water": 3.0, "elevation": 2.5}
         )
+        
+        # Mock the DataContextBuilder for the new engine as well
+        weighted_engine.data_builder.build_context = Mock(return_value=mock_context)
         
         response2 = weighted_engine.predict(request)
         score2 = response2["overall"]["score"]

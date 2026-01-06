@@ -221,6 +221,27 @@ def main():
     
     n_presence = len(presence_gdf)
     
+    # Determine if we should use parallel processing
+    # Standardized threshold: sequential for datasets < 5000 rows
+    # This matches the logic in integrate_environmental_features.py
+    PARALLEL_THRESHOLD = 5000
+    
+    # Determine effective n_processes
+    # If explicitly set to 1, always use sequential
+    # Otherwise, use sequential for small datasets (< threshold)
+    if args.n_processes == 1:
+        effective_n_processes = 1
+        logger.info("Using sequential processing (n_processes=1)")
+    elif n_presence < PARALLEL_THRESHOLD:
+        effective_n_processes = 1
+        logger.info(f"Dataset size ({n_presence:,}) < {PARALLEL_THRESHOLD:,} rows - using sequential processing")
+    else:
+        effective_n_processes = args.n_processes
+        if effective_n_processes is None or effective_n_processes > 1:
+            logger.info(f"Dataset size ({n_presence:,}) >= {PARALLEL_THRESHOLD:,} rows - using parallel processing")
+        else:
+            logger.info("Using sequential processing")
+    
     # Load study area
     study_area = load_study_area(data_dir)
     
@@ -247,7 +268,7 @@ def main():
             study_area,
             data_dir=data_dir
         )
-        env_absences = env_gen.generate(n_environmental, n_processes=args.n_processes)
+        env_absences = env_gen.generate(n_environmental, n_processes=effective_n_processes)
         all_absences.append(env_absences)
         logger.info(f"✓ Generated {len(env_absences):,} environmental absences")
     
@@ -258,14 +279,14 @@ def main():
             study_area,
             data_dir=data_dir
         )
-        unsuit_absences = unsuit_gen.generate(n_unsuitable, n_processes=args.n_processes)
+        unsuit_absences = unsuit_gen.generate(n_unsuitable, n_processes=effective_n_processes)
         all_absences.append(unsuit_absences)
         logger.info(f"✓ Generated {len(unsuit_absences):,} unsuitable absences")
     
     # Random background absences
     if n_background > 0:
         bg_gen = RandomBackgroundGenerator(presence_gdf, study_area)
-        bg_absences = bg_gen.generate(n_background, n_processes=args.n_processes)
+        bg_absences = bg_gen.generate(n_background, n_processes=effective_n_processes)
         all_absences.append(bg_absences)
         logger.info(f"✓ Generated {len(bg_absences):,} background absences")
     

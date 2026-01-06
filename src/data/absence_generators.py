@@ -1000,11 +1000,56 @@ class UnsuitableHabitatAbsenceGenerator(AbsenceGenerator):
             return 20.0  # Default: assume far from water
         
         try:
-            nearest_geom = nearest_points(point, self.water_sources.unary_union)[1]
-            distance_m = point.distance(nearest_geom) * 111139
-            distance_mi = distance_m / 1609.34
+            # Convert point to UTM for accurate distance calculation
+            point_gdf = gpd.GeoDataFrame(geometry=[point], crs=self.crs)
+            if self.water_sources.crs != self.utm_crs:
+                water_utm = self.water_sources.to_crs(self.utm_crs)
+            else:
+                water_utm = self.water_sources
+            
+            point_utm = point_gdf.to_crs(self.utm_crs).geometry.iloc[0]
+            
+            # Use spatial index for efficient nearest neighbor query
+            # Avoid unary_union which is extremely expensive for large datasets (958K+ features)
+            if hasattr(water_utm, 'sindex') and water_utm.sindex is not None:
+                # Query nearby features first (within 50km buffer)
+                buffer_m = 50000  # 50km buffer
+                bounds = (
+                    point_utm.x - buffer_m,
+                    point_utm.y - buffer_m,
+                    point_utm.x + buffer_m,
+                    point_utm.y + buffer_m
+                )
+                candidate_indices = list(water_utm.sindex.intersection(bounds))
+                
+                if candidate_indices:
+                    # Calculate distance to candidates only
+                    candidates = water_utm.iloc[candidate_indices]
+                    distances_m = candidates.geometry.distance(point_utm)
+                    min_distance_m = distances_m.min()
+                else:
+                    # No nearby water found, use default
+                    min_distance_m = buffer_m
+            else:
+                # Fallback: use nearest_points but sample for large datasets
+                if len(water_utm) > 10000:
+                    # Sample for performance (for very large datasets)
+                    sample_size = min(500, len(water_utm))
+                    water_sample = water_utm.sample(n=sample_size, random_state=42)
+                    distances_m = water_sample.geometry.distance(point_utm)
+                    min_distance_m = distances_m.min()
+                    # If min distance is large, actual distance might be larger
+                    # but this is acceptable for unsuitable habitat check (we're checking if >10 miles)
+                else:
+                    # Small dataset: calculate distance to all
+                    distances_m = water_utm.geometry.distance(point_utm)
+                    min_distance_m = distances_m.min()
+            
+            # Convert meters to miles
+            distance_mi = min_distance_m / 1609.34
             return distance_mi
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Water distance calculation failed: {e}")
             return 20.0
     
     def _is_unsuitable(self, point: Point) -> bool:
@@ -1058,9 +1103,40 @@ class UnsuitableHabitatAbsenceGenerator(AbsenceGenerator):
         
         absence_points = []
         attempts = 0
+        start_time = time.time()
+        last_progress_time = start_time
+        
+        # Pre-convert water_sources to UTM and build spatial index for efficiency
+        water_utm = None
+        water_sindex = None
+        if self.water_sources is not None:
+            try:
+                if self.water_sources.crs != self.utm_crs:
+                    water_utm = self.water_sources.to_crs(self.utm_crs)
+                else:
+                    water_utm = self.water_sources.copy()
+                
+                # Build spatial index for efficient nearest neighbor queries
+                if hasattr(water_utm, 'sindex'):
+                    try:
+                        water_utm.sindex  # Trigger index creation
+                        water_sindex = water_utm.sindex
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.debug(f"Failed to prepare water sources for efficient querying: {e}")
         
         while len(absence_points) < n_samples and attempts < max_attempts:
             attempts += 1
+            
+            # Log progress every 1000 attempts or every 30 seconds
+            current_time = time.time()
+            if attempts % 1000 == 0 or (current_time - last_progress_time) >= 30:
+                elapsed = current_time - start_time
+                rate = attempts / elapsed if elapsed > 0 else 0
+                logger.info(f"Unsuitable habitat: {len(absence_points)}/{n_samples} samples, "
+                          f"{attempts:,}/{max_attempts:,} attempts ({rate:.1f} attempts/sec)")
+                last_progress_time = current_time
             
             point = self._sample_random_point_in_study_area()
             if point is None:
@@ -1069,13 +1145,75 @@ class UnsuitableHabitatAbsenceGenerator(AbsenceGenerator):
             if not self.check_distance_constraint(point):
                 continue
             
-            # Check if unsuitable
-            if not self._is_unsuitable(point):
-                continue
+            # Check if unsuitable (use optimized water distance if available)
+            if water_utm is not None and water_sindex is not None:
+                # Use optimized version
+                if not self._is_unsuitable_optimized(point, water_utm, water_sindex):
+                    continue
+            else:
+                # Use standard version
+                if not self._is_unsuitable(point):
+                    continue
             
             absence_points.append(point)
         
         return absence_points
+    
+    def _is_unsuitable_optimized(self, point: Point, water_utm: gpd.GeoDataFrame, water_sindex) -> bool:
+        """
+        Optimized version of _is_unsuitable that uses pre-converted water_utm and spatial index.
+        """
+        lon, lat = point.x, point.y
+        
+        # Check elevation
+        elevation_m = self._sample_raster(self.dem, lon, lat, default=2500.0)
+        elevation_ft = elevation_m * 3.28084
+        if elevation_ft < 4000 or elevation_ft > 14000:
+            return True
+        
+        # Check slope
+        slope_deg = self._sample_raster(self.slope, lon, lat, default=15.0)
+        if slope_deg > 60.0:
+            return True
+        
+        # Check land cover (unsuitable types)
+        landcover_code = int(self._sample_raster(self.landcover, lon, lat, default=0))
+        unsuitable_codes = [11, 12, 21, 22, 23, 24, 31]  # Water, urban, barren
+        if landcover_code in unsuitable_codes:
+            return True
+        
+        # Check water distance (too far = unsuitable) - optimized version
+        try:
+            # Convert point to UTM
+            point_gdf = gpd.GeoDataFrame(geometry=[point], crs=self.crs)
+            point_utm = point_gdf.to_crs(self.utm_crs).geometry.iloc[0]
+            
+            # Use spatial index for efficient query
+            buffer_m = 50000  # 50km buffer
+            bounds = (
+                point_utm.x - buffer_m,
+                point_utm.y - buffer_m,
+                point_utm.x + buffer_m,
+                point_utm.y + buffer_m
+            )
+            candidate_indices = list(water_sindex.intersection(bounds))
+            
+            if candidate_indices:
+                candidates = water_utm.iloc[candidate_indices]
+                distances_m = candidates.geometry.distance(point_utm)
+                min_distance_m = distances_m.min()
+            else:
+                # No nearby water, assume far
+                min_distance_m = buffer_m
+            
+            distance_mi = min_distance_m / 1609.34
+            if distance_mi > 10.0:
+                return True
+        except Exception:
+            # Fallback to default check
+            pass
+        
+        return False
     
     def generate(self, n_samples: int, max_attempts: Optional[int] = None, n_processes: Optional[int] = None) -> gpd.GeoDataFrame:
         """Generate unsuitable habitat absences."""

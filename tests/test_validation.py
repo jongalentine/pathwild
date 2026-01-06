@@ -2,22 +2,57 @@ import pytest
 import numpy as np
 from src.inference.engine import ElkPredictionEngine
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock
 
 class TestValidation:
     """Tests for validating predictions against known data"""
     
     @pytest.fixture
-    def engine(self, tmp_path):
-        """Create test engine"""
+    def mock_context(self):
+        """Create a mock context that DataContextBuilder.build_context returns"""
+        return {
+            "elevation": 8500.0,
+            "slope": 15.0,
+            "aspect": 180.0,
+            "landcover": "Mixed Forest",
+            "nlcd_code": 43,
+            "canopy_cover": 45.0,
+            "water_distance_miles": 0.93,
+            "water_reliability": 1.0,
+            "road_distance_miles": 1.86,
+            "trail_distance_miles": 1.24,
+            "ndvi": 0.65,
+            "ndvi_age_days": 5,
+            "irg": 0.01,
+            "summer_integrated_ndvi": 70.0,
+            "temperature_f": 50.0,
+            "temp_high": 60.0,
+            "temp_low": 40.0,
+            "precip_last_7_days_inches": 0.5,
+            "cloud_cover_percent": 30,
+            "snow_depth_inches": 0.0,
+            "snow_water_equiv_inches": 0.0,
+            "snow_crust_detected": False,
+            "snow_data_source": "snotel",
+            "snow_station_name": "TEST_STATION",
+            "snow_station_distance_km": 5.0
+        }
+    
+    @pytest.fixture
+    def engine(self, tmp_path, mock_context):
+        """Create test engine with mocked DataContextBuilder"""
         data_dir = tmp_path / "data"
         data_dir.mkdir()
         
         for subdir in ["dem", "terrain", "landcover", "hydrology"]:
             (data_dir / subdir).mkdir()
         
-        # AWDBClient no longer needs mocking - it uses HTTP requests which are skipped in test environment
-        return ElkPredictionEngine(str(data_dir))
+        engine = ElkPredictionEngine(str(data_dir))
+        
+        # Mock the DataContextBuilder's build_context method to return quickly
+        engine.data_builder.build_context = Mock(return_value=mock_context)
+        
+        return engine
     
     def test_known_good_habitat_scores_high(self, engine):
         """Test that known good elk habitat scores highly"""

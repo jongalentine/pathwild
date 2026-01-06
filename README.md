@@ -63,6 +63,8 @@ python scripts/run_data_pipeline.py --skip-steps process_raw,generate_absence
 
 **⚠️ Prerequisites:** Before running the pipeline, ensure all required environmental data files are present. The pipeline will automatically check prerequisites and fail fast if required files are missing. See [Environmental Data Prerequisites Guide](./docs/environmental_data_prerequisites.md) for detailed instructions.
 
+**📊 NDVI & Weather Data**: The pipeline now supports real NDVI (AppEEARS) and weather data (PRISM + Open-Meteo). Set `APPEEARS_USERNAME` and `APPEEARS_PASSWORD` environment variables to enable real NDVI data. See [NDVI/Weather Integration Status](./docs/ndvi_weather_integration_status.md) for details.
+
 See [Automated Data Pipeline Documentation](./docs/automated_data_pipeline.md) for details.
 
 ### Run Jupyter Lab

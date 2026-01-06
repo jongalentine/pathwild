@@ -70,3 +70,23 @@ web:
   domain: "pathwild.ai"
   title: "PathWild - AI Wildlife Prediction"
   tagline: "Predict. Plan. Succeed."
+
+# Data pipeline configuration
+appeears:
+  username: ${APPEEARS_USERNAME}
+  password: ${APPEEARS_PASSWORD}
+
+prism:
+  data_dir: data/prism
+  variables: [tmean, tmin, tmax, ppt]
+
+openmeteo:
+  forecast_days: 7
+
+# Area polygon configuration (example: Area 048)
+area_048_polygon:
+  - [-107.5, 44.3]
+  - [-107.5, 44.7]
+  - [-107.0, 44.7]
+  - [-107.0, 44.3]
+  - [-107.5, 44.3]

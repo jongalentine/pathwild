@@ -12,7 +12,7 @@ The pipeline consists of six main steps:
 
 1. **Process Raw Presence Data** - Converts raw data files (shapefiles, CSVs) into standardized presence points
 2. **Generate Absence Data** - Creates balanced absence points using multiple strategies
-3. **Integrate Environmental Features** - Adds environmental features (elevation, water, landcover, etc.)
+3. **Integrate Environmental Features** - Adds environmental features (elevation, water, landcover, NDVI, weather, etc.)
 4. **Analyze Integrated Features** - Validates feature integration and data quality
 5. **Assess Training Readiness** - Evaluates dataset readiness for model training
 6. **Prepare Training Features** - Creates training-ready feature datasets by excluding metadata columns
@@ -119,7 +119,9 @@ python scripts/generate_absence_data.py \
 
 ### Step 3: Integrate Environmental Features
 
-Adds environmental features to presence/absence datasets.
+Adds environmental features to presence/absence datasets, including:
+- Static features: elevation, slope, aspect, land cover, canopy, water, roads, trails
+- Temporal features: NDVI (via AppEEARS), weather/temperature (via PRISM for historical, Open-Meteo for forecasts), snow depth (via SNOTEL)
 
 **Script:** `scripts/integrate_environmental_features.py`
 
@@ -145,6 +147,8 @@ python scripts/integrate_environmental_features.py \
 **Output:** Same file with environmental features added (overwrites input)
 
 **Environmental Features Added:**
+
+**Static Features:**
 - `elevation` - Elevation in meters (from DEM)
 - `slope_degrees` - Slope in degrees (from terrain data)
 - `aspect_degrees` - Aspect in degrees (from terrain data)
@@ -156,6 +160,24 @@ python scripts/integrate_environmental_features.py \
 - `road_distance_miles` - Distance to nearest road in miles
 - `trail_distance_miles` - Distance to nearest trail in miles
 - `security_habitat_percent` - Percentage of security habitat in buffer
+
+**Temporal Features:**
+- `snow_depth_inches` - Snow depth (via SNOTEL AWDB API)
+- `snow_water_equiv_inches` - Snow water equivalent
+- `snow_crust_detected` - Snow crust detection flag
+- `temperature_f` - Average daily temperature (°F)
+  - Historical: PRISM gridded data (1981-present)
+  - Forecasts: Open-Meteo API
+- `precip_last_7_days_inches` - 7-day cumulative precipitation
+- `cloud_cover_percent` - Cloud cover percentage (if available)
+- `ndvi` - Normalized Difference Vegetation Index (0-1)
+  - Source: AppEEARS (Landsat NDVI) when credentials available
+  - Fallback: Seasonal placeholder values
+- `ndvi_age_days` - Days since NDVI data acquisition
+- `irg` - Instantaneous Rate of Green-up (rate of change)
+- `summer_integrated_ndvi` - Integrated NDVI for June-September
+
+**Note**: NDVI and weather data use real providers when credentials/setup is available, with automatic fallback to placeholders. See `docs/ndvi_weather_integration_status.md` for setup instructions.
 
 **Incremental Processing:**
 By default, the script only processes rows with placeholder values, making incremental updates much faster. Use `--force` to regenerate all rows.

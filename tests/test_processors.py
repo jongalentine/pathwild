@@ -7,10 +7,27 @@ import pytest
 from unittest.mock import Mock, patch, MagicMock
 from pathlib import Path
 from datetime import datetime, timedelta
+import os
+import sys
+from types import ModuleType
 import numpy as np
 import geopandas as gpd
 import pandas as pd
 from shapely.geometry import Point, box
+
+# Mock rasterio before importing processors (which imports PRISMClient)
+mock_rasterio = ModuleType('rasterio')
+mock_rasterio.open = Mock()
+# Add errors module for NotGeoreferencedWarning
+mock_rasterio_errors = ModuleType('rasterio.errors')
+mock_rasterio_errors.NotGeoreferencedWarning = type('NotGeoreferencedWarning', (Warning,), {})
+mock_rasterio.errors = mock_rasterio_errors
+sys.modules['rasterio'] = mock_rasterio
+sys.modules['rasterio.errors'] = mock_rasterio_errors
+
+mock_rasterio_mask = ModuleType('rasterio.mask')
+mock_rasterio_mask.mask = Mock()
+sys.modules['rasterio.mask'] = mock_rasterio_mask
 
 from src.data.processors import (
     DataContextBuilder,
@@ -175,84 +192,110 @@ class TestAWDBClient:
 
 
 class TestWeatherClient:
-    """Test WeatherClient for weather data retrieval."""
+    """Test WeatherClient using PRISM (historical) and Open-Meteo (forecasts)."""
     
-    def test_init(self):
-        """Test WeatherClient initialization."""
-        client = WeatherClient()
-        assert client.api_key is None
-        assert client.cache == {}
+    @pytest.mark.unit
+    def test_init_without_real_data(self, tmp_path):
+        """Test initialization without real data clients."""
+        client = WeatherClient(data_dir=tmp_path, use_real_data=False)
+        assert client.use_real_data is False
+        # When use_real_data=False, clients are not initialized
+        assert not hasattr(client, 'prism_client') or client.prism_client is None
+        assert not hasattr(client, 'openmeteo_client') or client.openmeteo_client is None
     
-    def test_get_weather_forecast(self):
-        """Test getting weather forecast (future date)."""
-        client = WeatherClient()
+    @pytest.mark.unit
+    def test_init_with_real_data(self, tmp_path):
+        """Test initialization with real data clients."""
+        # Import modules to ensure they're available for patching
+        import src.data.prism_client
+        import src.data.openmeteo_client
         
-        future_date = datetime.now() + timedelta(days=5)
-        result = client.get_weather(43.0, -110.0, future_date)
+        with patch('src.data.prism_client.PRISMClient') as mock_prism_class, \
+             patch('src.data.openmeteo_client.OpenMeteoClient') as mock_openmeteo_class:
+            # Mock the client classes to return mock instances
+            mock_prism = Mock()
+            mock_openmeteo = Mock()
+            mock_prism_class.return_value = mock_prism
+            mock_openmeteo_class.return_value = mock_openmeteo
+            
+            client = WeatherClient(data_dir=tmp_path, use_real_data=True)
+            assert client.use_real_data is True
+            assert client.prism_client is not None
+            assert client.openmeteo_client is not None
+    
+    @pytest.mark.unit
+    def test_get_weather_historical_placeholder(self, tmp_path):
+        """Test getting historical weather with placeholder fallback."""
+        client = WeatherClient(data_dir=tmp_path, use_real_data=False)
+        result = client.get_weather(44.0, -107.0, datetime(2024, 6, 15))
         
         assert "temp" in result
         assert "temp_high" in result
         assert "temp_low" in result
-        assert "precip_7d" in result
-        assert "cloud_cover" in result
-        assert "wind_mph" in result
-    
-    def test_get_weather_historical(self):
-        """Test getting historical weather (past date)."""
-        client = WeatherClient()
-        
-        past_date = datetime.now() - timedelta(days=5)
-        result = client.get_weather(43.0, -110.0, past_date)
-        
-        assert "temp" in result
-        assert "temp_high" in result
-        assert "temp_low" in result
-        assert "precip_7d" in result
-    
-    def test_get_weather_today(self):
-        """Test getting weather for today."""
-        client = WeatherClient()
-        
-        today = datetime.now()
-        result = client.get_weather(43.0, -110.0, today)
-        
-        # Should use historical (today <= now)
-        assert "temp" in result
-    
-    def test_get_forecast(self):
-        """Test _get_forecast method."""
-        client = WeatherClient()
-        
-        result = client._get_forecast(43.0, -110.0, datetime(2026, 10, 15))
-        
-        assert result["temp"] == 45.0
-        assert result["temp_high"] == 55.0
-        assert result["temp_low"] == 35.0
-        assert result["precip_7d"] == 0.3
-    
-    def test_get_historical(self):
-        """Test _get_historical method."""
-        client = WeatherClient()
-        
-        result = client._get_historical(43.0, -110.0, datetime(2026, 10, 15))
-        
         assert result["temp"] == 42.0
-        assert result["temp_high"] == 52.0
-        assert result["temp_low"] == 32.0
-        assert result["precip_7d"] == 0.5
+    
+    @pytest.mark.unit
+    def test_get_weather_forecast_placeholder(self, tmp_path):
+        """Test getting forecast weather with placeholder fallback."""
+        client = WeatherClient(data_dir=tmp_path, use_real_data=False)
+        future_date = datetime.now() + timedelta(days=7)
+        result = client.get_weather(44.0, -107.0, future_date)
+        
+        assert "temp" in result
+        assert "temp_high" in result
+        assert "temp_low" in result
+        assert result["temp"] == 45.0
+    
+    @pytest.mark.unit
+    def test_get_weather_historical_real_data(self, tmp_path):
+        """Test getting historical weather with real PRISM data."""
+        # Import modules to ensure they're available for patching
+        import src.data.prism_client
+        import src.data.openmeteo_client
+        
+        with patch('src.data.prism_client.PRISMClient') as mock_prism_class, \
+             patch('src.data.openmeteo_client.OpenMeteoClient') as mock_openmeteo_class:
+            # Mock PRISM client
+            mock_prism = Mock()
+            mock_prism.get_temperature.return_value = {
+                "temp_mean_c": 20.0,
+                "temp_min_c": 15.0,
+                "temp_max_c": 25.0
+            }
+            # Mock get_precipitation to return 50mm for each day (called in loop)
+            mock_prism.get_precipitation.return_value = 50.0  # 50mm per day
+            mock_prism_class.return_value = mock_prism
+            
+            # Mock Open-Meteo client (may be used for fallback)
+            mock_openmeteo = Mock()
+            mock_openmeteo_class.return_value = mock_openmeteo
+            
+            client = WeatherClient(data_dir=tmp_path, use_real_data=True)
+            result = client._get_historical(44.0, -107.0, datetime(2024, 6, 15))
+            
+            # Should convert Celsius to Fahrenheit
+            assert result["temp"] == pytest.approx(68.0, abs=0.1)  # 20°C = 68°F
+            assert result["temp_high"] == pytest.approx(77.0, abs=0.1)  # 25°C = 77°F
+            assert result["temp_low"] == pytest.approx(59.0, abs=0.1)  # 15°C = 59°F
+            # Precipitation accumulated over 7 days
+            assert result["precip_7d"] > 0
 
 
 class TestSatelliteClient:
     """Test SatelliteClient for NDVI data retrieval."""
     
-    def test_init(self):
-        """Test SatelliteClient initialization."""
-        client = SatelliteClient()
+    @pytest.mark.unit
+    def test_init_without_real_data(self):
+        """Test initialization without real data client."""
+        client = SatelliteClient(use_real_data=False)
+        assert client.use_real_data is False
+        assert client.appeears_client is None
         assert client.cache == {}
     
-    def test_get_ndvi_summer(self):
-        """Test getting NDVI for summer months."""
-        client = SatelliteClient()
+    @pytest.mark.unit
+    def test_get_ndvi_summer_placeholder(self):
+        """Test getting NDVI for summer months with placeholder."""
+        client = SatelliteClient(use_real_data=False)
         
         result = client.get_ndvi(43.0, -110.0, datetime(2026, 7, 15))
         
@@ -261,36 +304,40 @@ class TestSatelliteClient:
         assert "irg" in result
         assert "cloud_free" in result
     
-    def test_get_ndvi_winter(self):
-        """Test getting NDVI for winter months."""
-        client = SatelliteClient()
+    @pytest.mark.unit
+    def test_get_ndvi_winter_placeholder(self):
+        """Test getting NDVI for winter months with placeholder."""
+        client = SatelliteClient(use_real_data=False)
         
         result = client.get_ndvi(43.0, -110.0, datetime(2026, 1, 15))
         
         assert result["ndvi"] == 0.30  # Low in winter
         assert result["cloud_free"] is True
     
-    def test_get_ndvi_fall(self):
-        """Test getting NDVI for fall months."""
-        client = SatelliteClient()
+    @pytest.mark.unit
+    def test_get_ndvi_fall_placeholder(self):
+        """Test getting NDVI for fall months with placeholder."""
+        client = SatelliteClient(use_real_data=False)
         
         result = client.get_ndvi(43.0, -110.0, datetime(2026, 10, 15))
         
         assert result["ndvi"] == 0.55  # Declining in fall
         assert result["irg"] < 0  # Negative IRG (browning)
     
-    def test_get_ndvi_spring(self):
-        """Test getting NDVI for spring months."""
-        client = SatelliteClient()
+    @pytest.mark.unit
+    def test_get_ndvi_spring_placeholder(self):
+        """Test getting NDVI for spring months with placeholder."""
+        client = SatelliteClient(use_real_data=False)
         
         result = client.get_ndvi(43.0, -110.0, datetime(2026, 4, 15))
         
         assert result["ndvi"] == 0.50  # Increasing in spring
         assert result["irg"] >= 0  # Positive or zero IRG
     
-    def test_get_integrated_ndvi(self):
-        """Test getting integrated NDVI over date range."""
-        client = SatelliteClient()
+    @pytest.mark.unit
+    def test_get_integrated_ndvi_placeholder(self):
+        """Test getting integrated NDVI over date range with placeholder."""
+        client = SatelliteClient(use_real_data=False)
         
         start = datetime(2026, 6, 1)
         end = datetime(2026, 9, 30)
@@ -298,6 +345,49 @@ class TestSatelliteClient:
         result = client.get_integrated_ndvi(43.0, -110.0, start, end)
         
         assert result == 60.0  # Placeholder value
+    
+    @pytest.mark.unit
+    @patch('src.data.appeears_client.AppEEARSClient')
+    def test_get_ndvi_with_real_data(self, mock_appeears_class):
+        """Test getting NDVI with real AppEEARS client."""
+        # Mock AppEEARS client
+        mock_appeears = Mock()
+        mock_result_df = pd.DataFrame({
+            "latitude": [43.0],
+            "longitude": [-110.0],
+            "date": ["2026-07-15"],
+            "ndvi": [0.75],
+            "qa_flags": [0]
+        })
+        mock_appeears.get_ndvi_for_points.return_value = mock_result_df
+        mock_appeears_class.return_value = mock_appeears
+        
+        with patch.dict(os.environ, {"APPEEARS_USERNAME": "test", "APPEEARS_PASSWORD": "test"}):
+            client = SatelliteClient(use_real_data=True)
+            # Verify the client was created with the mock
+            assert client.appeears_client is not None
+            result = client.get_ndvi(43.0, -110.0, datetime(2026, 7, 15))
+            
+            assert result["ndvi"] == 0.75
+            # qa_flags == 0 means cloud_free should be True
+            assert result.get("cloud_free", False) == True
+    
+    @pytest.mark.unit
+    def test_extract_ndvi_batch_placeholder(self):
+        """Test batch NDVI extraction with placeholder."""
+        client = SatelliteClient(use_real_data=False)
+        
+        points = [
+            (43.0, -110.0, datetime(2026, 7, 15)),
+            (44.0, -107.0, datetime(2026, 7, 16))
+        ]
+        
+        result_df = client.extract_ndvi_batch(points)
+        
+        assert len(result_df) == 2
+        assert "ndvi" in result_df.columns
+        assert "latitude" in result_df.columns
+        assert "longitude" in result_df.columns
 
 
 class TestDataContextBuilderMethods:
@@ -308,7 +398,26 @@ class TestDataContextBuilderMethods:
         """Create test builder."""
         data_dir = tmp_path / "data"
         data_dir.mkdir()
-        return DataContextBuilder(data_dir)
+        builder = DataContextBuilder(data_dir)
+        
+        # Mock clients to prevent API calls that could be slow
+        builder.snotel_client.get_snow_data = Mock(return_value={
+            'depth': 10.0,
+            'swe': 2.0,
+            'crust': False,
+            'station': None,
+            'station_distance_km': None
+        })
+        builder.weather_client.get_weather = Mock(return_value={
+            'temp': 45.0, 'temp_high': 55.0, 'temp_low': 35.0,
+            'precip_7d': 0.5, 'cloud_cover': 30
+        })
+        builder.satellite_client.get_ndvi = Mock(return_value={
+            'ndvi': 0.6, 'age_days': 5, 'irg': 0.01, 'cloud_free': True
+        })
+        builder.satellite_client.get_integrated_ndvi = Mock(return_value=70.0)
+        
+        return builder
     
     def test_sample_raster_none(self, builder):
         """Test sampling when raster is None."""
@@ -607,7 +716,26 @@ class TestDataContextBuilderErrorHandling:
         """Create test builder."""
         data_dir = tmp_path / "data"
         data_dir.mkdir()
-        return DataContextBuilder(data_dir)
+        builder = DataContextBuilder(data_dir)
+        
+        # Mock clients to prevent API calls that could be slow
+        builder.snotel_client.get_snow_data = Mock(return_value={
+            'depth': 10.0,
+            'swe': 2.0,
+            'crust': False,
+            'station': None,
+            'station_distance_km': None
+        })
+        builder.weather_client.get_weather = Mock(return_value={
+            'temp': 45.0, 'temp_high': 55.0, 'temp_low': 35.0,
+            'precip_7d': 0.5, 'cloud_cover': 30
+        })
+        builder.satellite_client.get_ndvi = Mock(return_value={
+            'ndvi': 0.6, 'age_days': 5, 'irg': 0.01, 'cloud_free': True
+        })
+        builder.satellite_client.get_integrated_ndvi = Mock(return_value=70.0)
+        
+        return builder
     
     def test_build_context_missing_data(self, builder):
         """Test building context with missing data files."""
