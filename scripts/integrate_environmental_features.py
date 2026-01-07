@@ -78,6 +78,19 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.data.processors import DataContextBuilder
 
+# Load configuration
+try:
+    import yaml
+    config_path = Path(__file__).parent.parent / "config.yaml"
+    if config_path.exists():
+        with open(config_path) as f:
+            CONFIG = yaml.safe_load(f)
+    else:
+        CONFIG = {}
+except ImportError:
+    CONFIG = {}
+    logger.warning("PyYAML not available, GEE config will not be loaded")
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -444,7 +457,9 @@ def _process_parallel(df, data_dir, date_col, batch_size, limit, dataset_path, n
         chunk = df.iloc[i:i+chunk_size]
         # Convert rows to dictionaries to avoid any pandas-specific pickling issues
         batch_data = [(idx, row.to_dict()) for idx, row in chunk.iterrows()]
-        batches.append((batch_data, data_dir_str, date_col))
+        # Include GEE config in batch args
+        gee_config_dict = CONFIG.get('gee', {}) if CONFIG else {}
+        batches.append((batch_data, data_dir_str, date_col, gee_config_dict))
     
     logger.info(f"Processing {len(batches)} batches with {n_workers} workers")
     
@@ -560,7 +575,7 @@ def _process_parallel(df, data_dir, date_col, batch_size, limit, dataset_path, n
 
 def process_batch(args):
     """Process a batch of rows - used for parallel processing"""
-    batch_data, data_dir_str, date_col = args
+    batch_data, data_dir_str, date_col, gee_config_dict = args
     
     # Convert string back to Path and initialize DataContextBuilder for this worker
     # This ensures clean pickling (Path objects can be pickled, but we convert to string for safety)
@@ -573,7 +588,12 @@ def process_batch(args):
     # Initialize DataContextBuilder for this worker
     # Each worker loads its own copy of the rasters (avoids pickling issues)
     try:
-        builder = DataContextBuilder(data_dir)
+        use_gee_ndvi = gee_config_dict.get('enabled', False) if gee_config_dict else False
+        builder = DataContextBuilder(
+            data_dir=data_dir,
+            use_gee_ndvi=use_gee_ndvi,
+            gee_config=gee_config_dict or {}
+        )
     except Exception as e:
         worker_logger.error(f"Failed to initialize DataContextBuilder: {e}")
         return [(idx, None) for idx, _ in batch_data]
@@ -680,7 +700,18 @@ def update_dataset(dataset_path: Path, data_dir: Path, batch_size: int = 1000, l
     # Initialize DataContextBuilder
     logger.info("Initializing DataContextBuilder...")
     try:
-        builder = DataContextBuilder(data_dir)
+        # Load GEE config if available
+        gee_config = CONFIG.get('gee', {}) if CONFIG else {}
+        use_gee_ndvi = gee_config.get('enabled', False)
+        
+        if use_gee_ndvi:
+            logger.info(f"GEE NDVI enabled (project: {gee_config.get('project', 'default')})")
+        
+        builder = DataContextBuilder(
+            data_dir=data_dir,
+            use_gee_ndvi=use_gee_ndvi,
+            gee_config=gee_config
+        )
         # Note: NDVI data uses placeholders (integration deferred - see TODO in processors.py)
         # Weather data uses real APIs (PRISM/Open-Meteo) when available
         

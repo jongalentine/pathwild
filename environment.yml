@@ -68,5 +68,6 @@ dependencies:
     - fastapi            # Alternative web framework
     - uvicorn            # ASGI server for FastAPI
     - python-dotenv      # Environment variable management
+    - earthengine-api>=0.1.400  # Google Earth Engine API (for NDVI)
     - pytest>=7.4.0     # Testing framework
     - pytest-cov>=4.1.0 # Coverage plugin

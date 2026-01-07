@@ -1349,11 +1349,11 @@ class TestSNOTELDataQualityTracking:
 @pytest.mark.integration
 @pytest.mark.slow
 class TestSNOTELRealData:
-    """Integration tests with real AWDB (requires R and AWDB installed)."""
+    """Integration tests with real AWDB (requires AWDB installed)."""
     
     @pytest.mark.skipif(
         True,  # Skip by default - set to False to run real integration tests
-        reason="Requires R and AWDB installed - run manually when needed"
+        reason="Requires AWDB installed - run manually when needed"
     )
     def test_real_snotel_download(self, data_dir, sample_station_file):
         """Test actual SNOTEL data download (slow test)."""

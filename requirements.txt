@@ -65,6 +65,9 @@ shapely>=2.0.0
 python-dotenv>=1.0.0
 pyyaml>=6.0.0
 
+# Google Earth Engine (optional - for NDVI data)
+earthengine-api>=0.1.400
+
 # Testing
 pytest>=7.4.0
 pytest-cov>=4.1.0
