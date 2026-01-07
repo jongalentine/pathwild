@@ -178,6 +178,16 @@ class TestPrepareTrainingFeatures:
         processed_dir.mkdir()
         features_dir.mkdir()
         
+        # Create combine_feature_files.py script in the same directory as prepare_training_features
+        # This is needed for the import to work
+        scripts_dir = Path(__file__).parent.parent / "scripts"
+        real_combine_script = scripts_dir / "combine_feature_files.py"
+        
+        # Copy combine script to tmp_path so it can be found
+        if real_combine_script.exists():
+            temp_combine_script = tmp_path / "combine_feature_files.py"
+            shutil.copy2(real_combine_script, temp_combine_script)
+        
         # Create multiple combined datasets
         for dataset_name in ['north_bighorn', 'south_bighorn']:
             df = pd.DataFrame({
@@ -206,6 +216,78 @@ class TestPrepareTrainingFeatures:
         df_north = pd.read_csv(features_dir / "north_bighorn_features.csv")
         assert 'route_id' not in df_north.columns
         assert 'elevation' in df_north.columns
+        
+        # Check that complete_context.csv was created (if combine script exists)
+        complete_context_file = features_dir / "complete_context.csv"
+        complete_context_test_file = features_dir / "complete_context_test.csv"
+        if real_combine_script.exists():
+            assert complete_context_file.exists(), "complete_context.csv should be created"
+            assert not complete_context_test_file.exists(), "complete_context_test.csv should not be created in normal mode"
+            df_complete = pd.read_csv(complete_context_file)
+            # Should have combined rows from both datasets
+            assert len(df_complete) == 4  # 2 rows from each dataset
+            assert 'elk_present' in df_complete.columns
+            assert 'elevation' in df_complete.columns
+            assert 'route_id' not in df_complete.columns
+    
+    def test_prepare_all_datasets_test_mode(self, prepare_module, tmp_path):
+        """Test prepare_all_datasets function in test mode (with limit)."""
+        processed_dir = tmp_path / "processed"
+        features_dir = tmp_path / "features"
+        processed_dir.mkdir()
+        features_dir.mkdir()
+        
+        # Create combine_feature_files.py script in the same directory as prepare_training_features
+        scripts_dir = Path(__file__).parent.parent / "scripts"
+        real_combine_script = scripts_dir / "combine_feature_files.py"
+        
+        # Copy combine script to tmp_path so it can be found
+        if real_combine_script.exists():
+            temp_combine_script = tmp_path / "combine_feature_files.py"
+            shutil.copy2(real_combine_script, temp_combine_script)
+        
+        # Create multiple test combined datasets
+        for dataset_name in ['north_bighorn', 'south_bighorn']:
+            df = pd.DataFrame({
+                'latitude': [43.0, 43.1],
+                'longitude': [-110.0, -110.1],
+                'elk_present': [1, 0],
+                'route_id': [1, 2],  # Metadata
+                'elevation': [2000.0, 2100.0],  # Feature
+                'slope_degrees': [5.0, 10.0]  # Feature
+            })
+            combined_file = processed_dir / f"combined_{dataset_name}_presence_absence_test.csv"
+            df.to_csv(combined_file, index=False)
+        
+        # Run prepare_all_datasets in test mode
+        prepare_module.prepare_all_datasets(
+            processed_dir=processed_dir,
+            features_dir=features_dir,
+            exclude_temporal=False,
+            limit=100  # Test mode
+        )
+        
+        # Check that test feature files were created
+        assert (features_dir / "north_bighorn_features_test.csv").exists()
+        assert (features_dir / "south_bighorn_features_test.csv").exists()
+        
+        # Check that metadata was excluded
+        df_north = pd.read_csv(features_dir / "north_bighorn_features_test.csv")
+        assert 'route_id' not in df_north.columns
+        assert 'elevation' in df_north.columns
+        
+        # Check that complete_context_test.csv was created (if combine script exists)
+        complete_context_file = features_dir / "complete_context.csv"
+        complete_context_test_file = features_dir / "complete_context_test.csv"
+        if real_combine_script.exists():
+            assert not complete_context_file.exists(), "complete_context.csv should not be created in test mode"
+            assert complete_context_test_file.exists(), "complete_context_test.csv should be created in test mode"
+            df_complete = pd.read_csv(complete_context_test_file)
+            # Should have combined rows from both test datasets
+            assert len(df_complete) == 4  # 2 rows from each dataset
+            assert 'elk_present' in df_complete.columns
+            assert 'elevation' in df_complete.columns
+            assert 'route_id' not in df_complete.columns
 
 
 class TestPrepareTrainingFeaturesIntegration:
@@ -256,4 +338,151 @@ class TestPrepareTrainingFeaturesIntegration:
         assert 'route_id' not in df_output.columns
         assert 'elevation' in df_output.columns
         assert 'elk_present' in df_output.columns
+
+
+class TestCombineFeatureFiles:
+    """Tests for combine_feature_files.py script."""
+    
+    def test_combine_feature_files(self, tmp_path):
+        """Test that combine_feature_files combines multiple feature files."""
+        features_dir = tmp_path / "features"
+        features_dir.mkdir()
+        
+        # Create multiple feature files
+        for i, dataset_name in enumerate(['north_bighorn', 'south_bighorn']):
+            df = pd.DataFrame({
+                'elk_present': [1, 0],
+                'latitude': [43.0 + i, 43.1 + i],
+                'longitude': [-110.0, -110.1],
+                'elevation': [2000.0 + i * 100, 2100.0 + i * 100],
+                'slope_degrees': [5.0, 10.0]
+            })
+            feature_file = features_dir / f"{dataset_name}_features.csv"
+            df.to_csv(feature_file, index=False)
+        
+        # Import combine module
+        scripts_dir = Path(__file__).parent.parent / "scripts"
+        combine_script = scripts_dir / "combine_feature_files.py"
+        
+        if not combine_script.exists():
+            pytest.skip("combine_feature_files.py not found")
+        
+        spec = importlib.util.spec_from_file_location(
+            "combine_feature_files",
+            combine_script
+        )
+        combine_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(combine_module)
+        
+        # Run combine
+        output_file = features_dir / "complete_context.csv"
+        combined_df = combine_module.combine_feature_files(
+            features_dir=features_dir,
+            output_file=output_file,
+            exclude_test_files=True
+        )
+        
+        # Check output
+        assert output_file.exists()
+        assert len(combined_df) == 4  # 2 rows from each dataset
+        assert 'elk_present' in combined_df.columns
+        assert 'elevation' in combined_df.columns
+        assert 'latitude' in combined_df.columns
+        
+        # Verify all data is present
+        assert combined_df['elk_present'].sum() == 2  # Two 1s and two 0s
+        assert len(combined_df[combined_df['elk_present'] == 0]) == 2
+    
+    def test_combine_feature_files_excludes_test_files(self, tmp_path):
+        """Test that test files are excluded by default."""
+        features_dir = tmp_path / "features"
+        features_dir.mkdir()
+        
+        # Create regular and test feature files
+        df_regular = pd.DataFrame({
+            'elk_present': [1, 0],
+            'elevation': [2000.0, 2100.0]
+        })
+        df_regular.to_csv(features_dir / "north_bighorn_features.csv", index=False)
+        
+        df_test = pd.DataFrame({
+            'elk_present': [1, 1, 1],
+            'elevation': [3000.0, 3100.0, 3200.0]
+        })
+        df_test.to_csv(features_dir / "north_bighorn_features_test.csv", index=False)
+        
+        # Import and run combine
+        scripts_dir = Path(__file__).parent.parent / "scripts"
+        combine_script = scripts_dir / "combine_feature_files.py"
+        
+        if not combine_script.exists():
+            pytest.skip("combine_feature_files.py not found")
+        
+        spec = importlib.util.spec_from_file_location(
+            "combine_feature_files",
+            combine_script
+        )
+        combine_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(combine_module)
+        
+        output_file = features_dir / "complete_context.csv"
+        combined_df = combine_module.combine_feature_files(
+            features_dir=features_dir,
+            output_file=output_file,
+            exclude_test_files=True
+        )
+        
+        # Should only have rows from regular file (not test file)
+        assert len(combined_df) == 2  # Only from regular file
+    
+    def test_combine_feature_files_test_mode(self, tmp_path):
+        """Test that combine_feature_files works in test mode."""
+        features_dir = tmp_path / "features"
+        features_dir.mkdir()
+        
+        # Create test feature files only
+        for i, dataset_name in enumerate(['north_bighorn', 'south_bighorn']):
+            df = pd.DataFrame({
+                'elk_present': [1, 0],
+                'latitude': [43.0 + i, 43.1 + i],
+                'longitude': [-110.0, -110.1],
+                'elevation': [2000.0 + i * 100, 2100.0 + i * 100],
+                'slope_degrees': [5.0, 10.0]
+            })
+            feature_file = features_dir / f"{dataset_name}_features_test.csv"
+            df.to_csv(feature_file, index=False)
+        
+        # Import combine module
+        scripts_dir = Path(__file__).parent.parent / "scripts"
+        combine_script = scripts_dir / "combine_feature_files.py"
+        
+        if not combine_script.exists():
+            pytest.skip("combine_feature_files.py not found")
+        
+        spec = importlib.util.spec_from_file_location(
+            "combine_feature_files",
+            combine_script
+        )
+        combine_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(combine_module)
+        
+        # Run combine in test mode
+        output_file = features_dir / "complete_context_test.csv"
+        combined_df = combine_module.combine_feature_files(
+            features_dir=features_dir,
+            output_file=output_file,
+            exclude_test_files=True,
+            test_mode=True
+        )
+        
+        # Check output
+        assert output_file.exists()
+        assert len(combined_df) == 4  # 2 rows from each dataset
+        assert 'elk_present' in combined_df.columns
+        assert 'elevation' in combined_df.columns
+        assert 'latitude' in combined_df.columns
+        
+        # Verify all data is present
+        assert combined_df['elk_present'].sum() == 2  # Two 1s and two 0s
+        assert len(combined_df[combined_df['elk_present'] == 0]) == 2
 

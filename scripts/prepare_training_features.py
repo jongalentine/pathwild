@@ -16,6 +16,7 @@ import argparse
 import pandas as pd
 from pathlib import Path
 import sys
+import importlib.util
 from typing import List, Set, Optional
 
 # Metadata columns to exclude from training (dataset-specific identifiers and source info)
@@ -213,6 +214,50 @@ def prepare_all_datasets(
     print(f"{'='*70}")
     print(f"Processed {len(combined_files)} dataset(s)")
     print(f"Output directory: {features_dir}")
+    
+    # Combine all feature files into complete_context.csv (or complete_context_test.csv in test mode)
+    print(f"\n{'='*70}")
+    if limit is None:
+        print("Combining all feature files into complete_context.csv...")
+    else:
+        print("Combining all test feature files into complete_context_test.csv...")
+    print(f"{'='*70}")
+    
+    try:
+        # Import combine_feature_files module
+        scripts_dir = Path(__file__).parent
+        combine_script = scripts_dir / "combine_feature_files.py"
+        
+        if combine_script.exists():
+            spec = importlib.util.spec_from_file_location(
+                "combine_feature_files",
+                combine_script
+            )
+            combine_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(combine_module)
+            
+            # Determine output file based on test mode
+            if limit is None:
+                output_file = features_dir / "complete_context.csv"
+                test_mode = False
+            else:
+                output_file = features_dir / "complete_context_test.csv"
+                test_mode = True
+            
+            combine_module.combine_feature_files(
+                features_dir=features_dir,
+                output_file=output_file,
+                exclude_test_files=True,
+                test_mode=test_mode
+            )
+        else:
+            print(f"⚠️  Warning: combine_feature_files.py not found, skipping combination step")
+    except Exception as e:
+        print(f"⚠️  Warning: Error combining feature files: {e}")
+        if limit is None:
+            print(f"   You can manually run: python scripts/combine_feature_files.py")
+        else:
+            print(f"   You can manually run: python scripts/combine_feature_files.py --test")
 
 
 def main():
