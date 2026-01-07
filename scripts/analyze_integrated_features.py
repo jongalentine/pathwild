@@ -55,7 +55,7 @@ EXPECTED_RANGES = {
     'ndvi': (-1, 1),  # Normalized Difference Vegetation Index
     'ndvi_age_days': (0, 365),  # Days since acquisition
     'irg': (-1, 1),  # Instantaneous Rate of Green-up
-    'summer_integrated_ndvi': (0, 365),  # Integrated NDVI over summer
+    'summer_integrated_ndvi': (0, 10),  # Integrated NDVI over summer (sum of ~8 satellite images, max ~8)
 }
 
 # Valid NLCD land cover codes (2016 version)
@@ -485,14 +485,21 @@ def analyze_integrated_features(dataset_path: Path):
                     placeholder_summer_pct = (placeholder_summer_count / len(summer_ndvi)) * 100
                     print(f"\n  ⚠ Placeholder summer NDVI ({placeholder_summer}): {placeholder_summer_count:,} rows ({placeholder_summer_pct:.1f}%)")
                 
-                # Check for reasonable values (should be much larger than single NDVI value)
+                # Check for reasonable values (sum of ~8 satellite images over summer)
                 if 'ndvi' in df.columns:
                     both_present = df[df['summer_integrated_ndvi'].notna() & df['ndvi'].notna()]
                     if len(both_present) > 0:
-                        # Summer integrated should typically be 30-120+ (sum of ~90 days of NDVI values)
-                        if summer_ndvi.max() < 30:
+                        # Summer integrated NDVI is sum of ~8 satellite images (Landsat 16-day revisit)
+                        # With NDVI range -1 to 1, max sum of 8 images = ~8
+                        # Typical values: 1-5 (3-4 images found on average)
+                        if summer_ndvi.max() < 0.5:
                             print(f"\n  ⚠ Warning: Maximum summer integrated NDVI ({summer_ndvi.max():.1f}) is unusually low")
-                            print(f"    → Expected range: 30-120+ (sum of ~90 days of summer NDVI)")
+                            print(f"    → Expected range: 0.5-8.0 (sum of ~8 satellite images over summer)")
+                            print(f"    → Typical values: 1-5 (3-4 images found on average)")
+                        elif summer_ndvi.max() > 10:
+                            print(f"\n  ⚠ Warning: Maximum summer integrated NDVI ({summer_ndvi.max():.1f}) is unusually high")
+                            print(f"    → Expected range: 0.5-8.0 (sum of ~8 satellite images over summer)")
+                            print(f"    → Values >10 may indicate incorrect calculation or too many images")
     else:
         print(f"\n⚠ 'ndvi' column not found")
     

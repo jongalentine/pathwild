@@ -83,6 +83,22 @@ prism:
 openmeteo:
   forecast_days: 7
 
+# Google Earth Engine Configuration
+gee:
+  enabled: true  # Set to true to use GEE for NDVI (requires earthengine-api and authentication)
+  project: spry-analyzer-283914  # GEE project ID (update to your project)
+  collection: landsat8  # landsat8 | sentinel2
+  batch_size: 100
+  max_workers: 4
+  buffer_days: 7
+  max_cloud_cover: 50.0  # Increased from 30.0 to find more images and reduce placeholder values
+
+# Processing Configuration
+processing:
+  parallel_threshold: 5000  # Use parallel if > N records
+  retry_attempts: 3
+  retry_delay: 2.0
+
 # Area polygon configuration (example: Area 048)
 area_048_polygon:
   - [-107.5, 44.3]

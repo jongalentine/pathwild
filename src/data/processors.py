@@ -5,10 +5,12 @@ import numpy as np
 import pandas as pd
 from shapely.geometry import Point, shape
 import requests
-from functools import lru_cache
+from functools import lru_cache, wraps
 import logging
 import warnings
 import os
+import threading
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -25,10 +27,617 @@ except (ImportError, OSError) as e:
     RASTERIO_AVAILABLE = False
     logger.warning(f"rasterio not available: {e}. Some features may be limited.")
 
+# Lazy import earthengine-api to avoid import errors if not installed
+try:
+    import ee
+    EE_AVAILABLE = True
+except ImportError:
+    ee = None
+    EE_AVAILABLE = False
+    logger.debug("earthengine-api not available. GEE features will be disabled.")
+
+
+# ============================================================================
+# Google Earth Engine Utilities
+# ============================================================================
+
+class GEEInitializer:
+    """Thread-safe singleton for GEE initialization"""
+    _instance = None
+    _lock = threading.Lock()
+    _initialized = False
+    _initialized_project = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def initialize(self, project: str = 'ee-jongalentine'):
+        """Initialize GEE (thread-safe, idempotent)"""
+        if not EE_AVAILABLE:
+            raise ImportError("earthengine-api not installed. Install with: pip install earthengine-api")
+        
+        with self._lock:
+            # If already initialized with the same project, skip
+            if self._initialized and self._initialized_project == project:
+                logger.debug(f"GEE already initialized with project: {project}")
+                return
+            
+            # If initialized with different project, log warning but don't re-initialize
+            # (GEE doesn't support changing projects after initialization)
+            if self._initialized and self._initialized_project != project:
+                logger.warning(
+                    f"GEE already initialized with project '{self._initialized_project}'. "
+                    f"Cannot switch to '{project}'. Using existing initialization."
+                )
+                return
+            
+            # Not initialized yet, try to initialize
+            try:
+                ee.Initialize(project=project)
+                self._initialized = True
+                self._initialized_project = project
+                logger.info(f"GEE initialized: {project}")
+            except Exception as e:
+                logger.error(f"GEE init failed for project '{project}': {e}")
+                # Don't set _initialized = True on failure, so we can retry
+                raise
+    
+    @property
+    def is_initialized(self) -> bool:
+        return self._initialized
+    
+    @property
+    def initialized_project(self) -> Optional[str]:
+        """Get the project that GEE was initialized with"""
+        return self._initialized_project
+
+
+def retry_on_ee_exception(max_retries: int = 3, delay: float = 1.0):
+    """Retry decorator for GEE operations"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    # Check if it's an EE exception
+                    if EE_AVAILABLE and hasattr(ee, 'EEException') and isinstance(e, ee.EEException):
+                        if attempt == max_retries - 1:
+                            raise
+                        logger.warning(
+                            f"GEE operation failed (attempt {attempt + 1}/{max_retries}): {e}"
+                        )
+                        time.sleep(delay * (2 ** attempt))
+                    else:
+                        # Not an EE exception, don't retry
+                        raise
+            return None
+        return wrapper
+    return decorator
+
+
+# ============================================================================
+# Google Earth Engine NDVI Client
+# ============================================================================
+
+class GEENDVIClient:
+    """
+    Google Earth Engine NDVI client.
+    Follows DataContextBuilder pattern for consistency with other data sources.
+    """
+    
+    COLLECTIONS = {
+        'landsat8': {
+            'id': 'LANDSAT/LC08/C02/T1_L2',
+            'red_band': 'SR_B4',
+            'nir_band': 'SR_B5',
+            'scale': 30,
+            'start_date': '2013-04-11'
+        },
+        'sentinel2': {
+            'id': 'COPERNICUS/S2_SR_HARMONIZED',
+            'red_band': 'B4',
+            'nir_band': 'B8',
+            'scale': 10,
+            'start_date': '2017-03-28'
+        }
+    }
+    
+    def __init__(
+        self,
+        project: str = 'ee-jongalentine',
+        collection: str = 'landsat8',
+        batch_size: int = 100,
+        max_workers: Optional[int] = 4
+    ):
+        """
+        Initialize GEE NDVI client.
+        
+        Args:
+            project: GEE project ID
+            collection: Satellite collection ('landsat8' or 'sentinel2')
+            batch_size: Points per batch for processing
+            max_workers: Thread pool size for parallel processing
+        """
+        if not EE_AVAILABLE:
+            raise ImportError("earthengine-api not installed. Install with: pip install earthengine-api")
+        
+        # Validate collection BEFORE initializing GEE (faster failure for invalid collections)
+        if collection not in self.COLLECTIONS:
+            raise ValueError(f"Unknown collection: {collection}. Must be one of: {list(self.COLLECTIONS.keys())}")
+        
+        # Initialize GEE (singleton pattern)
+        GEEInitializer().initialize(project)
+        
+        self.collection_config = self.COLLECTIONS[collection]
+        self.batch_size = batch_size
+        self.max_workers = max_workers
+        
+        logger.info(
+            f"GEENDVIClient initialized: {collection}, "
+            f"batch_size={batch_size}, workers={max_workers}"
+        )
+    
+    def check_availability(self) -> Dict[str, bool]:
+        """Check GEE connection"""
+        if not EE_AVAILABLE:
+            return {
+                'gee_available': False,
+                'error': 'earthengine-api not installed'
+            }
+        
+        try:
+            test_point = ee.Geometry.Point([-107.25, 44.5])
+            collection = ee.ImageCollection(self.collection_config['id']) \
+                .filterBounds(test_point) \
+                .limit(1)
+            count = collection.size().getInfo()
+            
+            return {
+                'gee_initialized': True,
+                'collection_accessible': True,
+                'test_successful': count >= 0
+            }
+        except Exception as e:
+            logger.error(f"GEE availability check failed: {e}")
+            return {
+                'gee_initialized': GEEInitializer().is_initialized,
+                'collection_accessible': False,
+                'error': str(e)
+            }
+    
+    @retry_on_ee_exception(max_retries=3, delay=2.0)
+    def _get_ndvi_single_point(
+        self,
+        lat: float,
+        lon: float,
+        date: datetime,
+        buffer_days: int,
+        max_cloud_cover: float
+    ) -> Optional[Dict[str, Optional[float]]]:
+        """
+        Get NDVI, cloud cover, and image age for single point (internal, with retry).
+        
+        Returns:
+            Dict with 'ndvi' (float), 'cloud_cover' (float or None), 
+            'image_date' (datetime or None), and 'ndvi_age_days' (float or None) keys,
+            or None if no data available
+        """
+        point = ee.Geometry.Point([lon, lat])
+        
+        # Date range
+        start_date = (date - timedelta(days=buffer_days)).strftime('%Y-%m-%d')
+        end_date = (date + timedelta(days=buffer_days)).strftime('%Y-%m-%d')
+        
+        # Filter collection
+        collection = ee.ImageCollection(self.collection_config['id']) \
+            .filterBounds(point) \
+            .filterDate(start_date, end_date) \
+            .filter(ee.Filter.lt('CLOUD_COVER', max_cloud_cover))
+        
+        # Get best image (lowest cloud cover)
+        image = collection.sort('CLOUD_COVER').first()
+        
+        # Check existence and get metadata
+        try:
+            image_info = image.getInfo()
+            if not image_info:
+                return None
+            
+            properties = image_info.get('properties', {})
+            
+            # Extract cloud cover from image properties
+            cloud_cover = properties.get('CLOUD_COVER', None)
+            if cloud_cover is None:
+                # Try alternative property names
+                cloud_cover = properties.get('cloud_cover', None)
+            
+            # Extract image timestamp (system:time_start is in milliseconds since epoch)
+            image_timestamp_ms = properties.get('system:time_start', None)
+            image_date = None
+            ndvi_age_days = None
+            
+            if image_timestamp_ms:
+                # Convert milliseconds to datetime
+                image_date = datetime.fromtimestamp(image_timestamp_ms / 1000.0)
+                # Calculate age in days (positive = image is older than observation date)
+                age_delta = date - image_date
+                ndvi_age_days = age_delta.total_seconds() / 86400.0  # Convert to days
+                # Handle images slightly after observation date (expected when using buffer_days)
+                if ndvi_age_days < 0:
+                    # Image is after observation date (expected when buffer_days allows future images)
+                    logger.debug(f"Image date ({image_date}) is after observation date ({date}), "
+                               f"age: {abs(ndvi_age_days):.2f} days (within {buffer_days}-day buffer)")
+                    ndvi_age_days = abs(ndvi_age_days)
+            
+        except Exception as e:
+            logger.debug(f"Error extracting image metadata: {e}")
+            return None
+        
+        # Calculate NDVI
+        red_band = self.collection_config['red_band']
+        nir_band = self.collection_config['nir_band']
+        ndvi = image.normalizedDifference([nir_band, red_band]).rename('NDVI')
+        
+        # Sample at point
+        scale = self.collection_config['scale']
+        value = ndvi.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=point,
+            scale=scale
+        ).get('NDVI')
+        
+        ndvi_value = value.getInfo()
+        
+        if ndvi_value is None:
+            return None
+        
+        return {
+            'ndvi': float(ndvi_value),
+            'cloud_cover': float(cloud_cover) if cloud_cover is not None else None,
+            'image_date': image_date,
+            'ndvi_age_days': float(ndvi_age_days) if ndvi_age_days is not None else None
+        }
+    
+    def _calculate_irg(
+        self,
+        lat: float,
+        lon: float,
+        current_date: datetime,
+        current_ndvi: float,
+        buffer_days: int,
+        max_cloud_cover: float,
+        lookback_days: int = 21
+    ) -> Optional[float]:
+        """
+        Calculate Instantaneous Rate of Green-up (IRG) by comparing current NDVI
+        with NDVI from lookback_days ago.
+        
+        IRG = (current_ndvi - past_ndvi) / days_between
+        
+        Args:
+            lat: Latitude
+            lon: Longitude
+            current_date: Current observation date
+            current_ndvi: Current NDVI value
+            buffer_days: Days to search around target date
+            max_cloud_cover: Maximum cloud cover threshold
+            lookback_days: Days to look back for past NDVI (default 21 = 3 weeks)
+            
+        Returns:
+            IRG value (positive = greening, negative = browning), or None if can't calculate
+        """
+        # Calculate past date
+        past_date = current_date - timedelta(days=lookback_days)
+        
+        # Fetch past NDVI
+        past_result = self._get_ndvi_single_point(
+            lat=lat,
+            lon=lon,
+            date=past_date,
+            buffer_days=buffer_days,
+            max_cloud_cover=max_cloud_cover
+        )
+        
+        if past_result is None or past_result.get('ndvi') is None:
+            # Can't calculate IRG without past data
+            # Fall back to seasonal approximation
+            month = current_date.month
+            if month in [4, 5]:  # Spring greening
+                return 0.01
+            elif month in [9, 10]:  # Fall browning
+                return -0.005
+            else:
+                return 0.0
+        
+        past_ndvi = past_result.get('ndvi')
+        
+        # Calculate IRG (rate of change per day)
+        days_between = lookback_days
+        if days_between <= 0:
+            return 0.0
+        
+        irg = (current_ndvi - past_ndvi) / days_between
+        
+        return float(irg)
+    
+    def _process_batch(
+        self,
+        batch_df: pd.DataFrame,
+        date_column: str,
+        lat_column: str,
+        lon_column: str,
+        buffer_days: int,
+        max_cloud_cover: float
+    ) -> pd.DataFrame:
+        """Process batch using thread pool"""
+        from concurrent.futures import ThreadPoolExecutor
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = []
+            
+            for idx, row in batch_df.iterrows():
+                future = executor.submit(
+                    self._get_ndvi_single_point,
+                    lat=row[lat_column],
+                    lon=row[lon_column],
+                    date=pd.to_datetime(row[date_column]),
+                    buffer_days=buffer_days,
+                    max_cloud_cover=max_cloud_cover
+                )
+                futures.append((idx, future))
+            
+            # Collect results in order
+            results = {}
+            cloud_cover_results = {}
+            age_days_results = {}
+            for idx, future in futures:
+                try:
+                    result = future.result(timeout=60)
+                    if result is not None:
+                        results[idx] = result.get('ndvi')
+                        cloud_cover_results[idx] = result.get('cloud_cover')
+                        age_days_results[idx] = result.get('ndvi_age_days')
+                    else:
+                        results[idx] = None
+                        cloud_cover_results[idx] = None
+                        age_days_results[idx] = None
+                except Exception as e:
+                    logger.warning(f"NDVI retrieval failed for index {idx}: {e}")
+                    results[idx] = None
+                    cloud_cover_results[idx] = None
+                    age_days_results[idx] = None
+            
+            ndvi_values = [results.get(idx) for idx in batch_df.index]
+            cloud_cover_values = [cloud_cover_results.get(idx) for idx in batch_df.index]
+            age_days_values = [age_days_results.get(idx) for idx in batch_df.index]
+        
+        batch_df = batch_df.copy()
+        batch_df['ndvi'] = ndvi_values
+        batch_df['cloud_cover_percent'] = cloud_cover_values
+        batch_df['ndvi_age_days'] = age_days_values
+        
+        # Calculate IRG for points with valid NDVI
+        # Use parallel processing for IRG as well to speed things up
+        batch_df['irg'] = None
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            irg_futures = {}
+            for idx, row in batch_df.iterrows():
+                if pd.notna(row['ndvi']) and pd.notna(row[date_column]):
+                    future = executor.submit(
+                        self._calculate_irg,
+                        lat=row[lat_column],
+                        lon=row[lon_column],
+                        current_date=pd.to_datetime(row[date_column]),
+                        current_ndvi=row['ndvi'],
+                        buffer_days=buffer_days,
+                        max_cloud_cover=max_cloud_cover
+                    )
+                    irg_futures[idx] = future
+            
+            # Collect IRG results with timeout
+            for idx, future in irg_futures.items():
+                try:
+                    irg = future.result(timeout=30)  # 30 second timeout per IRG calculation
+                    batch_df.at[idx, 'irg'] = irg
+                except TimeoutError:
+                    logger.warning(f"IRG calculation timeout for index {idx}, using fallback")
+                    # Use seasonal fallback
+                    month = pd.to_datetime(batch_df.at[idx, date_column]).month
+                    batch_df.at[idx, 'irg'] = 0.01 if month in [4, 5] else -0.005 if month in [9, 10] else 0.0
+                except Exception as e:
+                    logger.warning(f"IRG calculation failed for index {idx}: {e}, using fallback")
+                    # Use seasonal fallback
+                    month = pd.to_datetime(batch_df.at[idx, date_column]).month
+                    batch_df.at[idx, 'irg'] = 0.01 if month in [4, 5] else -0.005 if month in [9, 10] else 0.0
+        
+        return batch_df
+    
+    def get_ndvi_for_points(
+        self,
+        points: pd.DataFrame,
+        date_column: str = 'timestamp',
+        lat_column: str = 'latitude',
+        lon_column: str = 'longitude',
+        buffer_days: int = 7,
+        max_cloud_cover: float = 30.0
+    ) -> pd.DataFrame:
+        """
+        Retrieve NDVI for all points.
+        Thread-safe batch processing with parallel execution.
+        
+        Args:
+            points: DataFrame with GPS observations
+            date_column: Column name for date/timestamp
+            lat_column: Column name for latitude
+            lon_column: Column name for longitude
+            buffer_days: Days before/after target date to search for images
+            max_cloud_cover: Maximum cloud cover percentage (0-100)
+            
+        Returns:
+            DataFrame with 'ndvi' column added
+        """
+        logger.info(f"Retrieving NDVI for {len(points)} points using GEE")
+        
+        # Convert dates
+        points = points.copy()
+        if not pd.api.types.is_datetime64_any_dtype(points[date_column]):
+            points[date_column] = pd.to_datetime(points[date_column])
+        
+        # Process in batches
+        results = []
+        n_batches = int(np.ceil(len(points) / self.batch_size))
+        
+        for i in range(n_batches):
+            start_idx = i * self.batch_size
+            end_idx = min((i + 1) * self.batch_size, len(points))
+            batch = points.iloc[start_idx:end_idx]
+            
+            logger.debug(f"Processing batch {i + 1}/{n_batches} ({len(batch)} points)")
+            
+            batch_result = self._process_batch(
+                batch,
+                date_column,
+                lat_column,
+                lon_column,
+                buffer_days,
+                max_cloud_cover
+            )
+            
+            results.append(batch_result)
+        
+        # Combine
+        final_df = pd.concat(results, ignore_index=False)
+        
+        # Statistics
+        n_success = final_df['ndvi'].notna().sum()
+        success_rate = n_success / len(final_df) * 100
+        
+        logger.info(
+            f"NDVI retrieval complete: {n_success}/{len(final_df)} "
+            f"({success_rate:.1f}% success)"
+        )
+        
+        return final_df
+    
+    def get_summer_integrated_ndvi(
+        self,
+        lat: float,
+        lon: float,
+        year: int,
+        buffer_days: int = 7,
+        max_cloud_cover: float = 30.0
+    ) -> Optional[float]:
+        """
+        Calculate summer integrated NDVI (sum of NDVI values from June-September).
+        
+        This is used for predicting pre-winter body condition and winterkill risk.
+        Integrated NDVI = sum of NDVI values over the summer period.
+        
+        Args:
+            lat: Latitude
+            lon: Longitude
+            year: Year to calculate summer NDVI for
+            buffer_days: Days to search around each target date
+            max_cloud_cover: Maximum cloud cover percentage (0-100)
+            
+        Returns:
+            Integrated NDVI value (sum of NDVI over summer), or None if insufficient data
+        """
+        point = ee.Geometry.Point([lon, lat])
+        
+        # Summer period: June 1 to September 30
+        start_date = datetime(year, 6, 1)
+        end_date = datetime(year, 9, 30)
+        
+        # Filter collection for summer period
+        collection = ee.ImageCollection(self.collection_config['id']) \
+            .filterBounds(point) \
+            .filterDate(start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')) \
+            .filter(ee.Filter.lt('CLOUD_COVER', max_cloud_cover)) \
+            .sort('system:time_start')  # Sort by date for consistent sampling
+        
+        # Optimize: Limit to max 8 images to reduce API calls
+        # This captures ~4 months of summer with Landsat 16-day revisit (typically 7-8 images)
+        # For Sentinel-2 (5-day revisit), this still gives good coverage
+        collection = collection.limit(8)
+        
+        # Calculate NDVI for all images in the collection
+        red_band = self.collection_config['red_band']
+        nir_band = self.collection_config['nir_band']
+        scale = self.collection_config['scale']
+        
+        # Map over collection to calculate NDVI for each image
+        def calculate_ndvi(image):
+            ndvi = image.normalizedDifference([nir_band, red_band]).rename('NDVI')
+            # Sample at point
+            ndvi_value = ndvi.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=point,
+                scale=scale
+            ).get('NDVI')
+            return image.set('ndvi_value', ndvi_value)
+        
+        # Apply NDVI calculation to all images
+        ndvi_collection = collection.map(calculate_ndvi)
+        
+        # Get all NDVI values
+        try:
+            # Get list of NDVI values
+            ndvi_values = ndvi_collection.aggregate_array('ndvi_value').getInfo()
+            
+            # Filter out None values and calculate sum
+            valid_ndvi = [v for v in ndvi_values if v is not None]
+            
+            if len(valid_ndvi) == 0:
+                logger.debug(f"No valid NDVI data for summer {year} at ({lat}, {lon})")
+                return None
+            
+            # Integrated NDVI = sum of all NDVI values
+            integrated_ndvi = sum(valid_ndvi)
+            
+            logger.debug(
+                f"Summer integrated NDVI for {year}: {integrated_ndvi:.2f} "
+                f"(from {len(valid_ndvi)} images)"
+            )
+            
+            return float(integrated_ndvi)
+            
+        except Exception as e:
+            logger.warning(f"Failed to calculate summer integrated NDVI: {e}")
+            return None
+
+
 class DataContextBuilder:
     """Builds comprehensive context for heuristic calculations"""
     
-    def __init__(self, data_dir: Path, cache_dir: Optional[Path] = None):
+    def __init__(
+        self, 
+        data_dir: Path, 
+        cache_dir: Optional[Path] = None,
+        use_gee_ndvi: bool = False,
+        gee_config: Optional[Dict] = None
+    ):
+        """
+        Initialize DataContextBuilder.
+        
+        Args:
+            data_dir: Path to data directory
+            cache_dir: Optional cache directory (defaults to data_dir/cache)
+            use_gee_ndvi: If True, use Google Earth Engine for NDVI (default: False)
+            gee_config: Optional GEE configuration dict with keys:
+                - project: GEE project ID (default: 'ee-jongalentine')
+                - collection: 'landsat8' or 'sentinel2' (default: 'landsat8')
+                - batch_size: Points per batch (default: 100)
+                - max_workers: Thread pool size (default: 4)
+        """
         self.data_dir = Path(data_dir)
         self.cache_dir = cache_dir or (self.data_dir / "cache")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -39,11 +648,40 @@ class DataContextBuilder:
         # Initialize data loaders
         self.snotel_client = AWDBClient(self.data_dir)
         self.weather_client = WeatherClient(data_dir=self.data_dir, use_real_data=True)
-        # TODO: NDVI data currently uses placeholders. For production, implement pre-downloaded
-        # raster files (similar to DEM/landcover) for training, and consider cloud-based
-        # solutions for inference. AppEEARS async API is not suitable for inference (requires
-        # minutes to process requests). See docs/dataset_gap_analysis.md for details.
-        self.satellite_client = SatelliteClient(use_real_data=False)
+        
+        # NDVI data source: GEE (if enabled) or SatelliteClient (AppEEARS/placeholder)
+        self.use_gee_ndvi = use_gee_ndvi
+        self.ndvi_client = None
+        
+        if use_gee_ndvi:
+            if not EE_AVAILABLE:
+                logger.warning("GEE requested but earthengine-api not available. Falling back to SatelliteClient.")
+                self.use_gee_ndvi = False
+                self.satellite_client = SatelliteClient(use_real_data=False)
+            else:
+                # Initialize GEE NDVI client
+                gee_config = gee_config or {}
+                try:
+                    self.ndvi_client = GEENDVIClient(
+                        project=gee_config.get('project', 'ee-jongalentine'),
+                        collection=gee_config.get('collection', 'landsat8'),
+                        batch_size=gee_config.get('batch_size', 100),
+                        max_workers=gee_config.get('max_workers', 4)
+                    )
+                    logger.info("GEE NDVI client initialized")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize GEE NDVI client: {e}. Falling back to SatelliteClient.")
+                    self.use_gee_ndvi = False
+                    self.satellite_client = SatelliteClient(use_real_data=False)
+                else:
+                    # GEE initialized successfully, still keep SatelliteClient for fallback
+                    self.satellite_client = SatelliteClient(use_real_data=False)
+        else:
+            # TODO: NDVI data currently uses google earth engine. For production, implement pre-downloaded
+            # raster files (similar to DEM/landcover) for training, and consider cloud-based
+            # solutions for inference. AppEEARS async API is not suitable for inference (requires
+            # minutes to process requests). See docs/dataset_gap_analysis.md for details.
+            self.satellite_client = SatelliteClient(use_real_data=False)
     
     def _load_static_layers(self):
         """Load data that doesn't change over time"""
@@ -359,21 +997,113 @@ class DataContextBuilder:
         context["cloud_cover_percent"] = weather.get("cloud_cover", 20)
         
         # Vegetation data
-        ndvi_data = self.satellite_client.get_ndvi(lat, lon, dt)
-        context["ndvi"] = ndvi_data.get("ndvi", 0.5)
-        context["ndvi_age_days"] = ndvi_data.get("age_days", 8)
-        context["irg"] = ndvi_data.get("irg", 0.0)
+        if self.use_gee_ndvi and self.ndvi_client:
+            # Use GEE for NDVI (even for single points - wrap in DataFrame)
+            try:
+                # Create single-row DataFrame for GEE batch processing
+                point_df = pd.DataFrame({
+                    'latitude': [lat],
+                    'longitude': [lon],
+                    'timestamp': [dt]
+                })
+                
+                # Get NDVI from GEE
+                ndvi_df = self.ndvi_client.get_ndvi_for_points(
+                    point_df,
+                    date_column='timestamp',
+                    lat_column='latitude',
+                    lon_column='longitude',
+                    buffer_days=7,
+                    max_cloud_cover=30.0
+                )
+                
+                # Extract NDVI value, cloud cover, age, and IRG
+                ndvi_value = ndvi_df.iloc[0]['ndvi'] if len(ndvi_df) > 0 else None
+                cloud_cover_value = ndvi_df.iloc[0].get('cloud_cover_percent') if len(ndvi_df) > 0 else None
+                ndvi_age_days_value = ndvi_df.iloc[0].get('ndvi_age_days') if len(ndvi_df) > 0 else None
+                irg_value = ndvi_df.iloc[0].get('irg') if len(ndvi_df) > 0 else None
+                
+                if pd.notna(ndvi_value) and ndvi_value is not None:
+                    context["ndvi"] = float(ndvi_value)
+                    
+                    # Use real ndvi_age_days from GEE if available
+                    if pd.notna(ndvi_age_days_value) and ndvi_age_days_value is not None:
+                        context["ndvi_age_days"] = float(ndvi_age_days_value)
+                    else:
+                        context["ndvi_age_days"] = 8  # Fallback default
+                    
+                    # Use real IRG from GEE if available
+                    if pd.notna(irg_value) and irg_value is not None:
+                        context["irg"] = float(irg_value)
+                    else:
+                        # Fallback to seasonal approximation
+                        month = dt.month
+                        context["irg"] = 0.01 if month in [4, 5] else -0.005 if month in [9, 10] else 0.0
+                    
+                    # Use cloud cover from GEE if available
+                    if pd.notna(cloud_cover_value) and cloud_cover_value is not None:
+                        context["cloud_cover_percent"] = float(cloud_cover_value)
+                        logger.debug(f"Using cloud cover from GEE: {cloud_cover_value}%")
+                else:
+                    # GEE returned None, fall back to SatelliteClient
+                    logger.debug(f"GEE returned None for NDVI at ({lat}, {lon}), using SatelliteClient fallback")
+                    ndvi_data = self.satellite_client.get_ndvi(lat, lon, dt)
+                    context["ndvi"] = ndvi_data.get("ndvi", 0.5)
+                    context["ndvi_age_days"] = ndvi_data.get("age_days", 8)
+                    # Try to calculate IRG even with fallback
+                    month = dt.month
+                    context["irg"] = ndvi_data.get("irg", 0.01 if month in [4, 5] else -0.005 if month in [9, 10] else 0.0)
+            except Exception as e:
+                # GEE failed, fall back to SatelliteClient
+                logger.warning(f"GEE NDVI retrieval failed: {e}, using SatelliteClient fallback")
+                ndvi_data = self.satellite_client.get_ndvi(lat, lon, dt)
+                context["ndvi"] = ndvi_data.get("ndvi", 0.5)
+                context["ndvi_age_days"] = ndvi_data.get("age_days", 8)
+                # Try to calculate IRG even with fallback
+                month = dt.month
+                context["irg"] = ndvi_data.get("irg", 0.01 if month in [4, 5] else -0.005 if month in [9, 10] else 0.0)
+        else:
+            ndvi_data = self.satellite_client.get_ndvi(lat, lon, dt)
+            context["ndvi"] = ndvi_data.get("ndvi", 0.5)
+            context["ndvi_age_days"] = ndvi_data.get("age_days", 8)
+            # Try to calculate IRG even with fallback
+            month = dt.month
+            context["irg"] = ndvi_data.get("irg", 0.01 if month in [4, 5] else -0.005 if month in [9, 10] else 0.0)
         
         # Summer integrated NDVI (for nutritional condition)
-        if dt.month >= 9:  # After summer
-            summer_start = datetime(dt.year, 6, 1)
-            summer_end = datetime(dt.year, 9, 1)
-            context["summer_integrated_ndvi"] = \
-                self.satellite_client.get_integrated_ndvi(lat, lon, summer_start, summer_end)
+        # Use current year if after September, otherwise use previous year
+        summer_year = dt.year if dt.month >= 9 else dt.year - 1
+        
+        if self.use_gee_ndvi and self.ndvi_client:
+            # Use GEE for summer integrated NDVI
+            try:
+                summer_ndvi = self.ndvi_client.get_summer_integrated_ndvi(
+                    lat=lat,
+                    lon=lon,
+                    year=summer_year,
+                    buffer_days=7,
+                    max_cloud_cover=30.0
+                )
+                if summer_ndvi is not None:
+                    context["summer_integrated_ndvi"] = summer_ndvi
+                else:
+                    # Fallback to SatelliteClient
+                    logger.debug(f"GEE returned None for summer integrated NDVI, using fallback")
+                    summer_start = datetime(summer_year, 6, 1)
+                    summer_end = datetime(summer_year, 9, 1)
+                    context["summer_integrated_ndvi"] = \
+                        self.satellite_client.get_integrated_ndvi(lat, lon, summer_start, summer_end)
+            except Exception as e:
+                # GEE failed, fall back to SatelliteClient
+                logger.warning(f"GEE summer integrated NDVI failed: {e}, using SatelliteClient fallback")
+                summer_start = datetime(summer_year, 6, 1)
+                summer_end = datetime(summer_year, 9, 1)
+                context["summer_integrated_ndvi"] = \
+                    self.satellite_client.get_integrated_ndvi(lat, lon, summer_start, summer_end)
         else:
-            # Use previous year
-            summer_start = datetime(dt.year - 1, 6, 1)
-            summer_end = datetime(dt.year - 1, 9, 1)
+            # Use SatelliteClient
+            summer_start = datetime(summer_year, 6, 1)
+            summer_end = datetime(summer_year, 9, 1)
             context["summer_integrated_ndvi"] = \
                 self.satellite_client.get_integrated_ndvi(lat, lon, summer_start, summer_end)
         
@@ -636,6 +1366,57 @@ class DataContextBuilder:
             # ... add more as needed
         }
         return landcover_map.get(int(code), "unknown")
+    
+    def add_ndvi(
+        self,
+        points: pd.DataFrame,
+        date_column: str = 'timestamp',
+        lat_column: str = 'latitude',
+        lon_column: str = 'longitude',
+        buffer_days: int = 7,
+        max_cloud_cover: float = 30.0
+    ) -> pd.DataFrame:
+        """
+        Add NDVI data to points using Google Earth Engine (if enabled) or SatelliteClient.
+        
+        Args:
+            points: DataFrame with GPS observations
+            date_column: Column name for date/timestamp (default: 'timestamp')
+            lat_column: Column name for latitude (default: 'latitude')
+            lon_column: Column name for longitude (default: 'longitude')
+            buffer_days: Days before/after target date to search for images (default: 7)
+            max_cloud_cover: Maximum cloud cover percentage 0-100 (default: 30.0)
+            
+        Returns:
+            DataFrame with 'ndvi' column added
+        """
+        if self.use_gee_ndvi and self.ndvi_client:
+            # Use GEE for batch NDVI retrieval
+            return self.ndvi_client.get_ndvi_for_points(
+                points,
+                date_column=date_column,
+                lat_column=lat_column,
+                lon_column=lon_column,
+                buffer_days=buffer_days,
+                max_cloud_cover=max_cloud_cover
+            )
+        else:
+            # Fall back to SatelliteClient (AppEEARS or placeholder)
+            logger.info("Using SatelliteClient for NDVI (GEE not enabled)")
+            # Convert DataFrame to list of tuples for batch processing
+            result_df = points.copy()
+            ndvi_values = []
+            
+            for idx, row in points.iterrows():
+                date = pd.to_datetime(row[date_column])
+                lat = row[lat_column]
+                lon = row[lon_column]
+                
+                ndvi_data = self.satellite_client.get_ndvi(lat, lon, date)
+                ndvi_values.append(ndvi_data.get("ndvi", 0.5))
+            
+            result_df['ndvi'] = ndvi_values
+            return result_df
 
 
 class AWDBClient:
