@@ -67,21 +67,7 @@ python scripts/run_data_pipeline.py --skip-steps process_raw,generate_absence
 
 See [Automated Data Pipeline Documentation](./docs/automated_data_pipeline.md) for details.
 
-### Run Jupyter Lab
-```bash
-jupyter lab
-```
 
-### Train Model (after data collection)
-```bash
-python src/models/train.py
-```
-
-### Run Web App Locally
-```bash
-python app/app.py
-# Visit http://localhost:5000
-```
 
 ## Project Structure
 ```
