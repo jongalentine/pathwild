@@ -1264,7 +1264,7 @@ def main():
         epilog="""
 Examples:
     # Analyze a specific dataset
-    python scripts/analyze_integrated_features.py data/processed/combined_north_bighorn_presence_absence.csv
+    python scripts/analyze_integrated_features.py data/processed/combined_northern_bighorn_presence_absence.csv
         """
     )
     

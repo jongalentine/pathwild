@@ -241,7 +241,7 @@ def process_dataset(
     
     Args:
         input_dir: Directory containing raw data files
-        dataset_name: Name of the dataset (e.g., 'north_bighorn', 'national_refuge')
+        dataset_name: Name of the dataset (e.g., 'northern_bighorn', 'national_refuge')
         output_dir: Directory to save processed presence points
     
     Returns:
@@ -325,7 +325,7 @@ def main():
         '--dataset',
         type=str,
         default=None,
-        help='Specific dataset to process (e.g., "north_bighorn"). If not specified, processes all datasets.'
+        help='Specific dataset to process (e.g., "northern_bighorn"). If not specified, processes all datasets.'
     )
     parser.add_argument(
         '--datasets',
@@ -358,7 +358,7 @@ def main():
         
         if not datasets:
             logger.error(f"No elk dataset directories found in {input_dir}")
-            logger.info(f"Expected directories like: elk_north_bighorn/, elk_southern_bighorn/, etc.")
+            logger.info(f"Expected directories like: elk_northern_bighorn/, elk_southern_bighorn/, etc.")
             return 1
     
     logger.info(f"Found {len(datasets)} dataset(s) to process: {datasets}")
