@@ -357,7 +357,7 @@ class PRISMClient:
             # Try web service first (new format - COG)
             if use_web_service:
                 url = self._get_web_service_url(variable, date)
-                logger.info(f"Downloading PRISM {variable} for {date.strftime('%Y-%m-%d')} from web service (COG format)...")
+                logger.debug(f"Downloading PRISM {variable} for {date.strftime('%Y-%m-%d')} from web service (COG format)...")
                 try:
                     result = self._download_cog_file(url, file_path, variable, date, max_retries)
                     if result is not None:
@@ -500,7 +500,7 @@ class PRISMClient:
                 # Clean up ZIP file (keep extracted COG)
                 zip_path.unlink()
                 
-                logger.info(f"Downloaded and extracted COG file: {output_path}")
+                logger.debug(f"Downloaded and extracted COG file: {output_path}")
                 return output_path
                 
             except requests.exceptions.HTTPError as e:

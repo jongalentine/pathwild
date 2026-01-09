@@ -11,6 +11,9 @@ import warnings
 import os
 import threading
 import time
+import sqlite3
+import hashlib
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +125,260 @@ def retry_on_ee_exception(max_retries: int = 3, delay: float = 1.0):
 
 
 # ============================================================================
+# NDVI Cache for Google Earth Engine
+# ============================================================================
+
+class NDVICache:
+    """
+    Persistent cache for NDVI data retrieved from Google Earth Engine.
+    
+    Uses SQLite for efficient storage and retrieval. Cache keys are based on:
+    - Location (lat, lon rounded to 5 decimal places ~1.1m precision)
+    - Date (to the day)
+    - Collection name
+    - buffer_days
+    - max_cloud_cover
+    
+    Since historical data never changes, cached entries are permanent.
+    """
+    
+    def __init__(self, cache_dir: Optional[Path] = None):
+        """
+        Initialize NDVI cache.
+        
+        Args:
+            cache_dir: Directory for cache database. Defaults to data/cache/ndvi_cache.db
+        """
+        if cache_dir is None:
+            cache_dir = Path('data/cache')
+        else:
+            cache_dir = Path(cache_dir)
+        
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_db = cache_dir / 'ndvi_cache.db'
+        self._lock = threading.Lock()
+        
+        # Initialize database
+        self._init_db()
+        
+        logger.info(f"NDVI cache initialized: {self.cache_db}")
+    
+    def _init_db(self):
+        """Initialize cache database schema."""
+        with self._lock:
+            conn = sqlite3.connect(str(self.cache_db), timeout=30.0)
+            try:
+                # Create table
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS ndvi_cache (
+                        cache_key TEXT PRIMARY KEY,
+                        lat REAL NOT NULL,
+                        lon REAL NOT NULL,
+                        date TEXT NOT NULL,
+                        collection TEXT NOT NULL,
+                        buffer_days INTEGER NOT NULL,
+                        max_cloud_cover REAL NOT NULL,
+                        ndvi REAL,
+                        cloud_cover REAL,
+                        image_date TEXT,
+                        ndvi_age_days REAL,
+                        cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                # Create index separately (SQLite doesn't support inline INDEX in CREATE TABLE)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_location_date 
+                    ON ndvi_cache(lat, lon, date)
+                """)
+                conn.commit()
+            finally:
+                conn.close()
+    
+    def _make_cache_key(
+        self,
+        lat: float,
+        lon: float,
+        date: datetime,
+        collection: str,
+        buffer_days: int,
+        max_cloud_cover: float
+    ) -> str:
+        """
+        Generate cache key from parameters.
+        
+        Args:
+            lat: Latitude (rounded to 5 decimal places)
+            lon: Longitude (rounded to 5 decimal places)
+            date: Observation date
+            collection: Satellite collection name
+            buffer_days: Buffer days parameter
+            max_cloud_cover: Max cloud cover parameter
+            
+        Returns:
+            Cache key string
+        """
+        # Round coordinates to 5 decimal places (~1.1m precision)
+        lat_rounded = round(lat, 5)
+        lon_rounded = round(lon, 5)
+        date_str = date.strftime('%Y-%m-%d')
+        
+        # Create hash for cache key
+        key_data = f"{lat_rounded:.5f},{lon_rounded:.5f},{date_str},{collection},{buffer_days},{max_cloud_cover:.1f}"
+        return hashlib.sha256(key_data.encode()).hexdigest()
+    
+    def get(
+        self,
+        lat: float,
+        lon: float,
+        date: datetime,
+        collection: str,
+        buffer_days: int,
+        max_cloud_cover: float
+    ) -> Optional[Dict[str, Optional[float]]]:
+        """
+        Retrieve NDVI data from cache.
+        
+        Args:
+            lat: Latitude
+            lon: Longitude
+            date: Observation date
+            collection: Satellite collection name
+            buffer_days: Buffer days parameter
+            max_cloud_cover: Max cloud cover parameter
+            
+        Returns:
+            Dict with 'ndvi', 'cloud_cover', 'image_date', 'ndvi_age_days' keys,
+            or None if not in cache
+        """
+        cache_key = self._make_cache_key(lat, lon, date, collection, buffer_days, max_cloud_cover)
+        
+        with self._lock:
+            conn = sqlite3.connect(str(self.cache_db), timeout=30.0)
+            try:
+                cursor = conn.execute("""
+                    SELECT ndvi, cloud_cover, image_date, ndvi_age_days
+                    FROM ndvi_cache
+                    WHERE cache_key = ?
+                """, (cache_key,))
+                
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                
+                ndvi, cloud_cover, image_date_str, ndvi_age_days = row
+                
+                # Parse image_date if present
+                image_date = None
+                if image_date_str:
+                    try:
+                        image_date = datetime.fromisoformat(image_date_str)
+                    except (ValueError, TypeError):
+                        pass
+                
+                return {
+                    'ndvi': float(ndvi) if ndvi is not None else None,
+                    'cloud_cover': float(cloud_cover) if cloud_cover is not None else None,
+                    'image_date': image_date,
+                    'ndvi_age_days': float(ndvi_age_days) if ndvi_age_days is not None else None
+                }
+            finally:
+                conn.close()
+    
+    def put(
+        self,
+        lat: float,
+        lon: float,
+        date: datetime,
+        collection: str,
+        buffer_days: int,
+        max_cloud_cover: float,
+        result: Dict[str, Optional[float]]
+    ):
+        """
+        Store NDVI data in cache.
+        
+        Args:
+            lat: Latitude
+            lon: Longitude
+            date: Observation date
+            collection: Satellite collection name
+            buffer_days: Buffer days parameter
+            max_cloud_cover: Max cloud cover parameter
+            result: Dict with 'ndvi', 'cloud_cover', 'image_date', 'ndvi_age_days' keys
+        """
+        cache_key = self._make_cache_key(lat, lon, date, collection, buffer_days, max_cloud_cover)
+        
+        # Round coordinates for storage
+        lat_rounded = round(lat, 5)
+        lon_rounded = round(lon, 5)
+        date_str = date.strftime('%Y-%m-%d')
+        
+        # Serialize image_date
+        image_date_str = None
+        if result.get('image_date'):
+            image_date_str = result['image_date'].isoformat()
+        
+        with self._lock:
+            conn = sqlite3.connect(str(self.cache_db), timeout=30.0)
+            try:
+                conn.execute("""
+                    INSERT OR REPLACE INTO ndvi_cache
+                    (cache_key, lat, lon, date, collection, buffer_days, max_cloud_cover,
+                     ndvi, cloud_cover, image_date, ndvi_age_days)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    cache_key,
+                    lat_rounded,
+                    lon_rounded,
+                    date_str,
+                    collection,
+                    buffer_days,
+                    max_cloud_cover,
+                    result.get('ndvi'),
+                    result.get('cloud_cover'),
+                    image_date_str,
+                    result.get('ndvi_age_days')
+                ))
+                conn.commit()
+            finally:
+                conn.close()
+    
+    def get_stats(self) -> Dict[str, int]:
+        """
+        Get cache statistics.
+        
+        Returns:
+            Dict with 'total_entries', 'total_size_mb' keys
+        """
+        with self._lock:
+            conn = sqlite3.connect(str(self.cache_db), timeout=30.0)
+            try:
+                cursor = conn.execute("SELECT COUNT(*) FROM ndvi_cache")
+                total_entries = cursor.fetchone()[0]
+                
+                # Get database file size
+                db_size = self.cache_db.stat().st_size if self.cache_db.exists() else 0
+                total_size_mb = db_size / (1024 * 1024)
+                
+                return {
+                    'total_entries': total_entries,
+                    'total_size_mb': round(total_size_mb, 2)
+                }
+            finally:
+                conn.close()
+    
+    def clear(self):
+        """Clear all cached entries (use with caution)."""
+        with self._lock:
+            conn = sqlite3.connect(str(self.cache_db), timeout=30.0)
+            try:
+                conn.execute("DELETE FROM ndvi_cache")
+                conn.commit()
+                logger.info("NDVI cache cleared")
+            finally:
+                conn.close()
+
+
 # Google Earth Engine NDVI Client
 # ============================================================================
 
@@ -153,7 +410,9 @@ class GEENDVIClient:
         project: str = 'ee-jongalentine',
         collection: str = 'landsat8',
         batch_size: int = 100,
-        max_workers: Optional[int] = 4
+        max_workers: Optional[int] = 4,
+        cache_dir: Optional[Path] = None,
+        use_cache: bool = True
     ):
         """
         Initialize GEE NDVI client.
@@ -163,6 +422,8 @@ class GEENDVIClient:
             collection: Satellite collection ('landsat8' or 'sentinel2')
             batch_size: Points per batch for processing
             max_workers: Thread pool size for parallel processing
+            cache_dir: Directory for NDVI cache (defaults to data/cache)
+            use_cache: If True, use persistent cache for historical data (default: True)
         """
         if not EE_AVAILABLE:
             raise ImportError("earthengine-api not installed. Install with: pip install earthengine-api")
@@ -177,10 +438,24 @@ class GEENDVIClient:
         self.collection_config = self.COLLECTIONS[collection]
         self.batch_size = batch_size
         self.max_workers = max_workers
+        self.collection = collection
+        self.use_cache = use_cache
+        
+        # Initialize cache if enabled
+        if self.use_cache:
+            self.cache = NDVICache(cache_dir=cache_dir)
+            cache_stats = self.cache.get_stats()
+            logger.info(
+                f"NDVI cache enabled: {cache_stats['total_entries']:,} entries "
+                f"({cache_stats['total_size_mb']:.2f} MB)"
+            )
+        else:
+            self.cache = None
+            logger.info("NDVI cache disabled")
         
         logger.info(
             f"GEENDVIClient initialized: {collection}, "
-            f"batch_size={batch_size}, workers={max_workers}"
+            f"batch_size={batch_size}, workers={max_workers}, cache={'enabled' if use_cache else 'disabled'}"
         )
     
     def check_availability(self) -> Dict[str, bool]:
@@ -223,11 +498,28 @@ class GEENDVIClient:
         """
         Get NDVI, cloud cover, and image age for single point (internal, with retry).
         
+        Checks cache first, then queries GEE if not cached.
+        
         Returns:
             Dict with 'ndvi' (float), 'cloud_cover' (float or None), 
             'image_date' (datetime or None), and 'ndvi_age_days' (float or None) keys,
             or None if no data available
         """
+        # Check cache first (if enabled)
+        if self.use_cache and self.cache:
+            cached_result = self.cache.get(
+                lat=lat,
+                lon=lon,
+                date=date,
+                collection=self.collection,
+                buffer_days=buffer_days,
+                max_cloud_cover=max_cloud_cover
+            )
+            if cached_result is not None:
+                logger.debug(f"Cache hit for ({lat:.5f}, {lon:.5f}) on {date.strftime('%Y-%m-%d')}")
+                return cached_result
+        
+        # Not in cache, query GEE
         point = ee.Geometry.Point([lon, lat])
         
         # Date range
@@ -295,14 +587,33 @@ class GEENDVIClient:
         ndvi_value = value.getInfo()
         
         if ndvi_value is None:
-            return None
+            result = None
+        else:
+            result = {
+                'ndvi': float(ndvi_value),
+                'cloud_cover': float(cloud_cover) if cloud_cover is not None else None,
+                'image_date': image_date,
+                'ndvi_age_days': float(ndvi_age_days) if ndvi_age_days is not None else None
+            }
         
-        return {
-            'ndvi': float(ndvi_value),
-            'cloud_cover': float(cloud_cover) if cloud_cover is not None else None,
-            'image_date': image_date,
-            'ndvi_age_days': float(ndvi_age_days) if ndvi_age_days is not None else None
-        }
+        # Store in cache (even if None, to avoid repeated failed queries)
+        if self.use_cache and self.cache:
+            self.cache.put(
+                lat=lat,
+                lon=lon,
+                date=date,
+                collection=self.collection,
+                buffer_days=buffer_days,
+                max_cloud_cover=max_cloud_cover,
+                result=result if result is not None else {
+                    'ndvi': None,
+                    'cloud_cover': None,
+                    'image_date': None,
+                    'ndvi_age_days': None
+                }
+            )
+        
+        return result
     
     def _calculate_irg(
         self,
@@ -484,7 +795,14 @@ class GEENDVIClient:
         Returns:
             DataFrame with 'ndvi' column added
         """
-        logger.info(f"Retrieving NDVI for {len(points)} points using GEE")
+        n_points = len(points)
+        
+        # Only log at INFO level for batches with multiple points to reduce log spam
+        # Single-point calls (from build_context) will be logged at DEBUG level
+        if n_points > 1:
+            logger.info(f"Retrieving NDVI for {n_points} points using GEE")
+        else:
+            logger.debug(f"Retrieving NDVI for {n_points} point(s) using GEE")
         
         # Convert dates
         points = points.copy()
@@ -493,11 +811,11 @@ class GEENDVIClient:
         
         # Process in batches
         results = []
-        n_batches = int(np.ceil(len(points) / self.batch_size))
+        n_batches = int(np.ceil(n_points / self.batch_size))
         
         for i in range(n_batches):
             start_idx = i * self.batch_size
-            end_idx = min((i + 1) * self.batch_size, len(points))
+            end_idx = min((i + 1) * self.batch_size, n_points)
             batch = points.iloc[start_idx:end_idx]
             
             logger.debug(f"Processing batch {i + 1}/{n_batches} ({len(batch)} points)")
@@ -512,6 +830,10 @@ class GEENDVIClient:
             )
             
             results.append(batch_result)
+            
+            # Log progress for larger batches (every 10 batches or at milestones)
+            if n_batches > 10 and (i + 1) % 10 == 0:
+                logger.info(f"NDVI progress: {i + 1}/{n_batches} batches processed ({end_idx}/{n_points} points)")
         
         # Combine
         final_df = pd.concat(results, ignore_index=False)
@@ -520,10 +842,24 @@ class GEENDVIClient:
         n_success = final_df['ndvi'].notna().sum()
         success_rate = n_success / len(final_df) * 100
         
-        logger.info(
-            f"NDVI retrieval complete: {n_success}/{len(final_df)} "
-            f"({success_rate:.1f}% success)"
-        )
+        # Log cache statistics if enabled
+        cache_info = ""
+        if self.use_cache and self.cache:
+            cache_stats = self.cache.get_stats()
+            cache_info = f" (cache: {cache_stats['total_entries']:,} entries, {cache_stats['total_size_mb']:.2f} MB)"
+        
+        # Only log completion at INFO level for batches with multiple points
+        # Single-point calls (from build_context) will be logged at DEBUG level
+        if n_points > 1:
+            logger.info(
+                f"NDVI retrieval complete: {n_success}/{len(final_df)} "
+                f"({success_rate:.1f}% success){cache_info}"
+            )
+        else:
+            logger.debug(
+                f"NDVI retrieval complete: {n_success}/{len(final_df)} "
+                f"({success_rate:.1f}% success){cache_info}"
+            )
         
         return final_df
     
@@ -637,6 +973,8 @@ class DataContextBuilder:
                 - collection: 'landsat8' or 'sentinel2' (default: 'landsat8')
                 - batch_size: Points per batch (default: 100)
                 - max_workers: Thread pool size (default: 4)
+                - use_cache: Enable NDVI caching (default: True)
+                - cache_dir: Override cache directory (defaults to data_dir/cache)
         """
         self.data_dir = Path(data_dir)
         self.cache_dir = cache_dir or (self.data_dir / "cache")
@@ -661,12 +999,17 @@ class DataContextBuilder:
             else:
                 # Initialize GEE NDVI client
                 gee_config = gee_config or {}
+                # Use cache_dir from gee_config if provided, otherwise use DataContextBuilder's cache_dir
+                ndvi_cache_dir = gee_config.get('cache_dir') or self.cache_dir
+                use_cache = gee_config.get('use_cache', True)  # Default to True for historical data
                 try:
                     self.ndvi_client = GEENDVIClient(
                         project=gee_config.get('project', 'ee-jongalentine'),
                         collection=gee_config.get('collection', 'landsat8'),
                         batch_size=gee_config.get('batch_size', 100),
-                        max_workers=gee_config.get('max_workers', 4)
+                        max_workers=gee_config.get('max_workers', 4),
+                        cache_dir=ndvi_cache_dir,
+                        use_cache=use_cache
                     )
                     logger.info("GEE NDVI client initialized")
                 except Exception as e:
@@ -1419,6 +1762,156 @@ class DataContextBuilder:
             return result_df
 
 
+class SNOTELDataCache:
+    """
+    Persistent cache for SNOTEL station data retrieved from AWDB API.
+    
+    Uses SQLite for efficient storage and retrieval. Cache keys are based on:
+    - Station ID
+    - Date range (begin_date, end_date)
+    
+    Since historical data never changes, cached entries are permanent.
+    """
+    
+    def __init__(self, cache_dir: Optional[Path] = None):
+        """
+        Initialize SNOTEL data cache.
+        
+        Args:
+            cache_dir: Directory for cache database. Defaults to data/cache/snotel_cache.db
+        """
+        if cache_dir is None:
+            cache_dir = Path('data/cache')
+        else:
+            cache_dir = Path(cache_dir)
+        
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_db = cache_dir / 'snotel_data_cache.db'
+        self._lock = threading.Lock()
+        
+        # Initialize database
+        self._init_db()
+        
+        logger.info(f"SNOTEL data cache initialized: {self.cache_db}")
+    
+    def _init_db(self):
+        """Initialize cache database schema."""
+        with self._lock:
+            conn = sqlite3.connect(str(self.cache_db), timeout=30.0)
+            try:
+                # Create table for station data
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS snotel_station_data (
+                        cache_key TEXT PRIMARY KEY,
+                        station_id TEXT NOT NULL,
+                        begin_date TEXT NOT NULL,
+                        end_date TEXT NOT NULL,
+                        data_json TEXT NOT NULL,
+                        cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                # Create index separately (SQLite doesn't support inline INDEX in CREATE TABLE)
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_station_dates 
+                    ON snotel_station_data(station_id, begin_date, end_date)
+                """)
+                conn.commit()
+            finally:
+                conn.close()
+    
+    def _make_cache_key(self, station_id: str, begin_date: str, end_date: str) -> str:
+        """Generate cache key from parameters."""
+        key_data = f"{station_id}:{begin_date}:{end_date}"
+        return hashlib.sha256(key_data.encode()).hexdigest()
+    
+    def get(self, station_id: str, begin_date: str, end_date: str) -> Optional[pd.DataFrame]:
+        """
+        Retrieve station data from cache.
+        
+        Args:
+            station_id: AWDB station ID
+            begin_date: Start date (YYYY-MM-DD)
+            end_date: End date (YYYY-MM-DD)
+            
+        Returns:
+            DataFrame with station data, or None if not in cache
+        """
+        cache_key = self._make_cache_key(station_id, begin_date, end_date)
+        
+        with self._lock:
+            conn = sqlite3.connect(str(self.cache_db), timeout=30.0)
+            try:
+                cursor = conn.execute("""
+                    SELECT data_json
+                    FROM snotel_station_data
+                    WHERE cache_key = ?
+                """, (cache_key,))
+                
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                
+                # Deserialize JSON to DataFrame
+                data_json = row[0]
+                import json
+                data_dict = json.loads(data_json)
+                df = pd.DataFrame(data_dict)
+                df['date'] = pd.to_datetime(df['date'])
+                return df
+            finally:
+                conn.close()
+    
+    def put(self, station_id: str, begin_date: str, end_date: str, data: pd.DataFrame):
+        """
+        Store station data in cache.
+        
+        Args:
+            station_id: AWDB station ID
+            begin_date: Start date (YYYY-MM-DD)
+            end_date: End date (YYYY-MM-DD)
+            data: DataFrame with station data
+        """
+        cache_key = self._make_cache_key(station_id, begin_date, end_date)
+        
+        # Serialize DataFrame to JSON
+        import json
+        # Convert date column to string for JSON serialization
+        data_copy = data.copy()
+        if 'date' in data_copy.columns:
+            data_copy['date'] = data_copy['date'].dt.strftime('%Y-%m-%d')
+        data_json = json.dumps(data_copy.to_dict('records'))
+        
+        with self._lock:
+            conn = sqlite3.connect(str(self.cache_db), timeout=30.0)
+            try:
+                conn.execute("""
+                    INSERT OR REPLACE INTO snotel_station_data
+                    (cache_key, station_id, begin_date, end_date, data_json)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (cache_key, station_id, begin_date, end_date, data_json))
+                conn.commit()
+            finally:
+                conn.close()
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Get cache statistics."""
+        with self._lock:
+            conn = sqlite3.connect(str(self.cache_db), timeout=30.0)
+            try:
+                cursor = conn.execute("SELECT COUNT(*) FROM snotel_station_data")
+                total_entries = cursor.fetchone()[0]
+                
+                db_size = self.cache_db.stat().st_size if self.cache_db.exists() else 0
+                total_size_mb = db_size / (1024 * 1024)
+                
+                return {
+                    'total_entries': total_entries,
+                    'total_size_mb': round(total_size_mb, 2)
+                }
+            finally:
+                conn.close()
+
+
 class AWDBClient:
     """Client for accessing SNOTEL snow data using AWDB REST API"""
     
@@ -1431,12 +1924,36 @@ class AWDBClient:
     _warned_api_failures = set()  # Set of station_ids that have failed API calls
     _warning_lock = None  # Will be initialized on first use for thread safety
     
-    def __init__(self, data_dir: Optional[Path] = None):
+    def __init__(self, data_dir: Optional[Path] = None, use_cache: bool = True, cache_historical_only: bool = True):
+        """
+        Initialize AWDB client.
+        
+        Args:
+            data_dir: Data directory (defaults to "data")
+            use_cache: If True, use persistent cache for historical data (default: True)
+            cache_historical_only: If True, only cache data older than 30 days (default: True)
+                                   This allows live data for inference while caching historical training data
+        """
         self.data_dir = Path(data_dir) if data_dir else Path("data")
         self.cache_dir = self.data_dir / "cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.station_cache_path = self.cache_dir / "snotel_stations_wyoming.geojson"
         self._stations_gdf = None
+        
+        self.use_cache = use_cache
+        self.cache_historical_only = cache_historical_only
+        
+        # Initialize persistent cache if enabled
+        if self.use_cache:
+            self.data_cache = SNOTELDataCache(cache_dir=self.cache_dir)
+            cache_stats = self.data_cache.get_stats()
+            logger.info(
+                f"SNOTEL data cache enabled: {cache_stats['total_entries']:,} entries "
+                f"({cache_stats['total_size_mb']:.2f} MB)"
+            )
+        else:
+            self.data_cache = None
+            logger.info("SNOTEL data cache disabled")
         
         # Two-level caching:
         # 1. Station data cache: station_id -> DataFrame with date range data
@@ -1444,7 +1961,7 @@ class AWDBClient:
         #    We cache by station ID and date range to minimize API calls
         # 2. Request cache: (lat, lon, date) -> final result dict
         #    This provides fast lookup for exact same location/date queries
-        self.station_data_cache = {}  # Cache station data: {station_id: DataFrame}
+        self.station_data_cache = {}  # In-memory cache: {station_id: DataFrame}
         self.request_cache = {}  # Cache final results: {(lat, lon, date_str): result_dict}
         
         # Cache size limits to prevent unbounded memory growth
@@ -1509,9 +2026,28 @@ class AWDBClient:
                 'activeOnly': 'true',
             }
             
-            response = requests.get(f"{self.AWDB_BASE_URL}/stations", params=params, timeout=30)
-            response.raise_for_status()
-            stations_data = response.json()
+            # Retry logic for connection errors
+            max_retries = 3
+            base_delay = 2.0
+            for attempt in range(max_retries + 1):
+                try:
+                    response = requests.get(f"{self.AWDB_BASE_URL}/stations", params=params, timeout=30)
+                    response.raise_for_status()
+                    stations_data = response.json()
+                    break  # Success, exit retry loop
+                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                    if attempt < max_retries:
+                        delay = base_delay * (2 ** attempt)  # Exponential backoff: 2s, 4s, 8s
+                        logger.warning(f"Connection error loading stations (attempt {attempt + 1}/{max_retries + 1}), retrying in {delay:.1f}s...")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        # Final attempt failed
+                        logger.error(f"Failed to load stations after {max_retries + 1} attempts: {e}")
+                        raise
+                except requests.exceptions.HTTPError as e:
+                    # Non-retryable HTTP errors (4xx, etc.) - raise immediately
+                    raise
             
             if not stations_data:
                 logger.warning("No Wyoming SNOTEL stations found in AWDB API")
@@ -1572,27 +2108,13 @@ class AWDBClient:
         """
         Load SNOTEL station locations from AWDB REST API.
         
-        Uses local cache if available and recent (within 24 hours), otherwise
-        fetches fresh station data from AWDB API. This ensures we have the latest
-        active stations while avoiding redundant API calls during parallel processing.
+        Uses local cache if available. For historical data processing, the cache
+        never expires (station locations don't change). For inference, we may want
+        to refresh to get newly activated stations, but for training data this is
+        not necessary.
         """
-        import time
-        from datetime import datetime, timedelta
-        
-        # Check if cache file exists and is recent (less than 24 hours old)
-        cache_valid = False
+        # Always try to load from cache first (for historical data, cache is permanent)
         if self.station_cache_path.exists():
-            try:
-                cache_age = time.time() - self.station_cache_path.stat().st_mtime
-                cache_age_hours = cache_age / 3600
-                if cache_age_hours < 24:
-                    cache_valid = True
-                    logger.debug(f"Station cache file is {cache_age_hours:.1f} hours old, using cache")
-            except Exception as e:
-                logger.debug(f"Could not check cache file age: {e}")
-        
-        if cache_valid:
-            # Load from cache
             try:
                 import geopandas as gpd
                 logger.debug(f"Loading Wyoming SNOTEL stations from cache ({self.station_cache_path.name})...")
@@ -1603,11 +2125,25 @@ class AWDBClient:
                 logger.warning(f"Failed to load stations from cache: {e}, fetching from API")
                 # Fall through to API fetch
         
-        # Cache doesn't exist or is stale, fetch from API
+        # Cache doesn't exist, fetch from API (with retry for connection errors)
         logger.info("Loading Wyoming SNOTEL stations from AWDB API...")
-        if not self._load_stations_from_awdb():
-            logger.warning("Failed to load stations from AWDB API, falling back to elevation estimates")
-            self._stations_gdf = None
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if self._load_stations_from_awdb():
+                    return  # Success
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if attempt < max_retries - 1:
+                    delay = 2.0 * (2 ** attempt)  # Exponential backoff: 2s, 4s, 8s
+                    logger.warning(f"Connection error loading stations (attempt {attempt + 1}/{max_retries}), retrying in {delay:.1f}s...")
+                    time.sleep(delay)
+                    continue
+                else:
+                    logger.error(f"Failed to load stations after {max_retries} attempts: {e}")
+        
+        # All retries failed
+        logger.warning("Failed to load stations from AWDB API, falling back to elevation estimates")
+        self._stations_gdf = None
     
     def _find_nearest_station(self, lat: float, lon: float, max_distance_km: float = 100.0):
         """
@@ -1717,7 +2253,7 @@ class AWDBClient:
         
         if station is None:
             # No station nearby, use elevation-based estimate
-            result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
+            result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft, station_distance_km=None)
             self.request_cache[cache_key] = result
             self._trim_caches()  # Prevent unbounded growth
             return result
@@ -1729,7 +2265,7 @@ class AWDBClient:
             if station_id is None or pd.isna(station_id):
                 # Station not mapped to AWDB station ID
                 logger.debug(f"Station {station['name']} has no AWDB station ID, using elevation estimate")
-                result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
+                result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft, station_distance_km=station.get("distance_km"))
                 self.request_cache[cache_key] = result
                 self._trim_caches()  # Prevent unbounded growth
                 return result
@@ -1746,27 +2282,48 @@ class AWDBClient:
             begin_date = (date - timedelta(days=30)).strftime("%Y-%m-%d")
             end_date = (date + timedelta(days=30)).strftime("%Y-%m-%d")
             
-            if station_cache_key in self.station_data_cache:
+            # Check if this is historical data (older than 30 days) for caching
+            is_historical = (datetime.now() - date).days > 30
+            
+            # Check persistent cache first (if enabled and historical)
+            df = None
+            if self.use_cache and self.data_cache and is_historical:
+                df = self.data_cache.get(station_id, begin_date, end_date)
+                if df is not None:
+                    logger.debug(f"Using persistent cache for station {station['name']} (station_id {station_id})")
+                    # Also store in in-memory cache for faster access
+                    self.station_data_cache[station_cache_key] = df
+            
+            # Check in-memory cache if persistent cache didn't have it
+            if df is None and station_cache_key in self.station_data_cache:
                 # Check if cached data covers the requested date
-                df = self.station_data_cache[station_cache_key]
-                df_dates = pd.to_datetime(df['date'])
+                df = self.station_data_cache[station_cache_key].copy()  # Make a copy to avoid modifying cached data
+                # Ensure date column is datetime
+                df['date'] = pd.to_datetime(df['date'])
+                df_dates = df['date']
                 if df_dates.min() <= pd.Timestamp(date) <= df_dates.max():
                     # Use cached data
-                    logger.debug(f"Using cached data for station {station['name']} (station_id {station_id})")
+                    logger.debug(f"Using in-memory cache for station {station['name']} (station_id {station_id})")
                 else:
                     # Cached data doesn't cover this date, fetch new data
                     logger.debug(f"Cached data for station {station['name']} doesn't cover {date_str}, fetching from API")
-                    df = self._fetch_station_data_from_awdb(station_id, begin_date, end_date)
-                    if df is not None:
-                        self.station_data_cache[station_cache_key] = df
-                        self._trim_caches()  # Prevent unbounded growth
-            else:
-                # Need to fetch station data
+                    df = None  # Will fetch below
+            
+            # Fetch from API if not in cache
+            if df is None:
                 logger.debug(f"Fetching data for station {station['name']} (station_id {station_id}) from AWDB API")
                 df = self._fetch_station_data_from_awdb(station_id, begin_date, end_date)
                 if df is not None:
+                    # Ensure date column is datetime before caching
+                    df['date'] = pd.to_datetime(df['date'])
+                    # Store in in-memory cache
                     self.station_data_cache[station_cache_key] = df
                     self._trim_caches()  # Prevent unbounded growth
+                    
+                    # Store in persistent cache if enabled and historical
+                    if self.use_cache and self.data_cache and is_historical:
+                        self.data_cache.put(station_id, begin_date, end_date, df)
+                        logger.debug(f"Cached station {station['name']} data for future use")
             
             if df is None or len(df) == 0:
                 # Only warn once per station to avoid log spam (shared across all instances)
@@ -1775,12 +2332,15 @@ class AWDBClient:
                     if warning_key not in AWDBClient._warned_stations:
                         logger.warning(f"No AWDB data available for station {station['name']} (station_id {station_id})")
                         AWDBClient._warned_stations.add(warning_key)
-                result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
+                result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft, station_distance_km=station.get("distance_km"))
                 self.request_cache[cache_key] = result
                 return result
             
+            # Ensure date column is datetime (should already be, but ensure it for safety)
+            if not pd.api.types.is_datetime64_any_dtype(df['date']):
+                df['date'] = pd.to_datetime(df['date'])
+            
             # Filter to the specific date
-            df['date'] = pd.to_datetime(df['date'])
             date_data = df[df['date'].dt.date == date.date()]
             
             if len(date_data) == 0:
@@ -1800,7 +2360,7 @@ class AWDBClient:
                     if warning_key not in AWDBClient._warned_stations:
                         logger.warning(f"No AWDB data available for station {station['name']} (station_id {station_id}) near {date_str}")
                         AWDBClient._warned_stations.add(warning_key)
-                result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
+                result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft, station_distance_km=station.get("distance_km"))
                 self.request_cache[cache_key] = result
                 return result
             
@@ -1843,7 +2403,9 @@ class AWDBClient:
             logger.warning(f"Error retrieving SNOTEL data via AWDB API: {e}, using elevation estimate")
             logger.debug(f"Traceback: {traceback.format_exc()}")
             # Pass elevation if available for better estimation
-            result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft)
+            # Include station distance if station was found (station variable may exist in outer scope)
+            station_dist = station.get("distance_km") if station is not None else None
+            result = self._estimate_snow_from_elevation(lat, lon, date, elevation_ft=elevation_ft, station_distance_km=station_dist)
             self.request_cache[cache_key] = result
             self._trim_caches()  # Prevent unbounded growth
             return result
@@ -2018,7 +2580,8 @@ class AWDBClient:
             return None
     
     def _estimate_snow_from_elevation(self, lat: float, lon: float, 
-                                     date: datetime, elevation_ft: Optional[float] = None) -> Dict:
+                                     date: datetime, elevation_ft: Optional[float] = None,
+                                     station_distance_km: Optional[float] = None) -> Dict:
         """
         Estimate snow based on elevation and date (fallback).
         
@@ -2028,6 +2591,8 @@ class AWDBClient:
             date: Date for estimation
             elevation_ft: Optional elevation in feet. If None, attempts to sample from DEM,
                          otherwise defaults to 8500 ft.
+            station_distance_km: Optional distance to nearest SNOTEL station in km.
+                                If provided, included in result for data quality tracking.
         """
         # Use provided elevation, or try to sample from DEM, or use default
         if elevation_ft is not None:
@@ -2052,7 +2617,8 @@ class AWDBClient:
             "depth": snow_depth,
             "swe": snow_depth * 0.25,
             "crust": False,
-            "station": None
+            "station": None,
+            "station_distance_km": station_distance_km
         }
     
     def _get_elevation_from_dem(self, lat: float, lon: float) -> float:

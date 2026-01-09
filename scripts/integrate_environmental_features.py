@@ -18,7 +18,7 @@ Examples:
     python scripts/integrate_environmental_features.py
     
     # Process specific dataset (auto-detects optimal workers and batch size based on hardware)
-    python scripts/integrate_environmental_features.py data/processed/combined_north_bighorn_presence_absence.csv
+    python scripts/integrate_environmental_features.py data/processed/combined_northern_bighorn_presence_absence.csv
     
     # Process with specific number of workers
     python scripts/integrate_environmental_features.py data/processed/combined_national_refuge_presence_absence.csv --workers 4
@@ -339,30 +339,45 @@ def _process_sequential(df, builder, date_col, batch_size, limit, dataset_path, 
             lat, lon = row['latitude'], row['longitude']
             
             # Get date if available
-            date_str = "2024-01-01"  # Default
+            date_str = "2024-01-01"  # Default for feature enrichment (not for month assignment)
+            used_default_date = True
             if date_col and pd.notna(row[date_col]):
-                date_str = str(row[date_col])
-                if ' ' in date_str:
-                    date_str = date_str.split(' ')[0]
+                date_val = str(row[date_col]).strip()
+                # Check if date string is valid (not empty, not 'nan', not 'none')
+                if date_val and date_val.lower() not in ['nan', 'none', '']:
+                    if ' ' in date_val:
+                        date_val = date_val.split(' ')[0]
+                    # Try to validate it's a parseable date
+                    try:
+                        from datetime import datetime
+                        datetime.strptime(date_val, "%Y-%m-%d")  # Validate format
+                        date_str = date_val
+                        used_default_date = False  # We have an actual valid date
+                    except (ValueError, TypeError):
+                        # Invalid date format - use default for feature enrichment only
+                        pass
             
-            # Build context
+            # Build context (use default date for feature enrichment even if date is missing)
             context = builder.build_context(
                 location={"lat": lat, "lon": lon},
                 date=date_str
             )
             
-            # Extract year and month from date_str for absence rows that don't have them
-            # This ensures temporal metadata is populated for all rows
-            try:
-                from datetime import datetime
-                date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-                if 'year' in df.columns and pd.isna(row.get('year')):
-                    df.at[idx, 'year'] = date_obj.year
-                if 'month' in df.columns and pd.isna(row.get('month')):
-                    df.at[idx, 'month'] = date_obj.month
-            except (ValueError, TypeError):
-                # If date parsing fails, leave year/month as is
-                pass
+            # Extract year, month, and day_of_year from date_str ONLY if it's an actual date, not default
+            # This ensures temporal metadata is populated from real dates, not defaults
+            if not used_default_date:
+                try:
+                    from datetime import datetime
+                    date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+                    if 'year' in df.columns and pd.isna(row.get('year')):
+                        df.at[idx, 'year'] = date_obj.year
+                    if 'month' in df.columns and pd.isna(row.get('month')):
+                        df.at[idx, 'month'] = date_obj.month
+                    if 'day_of_year' in df.columns and pd.isna(row.get('day_of_year')):
+                        df.at[idx, 'day_of_year'] = date_obj.timetuple().tm_yday
+                except (ValueError, TypeError):
+                    # If date parsing fails, leave year/month/day_of_year as is
+                    pass
             
             # Update environmental columns (static + temporal)
             env_columns = [
@@ -506,69 +521,100 @@ def _process_parallel(df, data_dir, date_col, batch_size, limit, dataset_path, n
         future_to_batch = {executor.submit(process_batch, batch): i for i, batch in enumerate(batches)}
         logger.info(f"All {len(future_to_batch)} batches submitted")
         
-        # Process results as they complete
-        iterator = as_completed(future_to_batch)
-        if HAS_TQDM:
-            iterator = tqdm(iterator, total=len(batches), desc="Processing batches")
+        # Start background thread to log periodic progress
+        import threading
+        progress_stop = threading.Event()
+        progress_stats = {'batch_count': 0, 'start_time': time.time(), 'last_progress_time': time.time()}
         
-        batch_count = 0
-        start_time = time.time()
-        last_progress_time = start_time
+        def log_periodic_progress():
+            """Background thread to log progress every 2 minutes"""
+            PROGRESS_INTERVAL = 120  # Log every 2 minutes
+            while not progress_stop.is_set():
+                time.sleep(PROGRESS_INTERVAL)
+                if progress_stop.is_set():
+                    break
+                elapsed = time.time() - progress_stats['start_time']
+                completed = progress_stats['batch_count']
+                total = len(batches)
+                logger.info(f"⏳ Processing in progress... ({completed}/{total} batches completed, "
+                          f"{elapsed/60:.1f} min elapsed)")
+                progress_stats['last_progress_time'] = time.time()
         
-        for future in iterator:
-            try:
-                # Add timeout to detect stuck workers
-                # Use dynamic timeout based on batch size
-                batch_idx = future_to_batch[future]
-                batch_size = len(batches[batch_idx][0])
-                batch_timeout = max(120, min(600, int(batch_size / 1000 * 60)))
-                
-                logger.debug(f"Waiting for batch {batch_idx} (timeout: {batch_timeout}s)")
-                results = future.result(timeout=batch_timeout)
-                for idx, context in results:
-                    if context is None:
-                        error_count += 1
-                    else:
-                        # Update year and month if they were extracted from date
-                        if '_year' in context and context['_year'] is not None:
-                            if 'year' in df.columns and pd.isna(df.at[idx, 'year']):
-                                df.at[idx, 'year'] = context['_year']
-                        if '_month' in context and context['_month'] is not None:
-                            if 'month' in df.columns and pd.isna(df.at[idx, 'month']):
-                                df.at[idx, 'month'] = context['_month']
-                        
-                        # Update environmental columns
-                        for col in env_columns:
-                            if col in context:
-                                df.at[idx, col] = context[col]
-                        updated_count += 1
-                
-                # Log batch completion with timing
-                batch_count += 1
-                elapsed = time.time() - start_time
-                avg_time_per_batch = elapsed / batch_count if batch_count > 0 else 0
-                remaining_batches = len(batches) - batch_count
-                estimated_remaining = avg_time_per_batch * remaining_batches
-                
-                logger.info(f"✓ Batch {batch_count}/{len(batches)} completed "
-                          f"({batch_count/len(batches)*100:.0f}%) - "
-                          f"~{estimated_remaining/60:.1f} min remaining")
-                          
-            except TimeoutError:
-                batch_idx = future_to_batch[future]
-                batch_size_actual = len(batches[batch_idx][0])
-                error_count += batch_size_actual
-                logger.error(f"Batch {batch_idx} timed out after 5 minutes (likely stuck)")
-                logger.error(f"  This batch had {batch_size_actual} rows")
-                logger.error(f"  Consider reducing --workers or checking for issues")
-            except Exception as e:
-                batch_idx = future_to_batch[future]
-                batch_size_actual = len(batches[batch_idx][0])
-                error_count += batch_size_actual
-                logger.error(f"Error processing batch {batch_idx}: {e}")
-                logger.error(f"  This batch had {batch_size_actual} rows")
-                import traceback
-                logger.debug(traceback.format_exc())
+        progress_thread = threading.Thread(target=log_periodic_progress, daemon=True)
+        progress_thread.start()
+        
+        try:
+            # Process results as they complete
+            iterator = as_completed(future_to_batch)
+            if HAS_TQDM:
+                iterator = tqdm(iterator, total=len(batches), desc="Processing batches")
+            
+            batch_count = 0
+            start_time = time.time()
+            
+            for future in iterator:
+                try:
+                    # Add timeout to detect stuck workers
+                    # Use dynamic timeout based on batch size
+                    batch_idx = future_to_batch[future]
+                    batch_size = len(batches[batch_idx][0])
+                    batch_timeout = max(120, min(600, int(batch_size / 1000 * 60)))
+                    
+                    logger.debug(f"Waiting for batch {batch_idx} (timeout: {batch_timeout}s)")
+                    results = future.result(timeout=batch_timeout)
+                    
+                    for idx, context in results:
+                        if context is None:
+                            error_count += 1
+                        else:
+                            # Update year, month, and day_of_year if they were extracted from date
+                            if '_year' in context and context['_year'] is not None:
+                                if 'year' in df.columns and pd.isna(df.at[idx, 'year']):
+                                    df.at[idx, 'year'] = context['_year']
+                            if '_month' in context and context['_month'] is not None:
+                                if 'month' in df.columns and pd.isna(df.at[idx, 'month']):
+                                    df.at[idx, 'month'] = context['_month']
+                            if '_day_of_year' in context and context['_day_of_year'] is not None:
+                                if 'day_of_year' in df.columns and pd.isna(df.at[idx, 'day_of_year']):
+                                    df.at[idx, 'day_of_year'] = context['_day_of_year']
+                            
+                            # Update environmental columns
+                            for col in env_columns:
+                                if col in context:
+                                    df.at[idx, col] = context[col]
+                            updated_count += 1
+                    
+                    # Log batch completion with timing
+                    batch_count += 1
+                    progress_stats['batch_count'] = batch_count  # Update for progress thread
+                    elapsed = time.time() - start_time
+                    avg_time_per_batch = elapsed / batch_count if batch_count > 0 else 0
+                    remaining_batches = len(batches) - batch_count
+                    estimated_remaining = avg_time_per_batch * remaining_batches
+                    
+                    logger.info(f"✓ Batch {batch_count}/{len(batches)} completed "
+                              f"({batch_count/len(batches)*100:.0f}%) - "
+                              f"~{estimated_remaining/60:.1f} min remaining")
+                              
+                except TimeoutError:
+                    batch_idx = future_to_batch[future]
+                    batch_size_actual = len(batches[batch_idx][0])
+                    error_count += batch_size_actual
+                    logger.error(f"Batch {batch_idx} timed out after 5 minutes (likely stuck)")
+                    logger.error(f"  This batch had {batch_size_actual} rows")
+                    logger.error(f"  Consider reducing --workers or checking for issues")
+                except Exception as e:
+                    batch_idx = future_to_batch[future]
+                    batch_size_actual = len(batches[batch_idx][0])
+                    error_count += batch_size_actual
+                    logger.error(f"Error processing batch {batch_idx}: {e}")
+                    logger.error(f"  This batch had {batch_size_actual} rows")
+                    import traceback
+                    logger.debug(traceback.format_exc())
+        finally:
+            # Stop progress logging thread
+            progress_stop.set()
+            progress_thread.join(timeout=1)
     
     return updated_count, error_count
 
@@ -601,6 +647,7 @@ def process_batch(args):
     results = []
     processed = 0
     batch_start_time = time.time()
+    last_log_time = batch_start_time  # Track last log time for time-based logging
     
     worker_logger.info(f"Worker starting batch with {len(batch_data)} rows")
     
@@ -613,39 +660,64 @@ def process_batch(args):
             lon = float(row_dict['longitude'])
             
             # Get date if available
-            date_str = "2024-01-01"  # Default
+            date_str = "2024-01-01"  # Default for feature enrichment (not for month assignment)
+            used_default_date = True
             if date_col and date_col in row_dict:
                 date_val = row_dict[date_col]
                 # Handle None, NaN, and other non-string values
-                if date_val is not None and str(date_val).lower() not in ['nan', 'none', '']:
-                    date_str = str(date_val)
-                    if ' ' in date_str:
-                        date_str = date_str.split(' ')[0]
+                if date_val is not None:
+                    date_val_str = str(date_val).strip()
+                    if date_val_str and date_val_str.lower() not in ['nan', 'none', '']:
+                        if ' ' in date_val_str:
+                            date_val_str = date_val_str.split(' ')[0]
+                        # Try to validate it's a parseable date
+                        try:
+                            from datetime import datetime
+                            datetime.strptime(date_val_str, "%Y-%m-%d")  # Validate format
+                            date_str = date_val_str
+                            used_default_date = False  # We have an actual valid date
+                        except (ValueError, TypeError):
+                            # Invalid date format - use default for feature enrichment only
+                            pass
             
-            # Build context
+            # Build context (use default date for feature enrichment even if date is missing)
             context = builder.build_context(
                 location={"lat": lat, "lon": lon},
                 date=date_str
             )
             
-            # Extract year and month from date_str and add to context
-            # This will be used to update year/month columns for absence rows
-            try:
-                from datetime import datetime
-                date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-                context['_year'] = date_obj.year
-                context['_month'] = date_obj.month
-            except (ValueError, TypeError):
-                # If date parsing fails, leave year/month as is
+            # Extract year, month, and day_of_year from date_str ONLY if it's an actual date, not default
+            # This will be used to update year/month/day_of_year columns for absence rows
+            # But we only set these if we have a real date, not a default
+            if not used_default_date:
+                try:
+                    from datetime import datetime
+                    date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+                    context['_year'] = date_obj.year
+                    context['_month'] = date_obj.month
+                    context['_day_of_year'] = date_obj.timetuple().tm_yday
+                except (ValueError, TypeError):
+                    # If date parsing fails, leave year/month/day_of_year as is
+                    context['_year'] = None
+                    context['_month'] = None
+                    context['_day_of_year'] = None
+            else:
+                # If we used default date, don't set temporal metadata (keep it None)
                 context['_year'] = None
                 context['_month'] = None
+                context['_day_of_year'] = None
             
             results.append((idx, context))
             processed += 1
             
-            # Log progress every 1000 rows to show worker is alive
-            if processed % 1000 == 0:
-                elapsed = time.time() - batch_start_time
+            # Log progress every 500 rows OR every 2 minutes (whichever comes first) to show worker is alive
+            # This ensures progress is visible even during slow API calls
+            current_time = time.time()
+            elapsed = current_time - batch_start_time
+            should_log_by_count = processed % 500 == 0
+            should_log_by_time = (current_time - last_log_time) >= 120  # Log every 2 minutes
+            
+            if should_log_by_count or should_log_by_time:
                 rate = processed / elapsed if elapsed > 0 else 0
                 remaining = len(batch_data) - processed
                 eta = remaining / rate if rate > 0 else 0
@@ -653,6 +725,7 @@ def process_batch(args):
                 worker_logger.info(f"Worker: {processed:,}/{len(batch_data):,} rows "
                                  f"({processed/len(batch_data)*100:.1f}%) - "
                                  f"{rate:.1f} rows/sec - ~{eta/60:.1f} min remaining")
+                last_log_time = current_time
                 
         except Exception as e:
             worker_logger.warning(f"Error processing row {idx}: {e}")
@@ -740,8 +813,44 @@ def update_dataset(dataset_path: Path, data_dir: Path, batch_size: int = 1000, l
     
     if date_col:
         logger.info(f"Using date column: {date_col}")
+        
+        # Ensure temporal columns exist and populate them from timestamp if available
+        # This ensures year, month, and day_of_year are available for all rows
+        if 'year' not in df.columns:
+            df['year'] = None
+        if 'month' not in df.columns:
+            df['month'] = None
+        if 'day_of_year' not in df.columns:
+            df['day_of_year'] = None
+        
+        # Extract year, month, and day_of_year from timestamp if not already populated
+        # This handles rows that have timestamps but missing temporal metadata
+        try:
+            pd_date = pd.to_datetime(df[date_col], errors='coerce')
+            mask_notna = pd_date.notna()
+            
+            if df['year'].isna().any():
+                df.loc[mask_notna & df['year'].isna(), 'year'] = pd_date[mask_notna & df['year'].isna()].dt.year
+            if df['month'].isna().any():
+                df.loc[mask_notna & df['month'].isna(), 'month'] = pd_date[mask_notna & df['month'].isna()].dt.month
+            if df['day_of_year'].isna().any():
+                df.loc[mask_notna & df['day_of_year'].isna(), 'day_of_year'] = pd_date[mask_notna & df['day_of_year'].isna()].dt.dayofyear
+                
+            logger.info(f"Extracted temporal columns from {date_col}: "
+                       f"year={df['year'].notna().sum():,}, "
+                       f"month={df['month'].notna().sum():,}, "
+                       f"day_of_year={df['day_of_year'].notna().sum():,}")
+        except Exception as e:
+            logger.warning(f"Could not extract temporal columns from {date_col}: {e}")
     else:
         logger.warning("No date column found, using default date")
+        # Still create the columns even if no date column (for consistency)
+        if 'year' not in df.columns:
+            df['year'] = None
+        if 'month' not in df.columns:
+            df['month'] = None
+        if 'day_of_year' not in df.columns:
+            df['day_of_year'] = None
     
     # Add/update environmental features
     logger.info(f"\nAdding environmental features to {len(df):,} points...")
