@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import pandas as pd
+import numpy as np
 from pathlib import Path
 import sys
 import importlib.util
@@ -22,7 +23,7 @@ from typing import List, Set, Optional
 # Metadata columns to exclude from training (dataset-specific identifiers and source info)
 METADATA_COLUMNS = {
     # Identifiers
-    'route_id', 'id', 'Elk_ID', 'elk_id',
+    'route_id', 'id', 'Elk_ID', 'elk_id', 'point_index',  # point_index: route-specific metadata (only present for LineString routes, missing for Point geometries, CSV files, and absence data)
     # Area-specific metadata
     'distance_to_area_048_km', 'inside_area_048',
     # Source temporal metadata
@@ -35,21 +36,25 @@ METADATA_COLUMNS = {
     'absence_strategy',
     # Feedground info (dataset-specific)
     'feedground',
-    # Day of year (redundant with month, could cause leakage)
-    'day_of_year',
-    # Date (redundant with year/month, could cause leakage)
+    # Date (redundant with year/month/day_of_year, could cause leakage)
+    # Note: day_of_year is NOT excluded by default - see OPTIONAL_TEMPORAL_COLUMNS
     'date',
     # Dataset name (if present)
     'dataset_name', 'dataset',
     # SNOTEL station name (categorical with high cardinality, risk of overfitting)
     # Note: snow_data_source and snow_station_distance_km are kept as features
-    'snow_station_name'
+    'snow_station_name',
+    # Predator/wildlife data quality and activity metrics (temporarily excluded until better modeling approach)
+    'wolf_data_quality', 'bear_data_quality', 'bear_activity_distance_miles', 'wolves_per_1000_elk',
+    # Pregnancy rate (temporarily excluded until better modeling approach)
+    'pregnancy_rate'
 }
 
 # Columns that might be useful but should be evaluated carefully
-# (year, month could be useful for temporal patterns, but might encode dataset info)
+# (year, month, day_of_year could be useful for temporal patterns, but might encode dataset info)
+# Note: day_of_year should be encoded cyclically (sin/cos) if used to avoid treating day 365 and day 1 as very different
 OPTIONAL_TEMPORAL_COLUMNS = {
-    'year', 'month'  # Keep by default, but can exclude if causing leakage
+    'year', 'month', 'day_of_year'  # Keep by default, but can exclude if causing leakage
 }
 
 # Core features that should always be included
@@ -60,12 +65,9 @@ CORE_FEATURES = {
     'water_distance_miles', 'water_reliability',
     'road_distance_miles', 'trail_distance_miles',
     'security_habitat_percent',
-    'wolves_per_1000_elk', 'wolf_data_quality',
-    'bear_activity_distance_miles', 'bear_data_quality',
     'snow_depth_inches', 'snow_water_equiv_inches', 'snow_crust_detected',
     'temperature_f', 'precip_last_7_days_inches', 'cloud_cover_percent',
-    'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi',
-    'pregnancy_rate'
+    'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi'
 }
 
 
@@ -75,7 +77,7 @@ def get_feature_columns(df: pd.DataFrame, exclude_temporal: bool = False) -> Lis
     
     Args:
         df: Input DataFrame
-        exclude_temporal: If True, exclude year/month columns
+        exclude_temporal: If True, exclude year/month/day_of_year columns
     
     Returns:
         List of column names to use as features
@@ -106,7 +108,8 @@ def get_feature_columns(df: pd.DataFrame, exclude_temporal: bool = False) -> Lis
 def prepare_training_dataset(
     input_file: Path,
     output_file: Path,
-    exclude_temporal: bool = False
+    exclude_temporal: bool = False,
+    include_day_of_year: bool = True
 ) -> pd.DataFrame:
     """
     Prepare a training-ready dataset by excluding metadata columns.
@@ -114,7 +117,8 @@ def prepare_training_dataset(
     Args:
         input_file: Path to input CSV file
         output_file: Path to output CSV file
-        exclude_temporal: If True, exclude year/month columns
+        exclude_temporal: If True, exclude year/month/day_of_year columns
+        include_day_of_year: If True, include day_of_year (encoded cyclically if present)
     
     Returns:
         Prepared DataFrame
@@ -123,15 +127,110 @@ def prepare_training_dataset(
     df = pd.read_csv(input_file)
     print(f"  Loaded {len(df):,} rows, {len(df.columns)} columns")
     
+    # Debug: Check if day_of_year exists
+    if 'day_of_year' in df.columns:
+        n_valid_doy = df['day_of_year'].notna().sum()
+        print(f"  Found day_of_year column with {n_valid_doy:,} valid values (out of {len(df):,})")
+    else:
+        print(f"  ⚠ day_of_year column not found in input file")
+    
     # Get feature columns
     feature_cols = get_feature_columns(df, exclude_temporal=exclude_temporal)
+    
+    # Handle day_of_year if present and requested
+    # Note: day_of_year may already be in feature_cols from get_feature_columns()
+    # We want to replace it with cyclical encoding
+    # Note: We allow day_of_year even if exclude_temporal is True, since it's cyclically encoded
+    if include_day_of_year and 'day_of_year' in df.columns:
+        # Check if day_of_year has valid values
+        valid_day_of_year = df['day_of_year'].notna()
+        n_valid = valid_day_of_year.sum()
+        
+        if n_valid > 0:
+            # Encode day_of_year cyclically (sin/cos) to handle circular nature
+            # This treats day 365 and day 1 as similar (both near year end/start)
+            # This is important because day 365 (Dec 31) and day 1 (Jan 1) are temporally close
+            df['day_of_year_sin'] = np.nan
+            df['day_of_year_cos'] = np.nan
+            df.loc[valid_day_of_year, 'day_of_year_sin'] = np.sin(
+                2 * np.pi * df.loc[valid_day_of_year, 'day_of_year'] / 365.25
+            )
+            df.loc[valid_day_of_year, 'day_of_year_cos'] = np.cos(
+                2 * np.pi * df.loc[valid_day_of_year, 'day_of_year'] / 365.25
+            )
+            
+            # Remove raw day_of_year from features (if present) and add cyclical encoding
+            if 'day_of_year' in feature_cols:
+                feature_cols.remove('day_of_year')
+            
+            # Add cyclical encoding (only if not already present)
+            # Use a set to avoid duplicates, then convert back to list
+            feature_cols_set = set(feature_cols)
+            feature_cols_set.add('day_of_year_sin')
+            feature_cols_set.add('day_of_year_cos')
+            feature_cols = list(feature_cols_set)
+            
+            # Verify columns were created in dataframe
+            if 'day_of_year_sin' in df.columns and 'day_of_year_cos' in df.columns:
+                print(f"  ✓ Added cyclical encoding for day_of_year (sin/cos) - {n_valid:,} valid values")
+            else:
+                print(f"  ⚠ ERROR: Failed to create day_of_year sin/cos columns in dataframe")
+        else:
+            print(f"  ⚠ day_of_year column exists but has no valid values ({len(df)} rows), skipping cyclical encoding")
+            # Remove day_of_year from features if it was added
+            if 'day_of_year' in feature_cols:
+                feature_cols.remove('day_of_year')
+    elif not include_day_of_year:
+        # Explicitly remove day_of_year if user requested exclusion
+        if 'day_of_year' in feature_cols:
+            feature_cols.remove('day_of_year')
+        if 'day_of_year_sin' in feature_cols:
+            feature_cols.remove('day_of_year_sin')
+        if 'day_of_year_cos' in feature_cols:
+            feature_cols.remove('day_of_year_cos')
+        print(f"  ✓ Excluded day_of_year as requested")
+    elif 'day_of_year' in df.columns and exclude_temporal:
+        # day_of_year will be excluded by get_feature_columns, but make sure sin/cos aren't there
+        if 'day_of_year_sin' in feature_cols:
+            feature_cols.remove('day_of_year_sin')
+        if 'day_of_year_cos' in feature_cols:
+            feature_cols.remove('day_of_year_cos')
     
     # Always include target
     if 'elk_present' not in feature_cols:
         feature_cols = ['elk_present'] + feature_cols
     
+    # Ensure all feature columns exist in dataframe (for debugging)
+    missing_cols = [col for col in feature_cols if col not in df.columns]
+    if missing_cols:
+        print(f"  ⚠ WARNING: Some feature columns are missing from dataframe: {missing_cols}")
+        feature_cols = [col for col in feature_cols if col in df.columns]
+    
+    # Verify day_of_year sin/cos are included if they should be
+    if include_day_of_year:
+        if 'day_of_year_sin' in df.columns and 'day_of_year_sin' not in feature_cols:
+            print(f"  ⚠ WARNING: day_of_year_sin exists in dataframe but not in feature_cols, adding it")
+            feature_cols.append('day_of_year_sin')
+        if 'day_of_year_cos' in df.columns and 'day_of_year_cos' not in feature_cols:
+            print(f"  ⚠ WARNING: day_of_year_cos exists in dataframe but not in feature_cols, adding it")
+            feature_cols.append('day_of_year_cos')
+    
     # Select only feature columns
     df_features = df[feature_cols].copy()
+    
+    # Verify day_of_year sin/cos are in output
+    if include_day_of_year:
+        if 'day_of_year_sin' in df_features.columns and 'day_of_year_cos' in df_features.columns:
+            n_valid = df_features['day_of_year_sin'].notna().sum()
+            n_total = len(df_features)
+            n_missing = n_total - n_valid
+            print(f"  ✓ Verified: day_of_year_sin and day_of_year_cos are in output")
+            print(f"    - Valid values: {n_valid:,} ({n_valid/n_total*100:.1f}%)")
+            if n_missing > 0:
+                print(f"    - Missing values: {n_missing:,} ({n_missing/n_total*100:.1f}%) - expected when source day_of_year is missing")
+        else:
+            print(f"  ⚠ WARNING: day_of_year sin/cos columns missing from output!")
+            print(f"     Available columns: {[c for c in df_features.columns if 'day' in c.lower()]}")
     
     # Report excluded columns
     excluded = set(df.columns) - set(feature_cols)
@@ -157,6 +256,7 @@ def prepare_all_datasets(
     processed_dir: Path = Path('data/processed'),
     features_dir: Path = Path('data/features'),
     exclude_temporal: bool = False,
+    include_day_of_year: bool = True,
     limit: Optional[int] = None
 ):
     """Prepare training features for all combined datasets."""
@@ -204,7 +304,12 @@ def prepare_all_datasets(
         print(f"{'='*70}")
         
         try:
-            prepare_training_dataset(input_file, output_file, exclude_temporal=exclude_temporal)
+            prepare_training_dataset(
+                input_file, 
+                output_file, 
+                exclude_temporal=exclude_temporal,
+                include_day_of_year=include_day_of_year
+            )
         except Exception as e:
             print(f"  ✗ Error: {e}")
             continue
@@ -269,14 +374,20 @@ def main():
 Examples:
   # Prepare a single dataset
   python scripts/prepare_training_features.py \\
-      data/processed/combined_north_bighorn_presence_absence.csv \\
-      data/features/north_bighorn_features.csv
+      data/processed/combined_northern_bighorn_presence_absence.csv \\
+      data/features/northern_bighorn_features.csv
   
   # Prepare all datasets
   python scripts/prepare_training_features.py --all-datasets
   
-  # Exclude temporal columns (year, month) to prevent data leakage
+  # Exclude temporal columns (year, month, day_of_year) to prevent data leakage
   python scripts/prepare_training_features.py --all-datasets --exclude-temporal
+  
+  # Include day_of_year with cyclical encoding (default, recommended)
+  python scripts/prepare_training_features.py --all-datasets
+  
+  # Exclude only day_of_year (keep year/month)
+  python scripts/prepare_training_features.py --all-datasets --exclude-day-of-year
         """
     )
     parser.add_argument(
@@ -301,7 +412,12 @@ Examples:
     parser.add_argument(
         '--exclude-temporal',
         action='store_true',
-        help='Exclude year/month columns to prevent potential data leakage'
+        help='Exclude year/month/day_of_year columns to prevent potential data leakage'
+    )
+    parser.add_argument(
+        '--exclude-day-of-year',
+        action='store_true',
+        help='Exclude day_of_year even if other temporal columns are kept (default: include day_of_year with cyclical encoding)'
     )
     parser.add_argument(
         '--processed-dir',
@@ -324,11 +440,14 @@ Examples:
     
     args = parser.parse_args()
     
+    include_day_of_year = not args.exclude_day_of_year
+    
     if args.all_datasets:
         prepare_all_datasets(
             processed_dir=args.processed_dir,
             features_dir=args.features_dir,
             exclude_temporal=args.exclude_temporal,
+            include_day_of_year=include_day_of_year,
             limit=args.limit
         )
     else:
@@ -338,7 +457,8 @@ Examples:
         prepare_training_dataset(
             args.input_file,
             args.output_file,
-            exclude_temporal=args.exclude_temporal
+            exclude_temporal=args.exclude_temporal,
+            include_day_of_year=include_day_of_year
         )
     
     return 0

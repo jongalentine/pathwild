@@ -53,7 +53,7 @@ def assess_training_readiness(dataset_path: Optional[Path] = None, test_mode: bo
         # When no specific dataset provided, look for both regular and test files
         # Prefer test files if they exist (indicates recent test run)
         base_datasets = {
-            'North Bighorn': 'north_bighorn',
+            'North Bighorn': 'northern_bighorn',
             'South Bighorn': 'southern_bighorn',
             'National Refuge': 'national_refuge',
             'Southern GYE': 'southern_gye'
