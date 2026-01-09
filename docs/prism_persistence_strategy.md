@@ -110,3 +110,4 @@ rm data/prism/*/prism_*_us_4km_20180513.*
 3. **Compression**: Compress old files to save disk space
 4. **S3 Backup**: Backup PRISM cache to S3 for team sharing
 
+
