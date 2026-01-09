@@ -114,10 +114,38 @@ class TestAWDBClient:
         
         assert "depth" in result
         assert "swe" in result
+        assert "station_distance_km" in result  # Should always be included
         assert result["crust"] is False
         assert result["depth"] > 0  # Winter should have snow
+        # When no station_distance_km provided, should be None
+        assert result["station_distance_km"] is None
         # At 8500 ft in winter: (8500 - 6000) / 100 = 25 inches
         assert result["depth"] == 25.0
+    
+    @pytest.mark.unit
+    def test_estimate_snow_from_elevation_includes_station_distance(self):
+        """Test that station_distance_km is included in estimate results when provided."""
+        client = AWDBClient()
+        
+        # Test with station distance provided
+        result_with_distance = client._estimate_snow_from_elevation(
+            43.0, -110.0, datetime(2026, 1, 15), 
+            elevation_ft=8500.0, 
+            station_distance_km=50.0
+        )
+        
+        # Should include station_distance_km
+        assert "station_distance_km" in result_with_distance
+        assert result_with_distance["station_distance_km"] == 50.0
+        
+        # Test without station distance (should be None)
+        result_no_distance = client._estimate_snow_from_elevation(
+            43.0, -110.0, datetime(2026, 1, 15), 
+            elevation_ft=8500.0
+        )
+        
+        assert "station_distance_km" in result_no_distance
+        assert result_no_distance["station_distance_km"] is None
     
     @pytest.mark.unit
     def test_estimate_snow_from_elevation_summer(self):

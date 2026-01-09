@@ -29,9 +29,16 @@ class TestPrepareTrainingFeatures:
             'route_id': [1, None, 2],
             'id': [100, 101, 102],
             'Elk_ID': ['E1', 'E2', 'E3'],
+            'point_index': [0, None, 1],  # Route-specific metadata
             'absence_strategy': [None, 'background', None],
             'distance_to_area_048_km': [10.5, 11.2, 9.8],
             'firstdate': ['2024-01-01', None, '2024-01-02'],
+            # Predator/wildlife columns (temporarily excluded)
+            'wolf_data_quality': [0.75, 0.5, 0.75],
+            'bear_data_quality': [0.65, 0.5, 0.65],
+            'bear_activity_distance_miles': [5.0, 5.0, 5.0],
+            'wolves_per_1000_elk': [2.0, 2.0, 2.0],
+            'pregnancy_rate': [0.85, 0.85, 0.85],
             # Environmental features (should be kept)
             'elevation': [2000.0, 2100.0, 2200.0],
             'slope_degrees': [5.0, 10.0, 15.0],
@@ -82,9 +89,16 @@ class TestPrepareTrainingFeatures:
         assert 'route_id' not in feature_cols
         assert 'id' not in feature_cols
         assert 'Elk_ID' not in feature_cols
+        assert 'point_index' not in feature_cols  # Route-specific metadata
         assert 'absence_strategy' not in feature_cols
         assert 'distance_to_area_048_km' not in feature_cols
         assert 'firstdate' not in feature_cols
+        # Should exclude predator/wildlife columns (temporarily excluded)
+        assert 'wolf_data_quality' not in feature_cols
+        assert 'bear_data_quality' not in feature_cols
+        assert 'bear_activity_distance_miles' not in feature_cols
+        assert 'wolves_per_1000_elk' not in feature_cols
+        assert 'pregnancy_rate' not in feature_cols
         
         # Should include environmental features
         assert 'elevation' in feature_cols
@@ -131,7 +145,14 @@ class TestPrepareTrainingFeatures:
         assert 'route_id' not in df_features.columns
         assert 'id' not in df_features.columns
         assert 'Elk_ID' not in df_features.columns
+        assert 'point_index' not in df_features.columns
         assert 'absence_strategy' not in df_features.columns
+        # Check predator/wildlife columns are excluded
+        assert 'wolf_data_quality' not in df_features.columns
+        assert 'bear_data_quality' not in df_features.columns
+        assert 'bear_activity_distance_miles' not in df_features.columns
+        assert 'wolves_per_1000_elk' not in df_features.columns
+        assert 'pregnancy_rate' not in df_features.columns
         
         # Check features are present
         assert 'elevation' in df_features.columns

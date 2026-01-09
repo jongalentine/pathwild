@@ -1092,3 +1092,130 @@ class TestBatchProcessing:
         finally:
             sys.argv = original_argv
 
+
+class TestMonthAssignment:
+    """Test that month is not incorrectly set from default dates."""
+    
+    def test_month_not_set_from_default_date(self, tmp_path):
+        """Test that rows without dates don't get month=1 (January) from default date."""
+        # Create dataset with rows missing dates (simulating absence data)
+        df = pd.DataFrame({
+            'latitude': [43.0, 43.1, 43.2, 43.3],
+            'longitude': [-110.0, -110.1, -110.2, -110.3],
+            'elk_present': [1, 0, 1, 0],
+            'firstdate': ['2024-06-15', None, '2024-09-20', None],  # Some rows have dates, some don't
+            'month': [None, None, None, None],  # Month column exists but empty
+            'year': [None, None, None, None],  # Year column exists but empty
+            'elevation': [8500.0, 8500.0, 8500.0, 8500.0]  # Placeholder values
+        })
+        
+        dataset_path = tmp_path / "test_dataset.csv"
+        df.to_csv(dataset_path, index=False)
+        
+        # Create mock builder
+        builder = Mock()
+        builder.build_context = Mock(return_value={
+            'elevation': 2500.0,
+            'slope_degrees': 5.0,
+            'aspect_degrees': 180.0,
+            'canopy_cover_percent': 45.0,
+            'land_cover_code': 41,
+            'land_cover_type': 'deciduous_forest',
+            'water_distance_miles': 2.5,
+            'water_reliability': 0.8,
+            'road_distance_miles': 1.5,
+            'trail_distance_miles': 0.8,
+            'security_habitat_percent': 0.6,
+            'snow_depth_inches': 10.0,
+            'snow_water_equiv_inches': 2.5,
+            'snow_crust_detected': False,
+            'snow_data_source': 'estimate',
+            'snow_station_name': None,
+            'snow_station_distance_km': None,
+            'temperature_f': 45.0,
+            'precip_last_7_days_inches': 0.5,
+            'cloud_cover_percent': 20,
+            'ndvi': 0.5,
+            'ndvi_age_days': 8,
+            'irg': 0.0,
+            'summer_integrated_ndvi': 60.0
+        })
+        
+        # Process dataset
+        updated_count, error_count = _process_sequential(
+            df, builder, 'firstdate', 1000, None, dataset_path, force=True
+        )
+        
+        # Verify month assignment:
+        # Row 0: Has date 2024-06-15, should get month=6 (June)
+        assert pd.notna(df.iloc[0]['month']), "Row with date should have month set"
+        assert df.iloc[0]['month'] == 6.0, "Row with June date should have month=6"
+        
+        # Row 1: No date, should NOT get month=1 (January) from default date
+        # Month should remain None
+        assert pd.isna(df.iloc[1]['month']) or df.iloc[1]['month'] is None, \
+            "Row without date should NOT have month set to January (default date)"
+        
+        # Row 2: Has date 2024-09-20, should get month=9 (September)
+        assert pd.notna(df.iloc[2]['month']), "Row with date should have month set"
+        assert df.iloc[2]['month'] == 9.0, "Row with September date should have month=9"
+        
+        # Row 3: No date, should NOT get month=1 (January) from default date
+        assert pd.isna(df.iloc[3]['month']) or df.iloc[3]['month'] is None, \
+            "Row without date should NOT have month set to January (default date)"
+        
+    def test_month_set_from_valid_date(self, tmp_path):
+        """Test that month is correctly set from valid dates."""
+        # Create dataset with valid dates
+        df = pd.DataFrame({
+            'latitude': [43.0, 43.1, 43.2],
+            'longitude': [-110.0, -110.1, -110.2],
+            'elk_present': [1, 0, 1],
+            'firstdate': ['2024-03-15', '2024-07-20', '2024-11-05'],  # Different months
+            'month': [None, None, None],  # Month column exists but empty
+            'year': [None, None, None],
+            'elevation': [8500.0, 8500.0, 8500.0]  # Placeholder values
+        })
+        
+        dataset_path = tmp_path / "test_dataset.csv"
+        df.to_csv(dataset_path, index=False)
+        
+        # Create mock builder
+        builder = Mock()
+        builder.build_context = Mock(return_value={
+            'elevation': 2500.0,
+            'slope_degrees': 5.0,
+            'aspect_degrees': 180.0,
+            'canopy_cover_percent': 45.0,
+            'land_cover_code': 41,
+            'land_cover_type': 'deciduous_forest',
+            'water_distance_miles': 2.5,
+            'water_reliability': 0.8,
+            'road_distance_miles': 1.5,
+            'trail_distance_miles': 0.8,
+            'security_habitat_percent': 0.6,
+            'snow_depth_inches': 10.0,
+            'snow_water_equiv_inches': 2.5,
+            'snow_crust_detected': False,
+            'snow_data_source': 'estimate',
+            'snow_station_name': None,
+            'snow_station_distance_km': None,
+            'temperature_f': 45.0,
+            'precip_last_7_days_inches': 0.5,
+            'cloud_cover_percent': 20,
+            'ndvi': 0.5,
+            'ndvi_age_days': 8,
+            'irg': 0.0,
+            'summer_integrated_ndvi': 60.0
+        })
+        
+        # Process dataset
+        updated_count, error_count = _process_sequential(
+            df, builder, 'firstdate', 1000, None, dataset_path, force=True
+        )
+        
+        # Verify month is correctly set from actual dates
+        assert df.iloc[0]['month'] == 3.0, "March date should set month=3"
+        assert df.iloc[1]['month'] == 7.0, "July date should set month=7"
+        assert df.iloc[2]['month'] == 11.0, "November date should set month=11"
+

@@ -322,8 +322,8 @@ class TestAssessTrainingReadinessIntegration:
             'security_habitat_percent': [60.0, 70.0]
         })
         
-        # Create one of the expected dataset files
-        test_file = processed_dir / "combined_north_bighorn_presence_absence.csv"
+        # Create one of the expected dataset files (with standardized name)
+        test_file = processed_dir / "combined_northern_bighorn_presence_absence.csv"
         df.to_csv(test_file, index=False)
         
         # Change to tmp_path to simulate data directory
@@ -365,8 +365,8 @@ class TestAssessTrainingReadinessIntegration:
             'slope_degrees': [5.0, 10.0],
         })
         
-        # Create test file
-        test_file = processed_dir / "combined_north_bighorn_presence_absence_test.csv"
+        # Create test file with standardized name (northern_bighorn)
+        test_file = processed_dir / "combined_northern_bighorn_presence_absence_test.csv"
         df.to_csv(test_file, index=False)
         
         # Change to tmp_path to simulate data directory

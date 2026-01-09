@@ -27,7 +27,7 @@ except ImportError:
     EE_AVAILABLE = False
     pytestmark = pytest.mark.skip("earthengine-api not available")
 
-from src.data.processors import GEENDVIClient, DataContextBuilder, GEEInitializer
+from src.data.processors import GEENDVIClient, DataContextBuilder, GEEInitializer, NDVICache, NDVICache
 
 
 @pytest.fixture
