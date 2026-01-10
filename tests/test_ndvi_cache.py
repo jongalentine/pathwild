@@ -24,12 +24,19 @@ except ImportError:
     EE_AVAILABLE = False
 
 from src.data.processors import NDVICache, GEENDVIClient
-import yaml
+
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
 
 
 @pytest.fixture
 def test_config():
     """Load test configuration"""
+    if not YAML_AVAILABLE:
+        return {}
     config_path = Path("config.yaml")
     if config_path.exists():
         with open(config_path) as f:

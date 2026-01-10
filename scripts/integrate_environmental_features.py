@@ -78,6 +78,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.data.processors import DataContextBuilder
 
+# Configure logging (must be before any logger usage)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 # Load configuration
 try:
     import yaml
@@ -90,13 +97,6 @@ try:
 except ImportError:
     CONFIG = {}
     logger.warning("PyYAML not available, GEE config will not be loaded")
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 
 # Placeholder values that indicate data needs to be replaced
@@ -748,6 +748,10 @@ def update_dataset(dataset_path: Path, data_dir: Path, batch_size: int = 1000, l
         batch_size: Number of rows to process before saving progress
         limit: Maximum number of rows to process (for testing). If None, processes all rows.
     """
+    # Ensure absolute paths for multiprocessing compatibility
+    data_dir = data_dir.resolve()
+    dataset_path = dataset_path.resolve()
+
     logger.info(f"Loading dataset: {dataset_path}")
     
     if not dataset_path.exists():
@@ -983,8 +987,8 @@ def main():
     
     args = parser.parse_args()
     
-    data_dir = Path(args.data_dir)
-    processed_dir = Path(args.processed_dir)
+    data_dir = Path(args.data_dir).resolve()  # Resolve to absolute path for multiprocessing
+    processed_dir = Path(args.processed_dir).resolve()
     
     if not data_dir.exists():
         logger.error(f"Data directory not found: {data_dir}")

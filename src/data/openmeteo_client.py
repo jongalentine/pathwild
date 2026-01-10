@@ -97,7 +97,7 @@ class OpenMeteoClient:
         params = {
             "latitude": lat,
             "longitude": lon,
-            "daily": "temperature_2m_max,temperature_2m_min,temperature_2m_mean,precipitation_sum",
+            "daily": "temperature_2m_max,temperature_2m_min,temperature_2m_mean,precipitation_sum,cloud_cover_mean",
             "temperature_unit": "fahrenheit",
             "precipitation_unit": "inch",
             "forecast_days": self.forecast_days,
@@ -137,7 +137,7 @@ class OpenMeteoClient:
             "longitude": lon,
             "start_date": start_date,
             "end_date": end_date,
-            "daily": "temperature_2m_max,temperature_2m_min,temperature_2m_mean,precipitation_sum",
+            "daily": "temperature_2m_max,temperature_2m_min,temperature_2m_mean,precipitation_sum,cloud_cover_mean",
             "temperature_unit": "fahrenheit",
             "precipitation_unit": "inch",
             "timezone": timezone
@@ -161,7 +161,8 @@ class OpenMeteoClient:
         temp_min = daily.get("temperature_2m_min", [])
         temp_mean = daily.get("temperature_2m_mean", [])
         precipitation = daily.get("precipitation_sum", [])
-        
+        cloud_cover = daily.get("cloud_cover_mean", [])
+
         results = []
         for i, date_str in enumerate(dates):
             result = {
@@ -169,7 +170,8 @@ class OpenMeteoClient:
                 "temp_max_f": temp_max[i] if i < len(temp_max) else None,
                 "temp_min_f": temp_min[i] if i < len(temp_min) else None,
                 "temp_mean_f": temp_mean[i] if i < len(temp_mean) else None,
-                "precipitation_inches": precipitation[i] if i < len(precipitation) else None
+                "precipitation_inches": precipitation[i] if i < len(precipitation) else None,
+                "cloud_cover_percent": cloud_cover[i] if i < len(cloud_cover) else None
             }
             results.append(result)
         

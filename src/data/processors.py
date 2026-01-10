@@ -2740,14 +2740,14 @@ class WeatherClient:
                     f.get("precipitation_inches", 0) or 0
                     for f in forecasts_7d[:7]
                 )
-                
+
                 return {
                     "temp": forecast.get("temp_mean_f", 45.0),
                     "temp_high": forecast.get("temp_max_f", 55.0),
                     "temp_low": forecast.get("temp_min_f", 35.0),
                     "precip_7d": precip_7d,
-                    "cloud_cover": 30,  # Open-Meteo doesn't provide this in free tier
-                    "wind_mph": 10  # Open-Meteo doesn't provide this in free tier
+                    "cloud_cover": forecast.get("cloud_cover_percent", 30),
+                    "wind_mph": 10  # Open-Meteo doesn't provide wind in daily data
                 }
             else:
                 raise ValueError("Forecast not available for target date")
@@ -2818,13 +2818,28 @@ class WeatherClient:
                 # Handle case where PRISM client already converted
                 temp_low_f = temp_data["temp_min_f"]
             
+            # PRISM doesn't provide cloud cover, so fetch it from Open-Meteo
+            cloud_cover_pct = 40.0  # Default fallback
+            try:
+                historical = self.openmeteo_client.get_historical(
+                    lat, lon,
+                    date.strftime("%Y-%m-%d"),
+                    date.strftime("%Y-%m-%d")
+                )
+                daily = historical.get("daily", {})
+                cloud_cover_data = daily.get("cloud_cover_mean", [])
+                if cloud_cover_data and cloud_cover_data[0] is not None:
+                    cloud_cover_pct = cloud_cover_data[0]
+            except Exception as cloud_e:
+                logger.debug(f"Could not fetch cloud cover from Open-Meteo: {cloud_e}")
+
             return {
                 "temp": temp_mean_f if temp_mean_f is not None else 42.0,
                 "temp_high": temp_high_f if temp_high_f is not None else 52.0,
                 "temp_low": temp_low_f if temp_low_f is not None else 32.0,
                 "precip_7d": precip_7d,
-                "cloud_cover": 40,  # PRISM doesn't provide this
-                "wind_mph": 12  # PRISM doesn't provide this
+                "cloud_cover": cloud_cover_pct,
+                "wind_mph": 12  # Neither PRISM nor Open-Meteo daily data provides wind
             }
             
         except Exception as e:
@@ -2861,13 +2876,15 @@ class WeatherClient:
             temp_min = daily.get("temperature_2m_min", [])
             temp_mean = daily.get("temperature_2m_mean", [])
             precipitation = daily.get("precipitation_sum", [])
-            
+            cloud_cover = daily.get("cloud_cover_mean", [])
+
             # Find the target date in the response
             target_date_str = date.strftime("%Y-%m-%d")
             temp_mean_f = 42.0
             temp_high_f = 52.0
             temp_low_f = 32.0
-            
+            cloud_cover_pct = 30.0
+
             if target_date_str in dates:
                 idx = dates.index(target_date_str)
                 if idx < len(temp_mean):
@@ -2876,17 +2893,19 @@ class WeatherClient:
                     temp_high_f = temp_max[idx] or 52.0
                 if idx < len(temp_min):
                     temp_low_f = temp_min[idx] or 32.0
-            
+                if idx < len(cloud_cover):
+                    cloud_cover_pct = cloud_cover[idx] or 30.0
+
             # Sum precipitation over the 7-day window
             precip_7d = sum(precipitation) if precipitation else 0.5
-            
+
             return {
                 "temp": temp_mean_f,
                 "temp_high": temp_high_f,
                 "temp_low": temp_low_f,
                 "precip_7d": precip_7d,
-                "cloud_cover": 30,  # Open-Meteo doesn't provide in free tier
-                "wind_mph": 10  # Open-Meteo doesn't provide in free tier
+                "cloud_cover": cloud_cover_pct,
+                "wind_mph": 10  # Open-Meteo doesn't provide wind in daily data
             }
         except Exception as e:
             logger.error(f"Open-Meteo historical data fetch failed: {e}")

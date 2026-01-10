@@ -17,7 +17,11 @@ import pandas as pd
 from datetime import datetime
 from pathlib import Path
 import os
-import yaml
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
 
 # Skip all tests if earthengine-api not available
 try:
@@ -57,6 +61,8 @@ def gee_client(test_config):
 @pytest.fixture
 def test_config():
     """Load test configuration"""
+    if not YAML_AVAILABLE:
+        return {}
     config_path = Path("config.yaml")
     if config_path.exists():
         with open(config_path) as f:
