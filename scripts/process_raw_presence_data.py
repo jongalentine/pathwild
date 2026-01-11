@@ -283,6 +283,33 @@ def process_dataset(
     # Add dataset metadata
     df['dataset'] = dataset_name
     
+    # Standardize date column: copy firstdate/lastdate to standard 'date' column
+    # This ensures all presence data has a consistent 'date' column for downstream processing
+    # while preserving original metadata columns (firstdate, lastdate) for reference
+    if 'date' not in df.columns:
+        # Look for alternative date column names (in priority order)
+        date_columns = ['firstdate', 'lastdate', 'Date_Time_MST', 'DT', 'timestamp']
+        date_col_found = None
+        
+        for col in date_columns:
+            if col in df.columns:
+                # Check if column has valid dates
+                date_series = pd.to_datetime(df[col], errors='coerce')
+                if date_series.notna().sum() > 0:
+                    # Copy to standard 'date' column
+                    df['date'] = date_series
+                    date_col_found = col
+                    logger.info(f"  Copied {col} to standard 'date' column ({date_series.notna().sum():,} valid dates)")
+                    break
+        
+        if date_col_found is None:
+            logger.warning("  No valid date column found - presence points will have missing temporal metadata")
+    else:
+        # Date column already exists - ensure it's datetime type
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        valid_dates = df['date'].notna().sum()
+        logger.info(f"  Standardized existing 'date' column ({valid_dates:,} valid dates)")
+    
     # Ensure required columns exist
     required_cols = ['latitude', 'longitude']
     missing_cols = [col for col in required_cols if col not in df.columns]
