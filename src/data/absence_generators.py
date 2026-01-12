@@ -6,7 +6,7 @@ where elk were NOT present) to balance presence data for binary classification.
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 import numpy as np
 import geopandas as gpd
 import pandas as pd
@@ -455,6 +455,68 @@ class AbsenceGenerator(ABC):
         # Convert to UTM for accurate distance calculations
         self.presence_utm = self.presence_data.to_crs(self.utm_crs)
     
+    def _add_temporal_metadata(
+        self,
+        absence_gdf: gpd.GeoDataFrame,
+        strategy_name: str
+    ) -> gpd.GeoDataFrame:
+        """
+        Add temporal metadata to absence points by sampling from presence data distribution.
+        
+        This ensures all absence points have complete temporal information (date, year, month, day_of_year)
+        which is critical for model training.
+        
+        Args:
+            absence_gdf: GeoDataFrame with absence points (missing temporal metadata)
+            strategy_name: Name of absence generation strategy
+            
+        Returns:
+            GeoDataFrame with temporal metadata added
+        """
+        # Check if presence data has date information
+        date_columns = ['date', 'firstdate', 'lastdate', 'timestamp']
+        date_column = None
+        for col in date_columns:
+            if col in self.presence_data.columns:
+                date_column = col
+                break
+        
+        if date_column is None:
+            # No date column in presence data - cannot add temporal metadata
+            logger.debug(f"No date column found in presence data - skipping temporal metadata for {strategy_name}")
+            return absence_gdf
+        
+        # Parse dates from presence data
+        presence_df = pd.DataFrame(self.presence_data.drop(columns='geometry'))
+        dates = pd.to_datetime(presence_df[date_column], errors='coerce').dropna()
+        
+        if len(dates) == 0:
+            # All dates invalid - cannot add temporal metadata
+            logger.debug(f"No valid dates in presence data - skipping temporal metadata for {strategy_name}")
+            return absence_gdf
+        
+        # Sample dates from presence distribution
+        n_absences = len(absence_gdf)
+        sampled_dates = dates.sample(n=n_absences, replace=True, random_state=42)
+        
+        # Add temporal columns
+        absence_gdf['date'] = sampled_dates.values
+        absence_gdf['year'] = sampled_dates.dt.year.values
+        absence_gdf['month'] = sampled_dates.dt.month.values
+        absence_gdf['day_of_year'] = sampled_dates.dt.dayofyear.values
+        
+        # Add season if useful
+        season_map = {
+            12: 'wi', 1: 'wi', 2: 'wi',  # Winter
+            3: 'sp', 4: 'sp', 5: 'sp',   # Spring
+            6: 'su', 7: 'su', 8: 'su',   # Summer
+            9: 'fa', 10: 'fa', 11: 'fa'  # Fall
+        }
+        absence_gdf['season'] = absence_gdf['month'].map(season_map)
+        
+        logger.debug(f"Added temporal metadata to {len(absence_gdf)} {strategy_name} absences")
+        return absence_gdf
+    
     @abstractmethod
     def generate(self, n_samples: int, max_attempts: int = 10000, n_processes: Optional[int] = None) -> gpd.GeoDataFrame:
         """
@@ -688,6 +750,10 @@ class AbsenceGenerator(ABC):
         absence_gdf['latitude'] = absence_gdf.geometry.y
         absence_gdf['longitude'] = absence_gdf.geometry.x
         absence_gdf['absence_strategy'] = strategy_name
+        
+        # Add temporal metadata if presence data has dates
+        # This ensures all absences have temporal information
+        self._add_temporal_metadata(absence_gdf, strategy_name)
         
         return absence_gdf
     

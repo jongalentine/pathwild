@@ -1338,7 +1338,35 @@ class DataContextBuilder:
         context["temperature_f"] = weather.get("temp", 45.0)
         context["precip_last_7_days_inches"] = weather.get("precip_7d", 0.0)
         context["cloud_cover_percent"] = weather.get("cloud_cover", 20)
-        
+
+        # Lunar illumination features (for nocturnal activity modeling)
+        # Research shows ungulates respond to moonlight conditions
+        try:
+            from .lunar_client import LunarCalculator
+            lunar_calc = LunarCalculator()
+            cloud_cover = context["cloud_cover_percent"]
+
+            # Get comprehensive lunar features
+            lunar_features = lunar_calc.get_all_lunar_features(lat, lon, dt, cloud_cover)
+
+            context["moon_phase"] = lunar_features.get("moon_phase", 0.5)
+            context["moon_altitude_midnight"] = lunar_features.get("moon_altitude_midnight", 0.0)
+            context["effective_illumination"] = lunar_features.get("effective_illumination_midnight", 0.0)
+            context["cloud_adjusted_illumination"] = lunar_features.get("cloud_adjusted_illumination", 0.0)
+        except ImportError:
+            # Fallback if lunar client not available
+            logger.debug("Lunar client not available, using placeholder values")
+            context["moon_phase"] = 0.5
+            context["moon_altitude_midnight"] = 0.0
+            context["effective_illumination"] = 0.0
+            context["cloud_adjusted_illumination"] = 0.0
+        except Exception as e:
+            logger.debug(f"Error calculating lunar features: {e}")
+            context["moon_phase"] = 0.5
+            context["moon_altitude_midnight"] = 0.0
+            context["effective_illumination"] = 0.0
+            context["cloud_adjusted_illumination"] = 0.0
+
         # Vegetation data
         if self.use_gee_ndvi and self.ndvi_client:
             # Use GEE for NDVI (even for single points - wrap in DataFrame)
@@ -2666,30 +2694,57 @@ class AWDBClient:
 
 
 class WeatherClient:
-    """Client for weather data using PRISM (historical) and Open-Meteo (forecasts)"""
-    
+    """
+    Client for weather data using multiple sources optimized for each data type.
+
+    Data Sources:
+        - PRISM: Historical temperature and precipitation (bulk downloaded, local files)
+        - ERA5: Historical cloud cover (bulk downloaded, local NetCDF files)
+        - OpenMeteo: Forecast/current data ONLY (API calls, rate-limited)
+
+    OpenMeteo is NOT suitable for bulk historical data retrieval due to aggressive
+    rate limiting. Use PRISM and ERA5 for training data pipelines.
+    """
+
     def __init__(self, data_dir: Optional[Path] = None, use_real_data: bool = True):
         """
         Initialize weather client.
-        
+
         Args:
-            data_dir: Data directory for PRISM cache
+            data_dir: Data directory for PRISM/ERA5 cache
             use_real_data: If False, uses placeholder values (for testing/fallback)
         """
         self.use_real_data = use_real_data
         self.cache = {}
-        
+        self.era5_client = None
+
+        if data_dir is None:
+            data_dir = Path("data")
+        self.data_dir = data_dir
+
         if use_real_data:
             try:
                 from .prism_client import PRISMClient
                 from .openmeteo_client import OpenMeteoClient
-                
-                if data_dir is None:
-                    data_dir = Path("data")
+                from .era5_client import ERA5CloudClient
+
                 self.prism_client = PRISMClient(data_dir / "prism")
                 self.openmeteo_client = OpenMeteoClient()
-            except ImportError:
-                logger.warning("PRISM/Open-Meteo clients not available, using placeholder values")
+
+                # ERA5 for historical cloud cover (optional - gracefully degrade if not available)
+                try:
+                    self.era5_client = ERA5CloudClient(data_dir / "era5")
+                    coverage = self.era5_client.get_coverage_info()
+                    if coverage['available']:
+                        logger.info(f"ERA5 cloud cover available: years {coverage['year_range'][0]}-{coverage['year_range'][1]}")
+                    else:
+                        logger.warning("ERA5 cloud cover data not downloaded. Run scripts/bulk_download_era5_cloud.py")
+                except Exception as e:
+                    logger.warning(f"ERA5 client not available: {e}. Cloud cover will use fallback values.")
+                    self.era5_client = None
+
+            except ImportError as e:
+                logger.warning(f"Weather clients not available: {e}, using placeholder values")
                 self.use_real_data = False
     
     def get_weather(self, lat: float, lon: float, date: datetime) -> Dict:
@@ -2764,7 +2819,17 @@ class WeatherClient:
             }
     
     def _get_historical(self, lat: float, lon: float, date: datetime) -> Dict:
-        """Get historical weather using PRISM, falling back to Open-Meteo for recent dates"""
+        """
+        Get historical weather using PRISM (temp/precip) and ERA5 (cloud cover).
+
+        Data sources:
+            - Temperature: PRISM (4km resolution, local files)
+            - Precipitation: PRISM (4km resolution, local files)
+            - Cloud cover: ERA5 (25km resolution, local NetCDF files)
+
+        OpenMeteo is NOT used for historical data due to rate limiting.
+        If PRISM/ERA5 data is not available, returns fallback values.
+        """
         if not self.use_real_data:
             # Placeholder fallback
             return {
@@ -2775,18 +2840,37 @@ class WeatherClient:
                 "cloud_cover": 40,
                 "wind_mph": 12
             }
-        
+
+        # Default fallback values
+        temp_mean_f = 42.0
+        temp_high_f = 52.0
+        temp_low_f = 32.0
+        precip_7d = 0.5
+        cloud_cover_pct = 40.0
+
+        # Get temperature from PRISM
         try:
-            # Get temperature for date from PRISM
             temp_data = self.prism_client.get_temperature(lat, lon, date)
-            
-            # Check if PRISM returned None (data not available - likely too recent)
-            if temp_data is None or all(v is None for v in temp_data.values()):
-                # Fall back to Open-Meteo for historical data (supports recent past)
-                logger.info(f"PRISM data not available for {date.strftime('%Y-%m-%d')}, using Open-Meteo historical data")
-                return self._get_historical_from_openmeteo(lat, lon, date)
-            
-            # Get 7-day precipitation
+
+            if temp_data is not None and not all(v is None for v in temp_data.values()):
+                # Convert temps to Fahrenheit
+                if temp_data.get("temp_mean_c") is not None:
+                    temp_mean_f = (temp_data["temp_mean_c"] * 9/5) + 32
+                if temp_data.get("temp_max_c") is not None:
+                    temp_high_f = (temp_data["temp_max_c"] * 9/5) + 32
+                elif temp_data.get("temp_max_f") is not None:
+                    temp_high_f = temp_data["temp_max_f"]
+                if temp_data.get("temp_min_c") is not None:
+                    temp_low_f = (temp_data["temp_min_c"] * 9/5) + 32
+                elif temp_data.get("temp_min_f") is not None:
+                    temp_low_f = temp_data["temp_min_f"]
+            else:
+                logger.debug(f"PRISM temperature not available for {date.strftime('%Y-%m-%d')}")
+        except Exception as e:
+            logger.debug(f"Failed to get PRISM temperature: {e}")
+
+        # Get 7-day precipitation from PRISM
+        try:
             start_date = date - timedelta(days=7)
             precip_mm = 0.0
             current_date = start_date
@@ -2795,123 +2879,32 @@ class WeatherClient:
                 if ppt is not None:
                     precip_mm += ppt
                 current_date += timedelta(days=1)
-            
-            # Convert mm to inches
-            precip_7d = precip_mm / 25.4
-            
-            # Convert temps to Fahrenheit
-            # PRISM returns temp_mean_c, temp_min_c, temp_max_c
-            temp_mean_f = None
-            temp_high_f = None
-            temp_low_f = None
-            
-            if temp_data.get("temp_mean_c") is not None:
-                temp_mean_f = (temp_data["temp_mean_c"] * 9/5) + 32
-            if temp_data.get("temp_max_c") is not None:
-                temp_high_f = (temp_data["temp_max_c"] * 9/5) + 32
-            elif temp_data.get("temp_max_f") is not None:
-                # Handle case where PRISM client already converted
-                temp_high_f = temp_data["temp_max_f"]
-            if temp_data.get("temp_min_c") is not None:
-                temp_low_f = (temp_data["temp_min_c"] * 9/5) + 32
-            elif temp_data.get("temp_min_f") is not None:
-                # Handle case where PRISM client already converted
-                temp_low_f = temp_data["temp_min_f"]
-            
-            # PRISM doesn't provide cloud cover, so fetch it from Open-Meteo
-            cloud_cover_pct = 40.0  # Default fallback
-            try:
-                historical = self.openmeteo_client.get_historical(
-                    lat, lon,
-                    date.strftime("%Y-%m-%d"),
-                    date.strftime("%Y-%m-%d")
-                )
-                daily = historical.get("daily", {})
-                cloud_cover_data = daily.get("cloud_cover_mean", [])
-                if cloud_cover_data and cloud_cover_data[0] is not None:
-                    cloud_cover_pct = cloud_cover_data[0]
-            except Exception as cloud_e:
-                logger.debug(f"Could not fetch cloud cover from Open-Meteo: {cloud_e}")
-
-            return {
-                "temp": temp_mean_f if temp_mean_f is not None else 42.0,
-                "temp_high": temp_high_f if temp_high_f is not None else 52.0,
-                "temp_low": temp_low_f if temp_low_f is not None else 32.0,
-                "precip_7d": precip_7d,
-                "cloud_cover": cloud_cover_pct,
-                "wind_mph": 12  # Neither PRISM nor Open-Meteo daily data provides wind
-            }
-            
+            precip_7d = precip_mm / 25.4  # Convert mm to inches
         except Exception as e:
-            # If PRISM fails, try Open-Meteo as fallback
-            logger.warning(f"Failed to get PRISM weather: {e}, trying Open-Meteo fallback")
+            logger.debug(f"Failed to get PRISM precipitation: {e}")
+
+        # Get cloud cover from ERA5 (NOT OpenMeteo - it's rate-limited)
+        if self.era5_client is not None:
             try:
-                return self._get_historical_from_openmeteo(lat, lon, date)
-            except Exception as e2:
-                logger.warning(f"Open-Meteo fallback also failed: {e2}, using placeholder")
-                return {
-                    "temp": 42.0,
-                    "temp_high": 52.0,
-                    "temp_low": 32.0,
-                    "precip_7d": 0.5,
-                    "cloud_cover": 40,
-                    "wind_mph": 12
-                }
+                era5_cloud = self.era5_client.get_cloud_cover(lat, lon, date)
+                if era5_cloud is not None:
+                    cloud_cover_pct = era5_cloud
+                else:
+                    logger.debug(f"ERA5 cloud cover not available for {date.strftime('%Y-%m-%d')}")
+            except Exception as e:
+                logger.debug(f"Failed to get ERA5 cloud cover: {e}")
+        else:
+            logger.debug("ERA5 client not available, using fallback cloud cover")
+
+        return {
+            "temp": temp_mean_f,
+            "temp_high": temp_high_f,
+            "temp_low": temp_low_f,
+            "precip_7d": precip_7d,
+            "cloud_cover": cloud_cover_pct,
+            "wind_mph": 12  # Wind data not available from PRISM/ERA5 daily
+        }
     
-    def _get_historical_from_openmeteo(self, lat: float, lon: float, date: datetime) -> Dict:
-        """Get historical weather from Open-Meteo API (for recent dates not in PRISM yet)"""
-        try:
-            # Get historical data for the date and 7-day window
-            start_date = date - timedelta(days=7)
-            historical = self.openmeteo_client.get_historical(
-                lat, lon,
-                start_date.strftime("%Y-%m-%d"),
-                date.strftime("%Y-%m-%d")
-            )
-            
-            # Parse the response
-            daily = historical.get("daily", {})
-            dates = daily.get("time", [])
-            temp_max = daily.get("temperature_2m_max", [])
-            temp_min = daily.get("temperature_2m_min", [])
-            temp_mean = daily.get("temperature_2m_mean", [])
-            precipitation = daily.get("precipitation_sum", [])
-            cloud_cover = daily.get("cloud_cover_mean", [])
-
-            # Find the target date in the response
-            target_date_str = date.strftime("%Y-%m-%d")
-            temp_mean_f = 42.0
-            temp_high_f = 52.0
-            temp_low_f = 32.0
-            cloud_cover_pct = 30.0
-
-            if target_date_str in dates:
-                idx = dates.index(target_date_str)
-                if idx < len(temp_mean):
-                    temp_mean_f = temp_mean[idx] or 42.0
-                if idx < len(temp_max):
-                    temp_high_f = temp_max[idx] or 52.0
-                if idx < len(temp_min):
-                    temp_low_f = temp_min[idx] or 32.0
-                if idx < len(cloud_cover):
-                    cloud_cover_pct = cloud_cover[idx] or 30.0
-
-            # Sum precipitation over the 7-day window
-            precip_7d = sum(precipitation) if precipitation else 0.5
-
-            return {
-                "temp": temp_mean_f,
-                "temp_high": temp_high_f,
-                "temp_low": temp_low_f,
-                "precip_7d": precip_7d,
-                "cloud_cover": cloud_cover_pct,
-                "wind_mph": 10  # Open-Meteo doesn't provide wind in daily data
-            }
-        except Exception as e:
-            logger.error(f"Open-Meteo historical data fetch failed: {e}")
-            raise
-
-
 class SatelliteClient:
     """Client for satellite imagery (NDVI) using AppEEARS"""
     
