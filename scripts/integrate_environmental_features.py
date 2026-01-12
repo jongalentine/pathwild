@@ -122,7 +122,13 @@ PLACEHOLDER_VALUES = {
     'ndvi': 0.5,
     'ndvi_age_days': 8,
     'irg': 0.0,
-    'summer_integrated_ndvi': 0.0
+    'summer_integrated_ndvi': 0.0,
+
+    # Lunar illumination features (for nocturnal activity modeling)
+    'moon_phase': 0.5,
+    'moon_altitude_midnight': 0.0,
+    'effective_illumination': 0.0,
+    'cloud_adjusted_illumination': 0.0
 }
 
 
@@ -238,8 +244,13 @@ def detect_optimal_workers(dataset_size: int = None) -> int:
         optimal = max(1, min(base_workers, memory_workers))
         optimal = max(1, int(optimal * size_factor))
         
-        # Cap at reasonable maximum (8 workers for threading due to GIL)
-        optimal = min(optimal, 8)
+        # Cap at reasonable maximum for raster-intensive workloads
+        # Raster file access (DEM, slope, aspect, land cover, canopy) requires significant
+        # memory and file handles. 4 workers is the practical maximum to avoid:
+        # - File handle exhaustion
+        # - Memory pressure
+        # - Segmentation faults from resource contention
+        optimal = min(optimal, 4)
         
         # Minimum of 2 for small systems
         if optimal < 2 and physical_cores >= 2:
@@ -310,7 +321,9 @@ def _process_sequential(df, builder, date_col, batch_size, limit, dataset_path, 
         'snow_depth_inches', 'snow_water_equiv_inches', 'snow_crust_detected',
         'snow_data_source', 'snow_station_name', 'snow_station_distance_km',  # Data quality tracking
         'temperature_f', 'precip_last_7_days_inches', 'cloud_cover_percent',
-        'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi'
+        'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi',
+        # Lunar illumination features
+        'moon_phase', 'moon_altitude_midnight', 'effective_illumination', 'cloud_adjusted_illumination'
     ]
     
     # Filter rows if not forcing (only process rows with placeholders)
@@ -391,7 +404,9 @@ def _process_sequential(df, builder, date_col, batch_size, limit, dataset_path, 
                 'snow_depth_inches', 'snow_water_equiv_inches', 'snow_crust_detected',
                 'snow_data_source', 'snow_station_name', 'snow_station_distance_km',  # Data quality tracking
                 'temperature_f', 'precip_last_7_days_inches', 'cloud_cover_percent',
-                'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi'
+                'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi',
+                # Lunar illumination features
+                'moon_phase', 'moon_altitude_midnight', 'effective_illumination', 'cloud_adjusted_illumination'
             ]
             
             for col in env_columns:
@@ -437,10 +452,12 @@ def _process_parallel(df, data_dir, date_col, batch_size, limit, dataset_path, n
         'snow_depth_inches', 'snow_water_equiv_inches', 'snow_crust_detected',
         'snow_data_source', 'snow_station_name', 'snow_station_distance_km',  # Data quality tracking
         'temperature_f', 'precip_last_7_days_inches', 'cloud_cover_percent',
-        'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi'
+        'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi',
+        # Lunar illumination features
+        'moon_phase', 'moon_altitude_midnight', 'effective_illumination', 'cloud_adjusted_illumination'
     ]
     
-    # Filter rows if not forcing (only process rows with placeholders)
+    # Determine which rows to process (don't create a filtered copy - work with original DataFrame)
     if not force:
         rows_to_process = []
         for idx in range(len(df)):
@@ -450,28 +467,29 @@ def _process_parallel(df, data_dir, date_col, batch_size, limit, dataset_path, n
         skipped_count = len(df) - len(rows_to_process)
         if skipped_count > 0:
             logger.info(f"Skipping {skipped_count:,} rows without placeholders (use --force to process all)")
-        # Filter dataframe to only rows with placeholders
-        df = df.iloc[rows_to_process].copy()
     else:
+        rows_to_process = list(range(len(df)))
         logger.info("Force mode: Processing all rows")
+        skipped_count = 0
     
-    # Prepare batches
+    # Prepare batches using original DataFrame indices (don't filter to local copy)
     # Use batch_size parameter, but ensure reasonable chunking for parallel processing
     # Cap at 5000 rows per batch to avoid extremely long-running batches
     MAX_BATCH_SIZE = 5000
     effective_batch_size = min(batch_size, MAX_BATCH_SIZE)
     # Create enough batches for parallel processing (at least 2 batches per worker)
     min_batches = n_workers * 2
-    chunk_size = max(100, min(effective_batch_size, len(df) // min_batches))
+    chunk_size = max(100, min(effective_batch_size, len(rows_to_process) // min_batches))
     batches = []
     
     # Convert data_dir to string for pickling (Path objects can sometimes cause issues)
     data_dir_str = str(data_dir)
     
-    for i in range(0, len(df), chunk_size):
-        chunk = df.iloc[i:i+chunk_size]
+    for i in range(0, len(rows_to_process), chunk_size):
+        batch_indices = rows_to_process[i:i+chunk_size]
         # Convert rows to dictionaries to avoid any pandas-specific pickling issues
-        batch_data = [(idx, row.to_dict()) for idx, row in chunk.iterrows()]
+        # Use original DataFrame indices (not filtered copy)
+        batch_data = [(idx, df.iloc[idx].to_dict()) for idx in batch_indices]
         # Include GEE config in batch args
         gee_config_dict = CONFIG.get('gee', {}) if CONFIG else {}
         batches.append((batch_data, data_dir_str, date_col, gee_config_dict))
@@ -493,7 +511,9 @@ def _process_parallel(df, data_dir, date_col, batch_size, limit, dataset_path, n
         'snow_depth_inches', 'snow_water_equiv_inches', 'snow_crust_detected',
         'snow_data_source', 'snow_station_name', 'snow_station_distance_km',  # Data quality tracking
         'temperature_f', 'precip_last_7_days_inches', 'cloud_cover_percent',
-        'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi'
+        'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi',
+        # Lunar illumination features
+        'moon_phase', 'moon_altitude_midnight', 'effective_illumination', 'cloud_adjusted_illumination'
     ]
     
     # Initialize columns if needed
@@ -810,7 +830,7 @@ def update_dataset(dataset_path: Path, data_dir: Path, batch_size: int = 1000, l
     
     # Determine date column
     date_col = None
-    for col in ['date', 'firstdate', 'Date_Time_MST']:
+    for col in ['date', 'firstdate', 'Date_Time_MST', 'DT']:
         if col in df.columns:
             date_col = col
             break
@@ -879,6 +899,12 @@ def update_dataset(dataset_path: Path, data_dir: Path, batch_size: int = 1000, l
     use_parallel = n_workers > 1 and len(df) >= PARALLEL_THRESHOLD
     
     if use_parallel:
+        # Safety cap: Raster-intensive workloads can crash with >4 workers due to
+        # file handle exhaustion and memory pressure. Cap at 4 for safety.
+        if n_workers > 4:
+            logger.warning(f"⚠️  Requested {n_workers} workers, but capping at 4 for safety (raster-intensive workloads)")
+            logger.warning(f"   Using more workers can cause segmentation faults due to resource exhaustion")
+            n_workers = 4
         logger.info(f"Dataset size ({len(df):,}) >= {PARALLEL_THRESHOLD:,} rows - using parallel processing with {n_workers} workers")
         updated_count, error_count = _process_parallel(df, data_dir, date_col, batch_size, limit, dataset_path, n_workers, force)
     else:

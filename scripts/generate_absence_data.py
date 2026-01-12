@@ -29,6 +29,20 @@ from src.data.absence_generators import (
     TemporalAbsenceGenerator
 )
 
+# Import enhanced temporal generators (optional - enabled via config)
+try:
+    from src.data.temporal_absence_generators import (
+        TemporallyMatchedAbsenceGenerator,
+        SeasonalSegregationAbsenceGenerator,
+        UnsuitableTemporalEnvironmentalAbsenceGenerator,
+        RandomTemporalBackgroundGenerator
+    )
+    TEMPORAL_GENERATORS_AVAILABLE = True
+except ImportError as e:
+    TEMPORAL_GENERATORS_AVAILABLE = False
+    # Logger not available yet at import time, will log later
+    _temporal_generators_error = e
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -181,6 +195,25 @@ def main():
         default=None,
         help='Limit number of presence points to process (for testing). Reduces absence generation accordingly.'
     )
+    parser.add_argument(
+        '--use-temporal-strategies',
+        action='store_true',
+        default=False,
+        help='Use enhanced temporal absence strategies (all absences get temporal metadata). '
+             'If not specified, temporal strategies are enabled by default if available.'
+    )
+    parser.add_argument(
+        '--no-temporal-strategies',
+        action='store_true',
+        default=False,
+        help='Disable enhanced temporal strategies and use legacy generators'
+    )
+    parser.add_argument(
+        '--config',
+        type=str,
+        default=None,
+        help='Path to configuration file with absence generation settings'
+    )
     
     args = parser.parse_args()
     
@@ -258,65 +291,208 @@ def main():
     logger.info(f"  Random background absences: {n_background:,}")
     logger.info(f"  Temporal absences: {n_temporal:,}")
     
-    # Generate absences using each strategy
-    all_absences = []
+    # Check if temporal strategies should be used
+    # Default: enabled if available, unless explicitly disabled
+    if args.no_temporal_strategies:
+        use_temporal_strategies = False
+        logger.info("Temporal strategies explicitly disabled - using legacy generators")
+    elif args.use_temporal_strategies:
+        use_temporal_strategies = True
+        if not TEMPORAL_GENERATORS_AVAILABLE:
+            logger.error("Enhanced temporal generators not available but --use-temporal-strategies was specified!")
+            logger.debug(f"Import error: {_temporal_generators_error}")
+            return 1
+    else:
+        # Default: enable if available
+        use_temporal_strategies = TEMPORAL_GENERATORS_AVAILABLE
+        if TEMPORAL_GENERATORS_AVAILABLE:
+            logger.info("Using enhanced temporal strategies by default (available and enabled)")
+        else:
+            logger.info("Temporal strategies not available - using legacy generators")
+            logger.debug(f"Import error: {_temporal_generators_error}")
     
-    # Environmental pseudo-absences
-    if n_environmental > 0:
-        env_gen = EnvironmentalPseudoAbsenceGenerator(
-            presence_gdf,
-            study_area,
-            data_dir=data_dir
-        )
-        env_absences = env_gen.generate(n_environmental, n_processes=effective_n_processes)
-        all_absences.append(env_absences)
-        logger.info(f"✓ Generated {len(env_absences):,} environmental absences")
-    
-    # Unsuitable habitat absences
-    if n_unsuitable > 0:
-        unsuit_gen = UnsuitableHabitatAbsenceGenerator(
-            presence_gdf,
-            study_area,
-            data_dir=data_dir
-        )
-        unsuit_absences = unsuit_gen.generate(n_unsuitable, n_processes=effective_n_processes)
-        all_absences.append(unsuit_absences)
-        logger.info(f"✓ Generated {len(unsuit_absences):,} unsuitable absences")
-    
-    # Random background absences
-    if n_background > 0:
-        bg_gen = RandomBackgroundGenerator(presence_gdf, study_area)
-        bg_absences = bg_gen.generate(n_background, n_processes=effective_n_processes)
-        all_absences.append(bg_absences)
-        logger.info(f"✓ Generated {len(bg_absences):,} background absences")
-    
-    # Temporal absences (if applicable)
-    if n_temporal > 0:
-        # Check if we have date information
-        date_columns = ['firstdate', 'lastdate', 'date', 'timestamp']
-        date_column = None
-        for col in date_columns:
-            if col in presence_df.columns:
-                date_column = col
-                break
+    if use_temporal_strategies and TEMPORAL_GENERATORS_AVAILABLE:
+        # Use enhanced temporal strategies (all absences get temporal metadata)
+        logger.info("\n" + "="*60)
+        logger.info("USING ENHANCED TEMPORAL STRATEGIES")
+        logger.info("="*60)
+        logger.info("All absence points will include complete temporal metadata (date, year, month, day_of_year)")
         
-        if date_column:
-            # Use firstdate or lastdate as the date
-            temp_gen = TemporalAbsenceGenerator(
+        all_absences = []
+        
+        # Strategy 1: Temporally-Matched Environmental Absences (40%)
+        if n_environmental > 0:
+            logger.info(f"\nStrategy 1: Temporally-Matched Environmental ({n_environmental:,} points)")
+            temp_matched_gen = TemporallyMatchedAbsenceGenerator(
                 presence_gdf,
                 study_area,
-                date_column=date_column
+                data_dir=data_dir,
+                min_distance_meters=2000.0
             )
-            temp_absences = temp_gen.generate(n_temporal)
-            all_absences.append(temp_absences)
-            logger.info(f"✓ Generated {len(temp_absences):,} temporal absences")
-        else:
-            logger.warning("No date column found, skipping temporal absences")
+            env_absences = temp_matched_gen.generate(n_environmental)
+            all_absences.append(env_absences)
+        
+        # Strategy 2: Seasonal Segregation Absences (30%)
+        if n_unsuitable > 0:
+            logger.info(f"\nStrategy 2: Seasonal Segregation ({n_unsuitable:,} points)")
+            # Check if we have date information
+            date_columns = ['firstdate', 'lastdate', 'date', 'timestamp', 'DT']
+            date_column = None
+            for col in date_columns:
+                if col in presence_df.columns:
+                    date_column = col
+                    break
+            
+            if date_column:
+                seasonal_gen = SeasonalSegregationAbsenceGenerator(
+                    presence_gdf,
+                    study_area,
+                    date_column=date_column,
+                    offset_months=6  # Default 6 months for opposite season
+                )
+                seasonal_absences = seasonal_gen.generate(n_unsuitable)
+                all_absences.append(seasonal_absences)
+            else:
+                logger.warning("No date column found for seasonal segregation, skipping")
+                # Fallback to unsuitable habitat generator
+                unsuit_gen = UnsuitableHabitatAbsenceGenerator(
+                    presence_gdf,
+                    study_area,
+                    data_dir=data_dir
+                )
+                unsuit_absences = unsuit_gen.generate(n_unsuitable, n_processes=effective_n_processes)
+                # Add temporal metadata
+                unsuit_absences = unsuit_gen._add_temporal_metadata(unsuit_absences, 'unsuitable')
+                all_absences.append(unsuit_absences)
+        
+        # Strategy 3: Unsuitable Temporal-Environmental Absences (20%)
+        if n_background > 0:
+            logger.info(f"\nStrategy 3: Unsuitable Temporal-Environmental ({n_background:,} points)")
+            unsuitable_temp_gen = UnsuitableTemporalEnvironmentalAbsenceGenerator(
+                presence_gdf,
+                study_area,
+                data_dir=data_dir
+            )
+            unsuitable_temp_absences = unsuitable_temp_gen.generate(n_background)
+            all_absences.append(unsuitable_temp_absences)
+        
+        # Strategy 4: Random Temporal Background (10%)
+        if n_temporal > 0:
+            logger.info(f"\nStrategy 4: Random Temporal Background ({n_temporal:,} points)")
+            random_temp_gen = RandomTemporalBackgroundGenerator(
+                presence_gdf,
+                study_area,
+                min_distance_meters=500.0
+            )
+            random_temp_absences = random_temp_gen.generate(n_temporal)
+            all_absences.append(random_temp_absences)
+    
+    else:
+        # Use legacy generators (backward compatibility)
+        logger.info("\nUsing legacy absence generators (backward compatibility mode)")
+        logger.info("Note: Legacy generators may not include temporal metadata for all absences")
+        logger.info("      Use --use-temporal-strategies flag to enable enhanced temporal strategies")
+        
+        all_absences = []
+        
+        # Environmental pseudo-absences
+        if n_environmental > 0:
+            env_gen = EnvironmentalPseudoAbsenceGenerator(
+                presence_gdf,
+                study_area,
+                data_dir=data_dir
+            )
+            env_absences = env_gen.generate(n_environmental, n_processes=effective_n_processes)
+            # Add temporal metadata if available
+            env_absences = env_gen._add_temporal_metadata(env_absences, 'environmental')
+            all_absences.append(env_absences)
+            logger.info(f"✓ Generated {len(env_absences):,} environmental absences")
+        
+        # Unsuitable habitat absences
+        if n_unsuitable > 0:
+            unsuit_gen = UnsuitableHabitatAbsenceGenerator(
+                presence_gdf,
+                study_area,
+                data_dir=data_dir
+            )
+            unsuit_absences = unsuit_gen.generate(n_unsuitable, n_processes=effective_n_processes)
+            # Add temporal metadata if available
+            unsuit_absences = unsuit_gen._add_temporal_metadata(unsuit_absences, 'unsuitable')
+            all_absences.append(unsuit_absences)
+            logger.info(f"✓ Generated {len(unsuit_absences):,} unsuitable absences")
+        
+        # Random background absences
+        if n_background > 0:
+            bg_gen = RandomBackgroundGenerator(presence_gdf, study_area)
+            bg_absences = bg_gen.generate(n_background, n_processes=effective_n_processes)
+            # Add temporal metadata if available
+            bg_absences = bg_gen._add_temporal_metadata(bg_absences, 'background')
+            all_absences.append(bg_absences)
+            logger.info(f"✓ Generated {len(bg_absences):,} background absences")
+        
+        # Temporal absences (if applicable)
+        if n_temporal > 0:
+            # Check if we have date information
+            date_columns = ['firstdate', 'lastdate', 'date', 'timestamp', 'DT']
+            date_column = None
+            for col in date_columns:
+                if col in presence_df.columns:
+                    date_column = col
+                    break
+            
+            if date_column:
+                # Use firstdate or lastdate as the date
+                temp_gen = TemporalAbsenceGenerator(
+                    presence_gdf,
+                    study_area,
+                    date_column=date_column
+                )
+                temp_absences = temp_gen.generate(n_temporal)
+                all_absences.append(temp_absences)
+                logger.info(f"✓ Generated {len(temp_absences):,} temporal absences")
+            else:
+                logger.warning("No date column found, skipping temporal absences")
     
     # Combine all absences
     if all_absences:
-        all_absences_gdf = pd.concat(all_absences, ignore_index=True)
-        all_absences_gdf['elk_present'] = 0
+        # Ensure all are GeoDataFrames
+        absences_gdfs = []
+        for absence in all_absences:
+            if isinstance(absence, gpd.GeoDataFrame):
+                absences_gdfs.append(absence)
+            else:
+                # Convert DataFrame to GeoDataFrame
+                if 'geometry' not in absence.columns:
+                    absence_gdf = gpd.GeoDataFrame(
+                        absence,
+                        geometry=gpd.points_from_xy(absence.longitude, absence.latitude),
+                        crs="EPSG:4326"
+                    )
+                else:
+                    absence_gdf = gpd.GeoDataFrame(absence, crs="EPSG:4326")
+                absences_gdfs.append(absence_gdf)
+        
+        all_absences_gdf = pd.concat(absences_gdfs, ignore_index=True)
+        
+        # Ensure elk_present is set
+        if 'elk_present' not in all_absences_gdf.columns:
+            all_absences_gdf['elk_present'] = 0
+        else:
+            all_absences_gdf['elk_present'] = 0  # Overwrite to ensure all are 0
+        
+        logger.info(f"\n✓ Combined {len(all_absences_gdf):,} total absence points")
+        
+        # Log temporal metadata completeness
+        if 'month' in all_absences_gdf.columns:
+            missing_month = all_absences_gdf['month'].isna().sum()
+            logger.info(f"  Temporal metadata completeness:")
+            logger.info(f"    Missing month: {missing_month:,} ({missing_month/len(all_absences_gdf)*100:.1f}%)")
+        if 'year' in all_absences_gdf.columns:
+            missing_year = all_absences_gdf['year'].isna().sum()
+            logger.info(f"    Missing year: {missing_year:,} ({missing_year/len(all_absences_gdf)*100:.1f}%)")
+        if 'date' in all_absences_gdf.columns:
+            missing_date = all_absences_gdf['date'].isna().sum()
+            logger.info(f"    Missing date: {missing_date:,} ({missing_date/len(all_absences_gdf)*100:.1f}%)")
     else:
         logger.error("No absences generated!")
         return 1
@@ -335,9 +511,23 @@ def main():
     if 'absence_strategy' in all_absences_gdf.columns:
         absence_cols.append('absence_strategy')
     
-    # Add any additional columns from presence data
+    # Add temporal columns if present (CRITICAL for model accuracy)
+    temporal_cols = ['date', 'year', 'month', 'day_of_year', 'season']
+    for col in temporal_cols:
+        if col in all_absences_gdf.columns:
+            absence_cols.append(col)
+        if col in presence_df.columns:
+            presence_cols.append(col)
+    
+    # Add dataset if present
+    if 'dataset' in all_absences_gdf.columns:
+        absence_cols.append('dataset')
+    if 'dataset' in presence_df.columns:
+        presence_cols.append('dataset')
+    
+    # Add any additional columns from presence data (but not geometry columns)
     for col in presence_df.columns:
-        if col not in ['latitude', 'longitude'] and col not in presence_cols:
+        if col not in ['latitude', 'longitude', 'geometry'] and col not in presence_cols:
             presence_cols.append(col)
     
     training_data = pd.concat([

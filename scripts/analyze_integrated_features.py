@@ -28,10 +28,15 @@ PLACEHOLDER_VALUES = {
     # Temporal features
     'temperature_f': 45.0,
     'precip_last_7_days_inches': 0.0,
-    'ndvi': 0.5,
+    'ndvi': [0.3, 0.5],  # Multiple placeholder values: 0.3 and 0.5
     'ndvi_age_days': 8,
     'irg': 0.0,
-    'summer_integrated_ndvi': 0.0
+    'summer_integrated_ndvi': 0.0,
+    # Lunar illumination features
+    'moon_phase': 0.5,
+    'moon_altitude_midnight': 0.0,
+    'effective_illumination': 0.0,
+    'cloud_adjusted_illumination': 0.0
 }
 
 # Expected value ranges for Wyoming (for validation)
@@ -56,6 +61,11 @@ EXPECTED_RANGES = {
     'ndvi_age_days': (0, 365),  # Days since acquisition
     'irg': (-1, 1),  # Instantaneous Rate of Green-up
     'summer_integrated_ndvi': (0, 10),  # Integrated NDVI over summer (sum of ~8 satellite images, max ~8)
+    # Lunar illumination features
+    'moon_phase': (0, 1),  # Fraction of moon illuminated (0-1)
+    'moon_altitude_midnight': (-90, 90),  # Moon's elevation above horizon at midnight (degrees)
+    'effective_illumination': (0, 1),  # Effective illumination (0-1 scale)
+    'cloud_adjusted_illumination': (0, 1),  # Cloud-adjusted illumination (0-1 scale)
 }
 
 # Valid NLCD land cover codes (2016 version)
@@ -89,16 +99,29 @@ def analyze_integrated_features(dataset_path: Path):
     
     # Environmental feature columns
     env_columns = [
+        # Geographic coordinates
+        'latitude', 'longitude',
+        # Terrain features
         'elevation', 'slope_degrees', 'aspect_degrees',
+        # Water features
         'water_distance_miles', 'water_reliability',
-        'canopy_cover_percent', 'land_cover_code',
+        # Land cover and vegetation
+        'canopy_cover_percent', 'land_cover_code', 'land_cover_type',
+        # Infrastructure
         'road_distance_miles', 'trail_distance_miles',
+        # Security habitat
         'security_habitat_percent',
         # Temporal features (SNOTEL, weather, satellite)
         'snow_depth_inches', 'snow_water_equiv_inches', 'snow_crust_detected',
         'snow_data_source', 'snow_station_name', 'snow_station_distance_km',
         'temperature_f', 'precip_last_7_days_inches', 'cloud_cover_percent',
-        'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi'
+        'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi',
+        # Lunar illumination features (for nocturnal activity modeling)
+        'moon_phase', 'moon_altitude_midnight', 'effective_illumination', 'cloud_adjusted_illumination',
+        # Temporal metadata (may be in feature files)
+        'year', 'month', 'day_of_year',
+        # Cyclical encodings (from prepare_training_features.py)
+        'day_of_year_sin', 'day_of_year_cos'
     ]
     
     # Find which environmental columns exist
@@ -138,24 +161,45 @@ def analyze_integrated_features(dataset_path: Path):
     placeholder_found = False
     for col, placeholder_val in PLACEHOLDER_VALUES.items():
         if col in df.columns:
-            # For numeric columns, use tolerance for floating point comparison
-            if pd.api.types.is_numeric_dtype(df[col]):
-                if col in ['temperature_f']:
-                    # Allow small tolerance for temperature (0.1°F)
-                    placeholder_count = (abs(df[col] - placeholder_val) < 0.1).sum()
-                elif col in ['ndvi', 'irg', 'precip_last_7_days_inches']:
-                    # Allow small tolerance for small decimal values
-                    placeholder_count = (abs(df[col] - placeholder_val) < 0.01).sum()
+            # Handle multiple placeholder values (e.g., NDVI can be 0.3 or 0.5)
+            if isinstance(placeholder_val, list):
+                placeholder_count = 0
+                for val in placeholder_val:
+                    # For numeric columns, use tolerance for floating point comparison
+                    if pd.api.types.is_numeric_dtype(df[col]):
+                        if col in ['ndvi', 'irg', 'precip_last_7_days_inches']:
+                            # Allow small tolerance for small decimal values
+                            placeholder_count += (abs(df[col] - val) < 0.01).sum()
+                        else:
+                            placeholder_count += (df[col] == val).sum()
+                    else:
+                        placeholder_count += (df[col] == val).sum()
+                
+                if placeholder_count > 0:
+                    placeholder_pct = (placeholder_count / len(df)) * 100
+                    print(f"\n⚠ {col}:")
+                    print(f"  Placeholder value(s) {placeholder_val}: {placeholder_count:,} rows ({placeholder_pct:.1f}%)")
+                    placeholder_found = True
+            else:
+                # Single placeholder value
+                # For numeric columns, use tolerance for floating point comparison
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    if col in ['temperature_f']:
+                        # Allow small tolerance for temperature (0.1°F)
+                        placeholder_count = (abs(df[col] - placeholder_val) < 0.1).sum()
+                    elif col in ['ndvi', 'irg', 'precip_last_7_days_inches']:
+                        # Allow small tolerance for small decimal values
+                        placeholder_count = (abs(df[col] - placeholder_val) < 0.01).sum()
+                    else:
+                        placeholder_count = (df[col] == placeholder_val).sum()
                 else:
                     placeholder_count = (df[col] == placeholder_val).sum()
-            else:
-                placeholder_count = (df[col] == placeholder_val).sum()
-            
-            if placeholder_count > 0:
-                placeholder_pct = (placeholder_count / len(df)) * 100
-                print(f"\n⚠ {col}:")
-                print(f"  Placeholder value ({placeholder_val}): {placeholder_count:,} rows ({placeholder_pct:.1f}%)")
-                placeholder_found = True
+                
+                if placeholder_count > 0:
+                    placeholder_pct = (placeholder_count / len(df)) * 100
+                    print(f"\n⚠ {col}:")
+                    print(f"  Placeholder value ({placeholder_val}): {placeholder_count:,} rows ({placeholder_pct:.1f}%)")
+                    placeholder_found = True
     
     if not placeholder_found:
         print("\n✓ No placeholder values detected")
@@ -220,6 +264,78 @@ def analyze_integrated_features(dataset_path: Path):
         print(f"\nClass Distribution:")
         print(f"  Presence (elk=1): {presence_count:,} ({presence_count/total*100:.1f}%)")
         print(f"  Absence (elk=0):  {absence_count:,} ({absence_count/total*100:.1f}%)")
+        
+        # Check absence strategy distribution (if using enhanced temporal generators)
+        if 'absence_strategy' in df.columns:
+            absence_df = df[df['elk_present'] == 0]
+            if len(absence_df) > 0:
+                strategy_counts = absence_df['absence_strategy'].value_counts()
+                print(f"\n  Absence Strategy Distribution:")
+                for strategy, count in strategy_counts.items():
+                    pct = (count / len(absence_df)) * 100
+                    print(f"    {strategy}: {count:,} ({pct:.1f}%)")
+        
+        # Temporal metadata completeness for absences
+        absence_df = df[df['elk_present'] == 0]
+        if len(absence_df) > 0:
+            print(f"\n  Absence Temporal Metadata Completeness:")
+            temporal_cols = ['date', 'year', 'month', 'day_of_year']
+            for col in temporal_cols:
+                if col in absence_df.columns:
+                    missing = absence_df[col].isna().sum()
+                    pct = (missing / len(absence_df)) * 100
+                    status = "✓" if pct < 5 else "⚠" if pct < 50 else "✗"
+                    print(f"    {status} {col}: {missing:,} missing ({pct:.1f}%)")
+            
+            # Check for temporal distribution matching (if both presence and absence have dates)
+            presence_df = df[df['elk_present'] == 1]
+            if 'month' in presence_df.columns and 'month' in absence_df.columns:
+                presence_months = presence_df['month'].dropna()
+                absence_months = absence_df['month'].dropna()
+                
+                if len(presence_months) > 0 and len(absence_months) > 0:
+                    # Check for disproportionate January observations (bug indicator)
+                    jan_presence_pct = (presence_months == 1).sum() / len(presence_months) * 100
+                    jan_absence_pct = (absence_months == 1).sum() / len(absence_months) * 100
+                    
+                    if jan_presence_pct > 30 or jan_absence_pct > 30:
+                        print(f"\n    ⚠ Warning: Disproportionate January observations detected")
+                        print(f"      Presence January: {jan_presence_pct:.1f}%")
+                        print(f"      Absence January: {jan_absence_pct:.1f}%")
+                        print(f"      This may indicate the January/2024 default date bug")
+                    
+                    # Check month distribution similarity
+                    presence_month_dist = presence_months.value_counts(normalize=True).sort_index()
+                    absence_month_dist = absence_months.value_counts(normalize=True).sort_index()
+                    common_months = set(presence_month_dist.index) & set(absence_month_dist.index)
+                    
+                    if len(common_months) > 0:
+                        max_diff = 0
+                        for month in common_months:
+                            diff = abs(presence_month_dist[month] - absence_month_dist.get(month, 0))
+                            max_diff = max(max_diff, diff)
+                        
+                        if max_diff < 0.1:
+                            print(f"    ✓ Temporal distribution matches well (max difference: {max_diff:.2%})")
+                        elif max_diff < 0.2:
+                            print(f"    ⚠ Temporal distribution differs moderately (max difference: {max_diff:.2%})")
+                        else:
+                            print(f"    ⚠ Temporal distribution differs significantly (max difference: {max_diff:.2%})")
+            
+            # Check for disproportionate 2024 observations (bug indicator)
+            if 'year' in presence_df.columns and 'year' in absence_df.columns:
+                presence_years = presence_df['year'].dropna()
+                absence_years = absence_df['year'].dropna()
+                
+                if len(presence_years) > 0 and len(absence_years) > 0:
+                    year_2024_presence_pct = (presence_years == 2024).sum() / len(presence_years) * 100
+                    year_2024_absence_pct = (absence_years == 2024).sum() / len(absence_years) * 100
+                    
+                    if year_2024_presence_pct > 40 or year_2024_absence_pct > 40:
+                        print(f"\n    ⚠ Warning: Disproportionate 2024 observations detected")
+                        print(f"      Presence 2024: {year_2024_presence_pct:.1f}%")
+                        print(f"      Absence 2024: {year_2024_absence_pct:.1f}%")
+                        print(f"      This may indicate the January/2024 default date bug")
     
     # Geographic distribution
     if 'latitude' in df.columns and 'longitude' in df.columns:
@@ -372,12 +488,22 @@ def analyze_integrated_features(dataset_path: Path):
             print(f"  Median: {ndvi.median():.3f}")
             print(f"  Std Dev: {ndvi.std():.3f}")
             
-            # Check for placeholder values
-            placeholder_ndvi = 0.5  # Default placeholder
-            placeholder_count = (ndvi == placeholder_ndvi).sum()
-            if placeholder_count > 0:
-                placeholder_pct = (placeholder_count / len(ndvi)) * 100
-                print(f"\n  ⚠ Placeholder NDVI ({placeholder_ndvi}): {placeholder_count:,} rows ({placeholder_pct:.1f}%)")
+            # Check for placeholder values (0.3 and 0.5 are both placeholders)
+            placeholder_ndvi_values = [0.3, 0.5]
+            placeholder_counts = {}
+            for val in placeholder_ndvi_values:
+                count = (abs(ndvi - val) < 0.01).sum()
+                if count > 0:
+                    placeholder_counts[val] = count
+            
+            if placeholder_counts:
+                total_placeholder = sum(placeholder_counts.values())
+                placeholder_pct = (total_placeholder / len(ndvi)) * 100
+                print(f"\n  ⚠ Placeholder NDVI values detected:")
+                for val, count in placeholder_counts.items():
+                    pct = (count / len(ndvi)) * 100
+                    print(f"    NDVI = {val}: {count:,} rows ({pct:.1f}%)")
+                print(f"    Total placeholders: {total_placeholder:,} rows ({placeholder_pct:.1f}%)")
                 if placeholder_pct > 10:
                     print(f"    → Consider running integration script to fetch real NDVI data from AppEEARS")
             else:
@@ -1102,9 +1228,16 @@ def analyze_integrated_features(dataset_path: Path):
         
         # Add specific warnings for temporal features
         if 'ndvi' in df.columns:
-            placeholder_ndvi = (abs(df['ndvi'] - 0.5) < 0.01).sum()
-            if placeholder_ndvi > len(df) * 0.1:
-                warnings.append(f"⚠ {placeholder_ndvi:,} rows ({placeholder_ndvi/len(df)*100:.1f}%) have placeholder NDVI (0.5)")
+            placeholder_ndvi_03 = (abs(df['ndvi'] - 0.3) < 0.01).sum()
+            placeholder_ndvi_05 = (abs(df['ndvi'] - 0.5) < 0.01).sum()
+            total_placeholder_ndvi = placeholder_ndvi_03 + placeholder_ndvi_05
+            if total_placeholder_ndvi > len(df) * 0.1:
+                if placeholder_ndvi_03 > 0 and placeholder_ndvi_05 > 0:
+                    warnings.append(f"⚠ {total_placeholder_ndvi:,} rows ({total_placeholder_ndvi/len(df)*100:.1f}%) have placeholder NDVI (0.3: {placeholder_ndvi_03}, 0.5: {placeholder_ndvi_05})")
+                elif placeholder_ndvi_03 > 0:
+                    warnings.append(f"⚠ {placeholder_ndvi_03:,} rows ({placeholder_ndvi_03/len(df)*100:.1f}%) have placeholder NDVI (0.3)")
+                else:
+                    warnings.append(f"⚠ {placeholder_ndvi_05:,} rows ({placeholder_ndvi_05/len(df)*100:.1f}%) have placeholder NDVI (0.5)")
                 warnings.append("  → Set APPEEARS_USERNAME and APPEEARS_PASSWORD environment variables to fetch real NDVI data")
         
         if 'temperature_f' in df.columns:
@@ -1224,6 +1357,40 @@ def analyze_integrated_features(dataset_path: Path):
     # Feature completeness warnings
     if missing_features:
         warnings.append(f"⚠ {len(missing_features)} expected environmental features are missing")
+    
+    # Temporal absence generation warnings
+    if 'elk_present' in df.columns:
+        absence_df = df[df['elk_present'] == 0]
+        if len(absence_df) > 0:
+            # Check for missing temporal metadata in absences
+            if 'month' in absence_df.columns:
+                missing_month = absence_df['month'].isna().sum()
+                if missing_month > len(absence_df) * 0.1:  # >10% missing
+                    pct = (missing_month / len(absence_df)) * 100
+                    warnings.append(f"⚠ {missing_month:,} absence rows ({pct:.1f}%) missing month - temporal strategies may not be enabled")
+                    warnings.append("  → Use --use-temporal-strategies flag in generate_absence_data.py to ensure all absences have temporal metadata")
+            
+            if 'year' in absence_df.columns:
+                missing_year = absence_df['year'].isna().sum()
+                if missing_year > len(absence_df) * 0.1:  # >10% missing
+                    pct = (missing_year / len(absence_df)) * 100
+                    warnings.append(f"⚠ {missing_year:,} absence rows ({pct:.1f}%) missing year - temporal strategies may not be enabled")
+            
+            # Check for absence_strategy column (indicates enhanced temporal generators were used)
+            if 'absence_strategy' not in absence_df.columns:
+                warnings.append("⚠ 'absence_strategy' column not found - may be using legacy absence generators")
+                warnings.append("  → Enhanced temporal strategies add this column to track which strategy generated each absence")
+            
+            # Check for disproportionate January/2024 (bug indicator)
+            if 'month' in absence_df.columns:
+                jan_pct = (absence_df['month'] == 1).sum() / len(absence_df) * 100
+                if jan_pct > 30:
+                    warnings.append(f"⚠ {jan_pct:.1f}% of absences are in January - may indicate default date bug")
+            
+            if 'year' in absence_df.columns:
+                year_2024_pct = (absence_df['year'] == 2024).sum() / len(absence_df) * 100
+                if year_2024_pct > 40:
+                    warnings.append(f"⚠ {year_2024_pct:.1f}% of absences are in 2024 - may indicate default date bug")
     
     if 'water_distance_miles' in df.columns:
         water_dist = df['water_distance_miles'].dropna()

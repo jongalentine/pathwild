@@ -41,9 +41,12 @@ METADATA_COLUMNS = {
     'date',
     # Dataset name (if present)
     'dataset_name', 'dataset',
-    # SNOTEL station name (categorical with high cardinality, risk of overfitting)
-    # Note: snow_data_source and snow_station_distance_km are kept as features
-    'snow_station_name',
+    # SNOTEL station metadata (data quality indicators, not environmental features)
+    # These could cause data leakage or model artifacts based on data availability
+    # rather than actual habitat preferences
+    'snow_station_name',  # High cardinality categorical (excluded - overfitting risk)
+    'snow_station_distance_km',  # Data quality indicator, not biological feature (excluded - potential leakage)
+    'snow_data_source',  # Data quality indicator, not environmental feature (excluded - potential leakage)
     # Predator/wildlife data quality and activity metrics (temporarily excluded until better modeling approach)
     'wolf_data_quality', 'bear_data_quality', 'bear_activity_distance_miles', 'wolves_per_1000_elk',
     # Pregnancy rate (temporarily excluded until better modeling approach)
@@ -66,8 +69,12 @@ CORE_FEATURES = {
     'road_distance_miles', 'trail_distance_miles',
     'security_habitat_percent',
     'snow_depth_inches', 'snow_water_equiv_inches', 'snow_crust_detected',
+    # Note: snow_data_source, snow_station_name, snow_station_distance_km are excluded
+    # as they are data quality indicators, not environmental features
     'temperature_f', 'precip_last_7_days_inches', 'cloud_cover_percent',
-    'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi'
+    'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi',
+    # Lunar illumination features (for nocturnal activity modeling)
+    'moon_phase', 'moon_altitude_midnight', 'effective_illumination', 'cloud_adjusted_illumination'
 }
 
 
@@ -233,11 +240,27 @@ def prepare_training_dataset(
             print(f"     Available columns: {[c for c in df_features.columns if 'day' in c.lower()]}")
     
     # Report excluded columns
-    excluded = set(df.columns) - set(feature_cols)
+    # Note: day_of_year_sin and day_of_year_cos are newly created, not excluded
+    # Only show columns that were in the input file but excluded from output
+    original_input_cols = set(df.columns)
+    # Remove newly created columns from consideration (they weren't excluded, they were created)
+    created_cols = set()
+    if 'day_of_year_sin' in df.columns and 'day_of_year_sin' in feature_cols:
+        created_cols.add('day_of_year_sin')
+    if 'day_of_year_cos' in df.columns and 'day_of_year_cos' in feature_cols:
+        created_cols.add('day_of_year_cos')
+    
+    excluded = original_input_cols - set(feature_cols) - created_cols
     if excluded:
         print(f"\n  Excluded {len(excluded)} metadata columns:")
         for col in sorted(excluded):
             print(f"    - {col}")
+    
+    # Report newly created columns (if any)
+    if created_cols:
+        print(f"\n  Created {len(created_cols)} cyclical encoding columns:")
+        for col in sorted(created_cols):
+            print(f"    + {col} (from day_of_year)")
     
     print(f"\n  Selected {len(feature_cols)} feature columns:")
     print(f"    - Target: elk_present")

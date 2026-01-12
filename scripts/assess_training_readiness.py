@@ -133,6 +133,33 @@ def assess_training_readiness(dataset_path: Optional[Path] = None, test_mode: bo
                 print(f"  ⚠ Warning: Class imbalance detected (ratio outside [0.5, 2.0])")
             else:
                 print(f"  ✓ Good class balance")
+            
+            # Check absence strategy distribution (if using enhanced temporal generators)
+            absence_df = combined_df[combined_df['elk_present'] == 0]
+            if 'absence_strategy' in absence_df.columns:
+                strategy_counts = absence_df['absence_strategy'].value_counts()
+                print(f"\n  Absence Strategy Distribution:")
+                for strategy, count in strategy_counts.items():
+                    pct = (count / len(absence_df)) * 100
+                    print(f"    {strategy}: {count:,} ({pct:.1f}%)")
+            
+            # Check temporal metadata completeness for absences (critical for model accuracy)
+            temporal_cols = ['date', 'year', 'month', 'day_of_year']
+            missing_temporal = {}
+            for col in temporal_cols:
+                if col in absence_df.columns:
+                    missing = absence_df[col].isna().sum()
+                    if missing > 0:
+                        missing_pct = (missing / len(absence_df)) * 100
+                        missing_temporal[col] = (missing, missing_pct)
+            
+            if missing_temporal:
+                print(f"\n  ⚠ Absence Temporal Metadata Missing:")
+                for col, (count, pct) in missing_temporal.items():
+                    print(f"    {col}: {count:,} ({pct:.1f}%)")
+                print(f"    → This reduces model accuracy - use enhanced temporal strategies")
+            else:
+                print(f"\n  ✓ All absence rows have complete temporal metadata")
     
     # Volume recommendations
     print(f"\nVolume Recommendations:")
@@ -293,11 +320,39 @@ def assess_training_readiness(dataset_path: Optional[Path] = None, test_mode: bo
     print("MODEL TRAINING RECOMMENDATIONS")
     print(f"{'='*70}")
     
-    # Overall readiness score
-    readiness_score = (volume_score * 0.3 + feature_richness_score * 0.3 + quality_score * 0.4)
+    # Check temporal metadata completeness (affects model accuracy)
+    temporal_score = 1.0
+    if 'elk_present' in combined_df.columns:
+        absence_df = combined_df[combined_df['elk_present'] == 0]
+        if len(absence_df) > 0:
+            temporal_cols = ['month', 'year']
+            for col in temporal_cols:
+                if col in absence_df.columns:
+                    missing_pct = (absence_df[col].isna().sum() / len(absence_df)) * 100
+                    if missing_pct > 50:
+                        temporal_score = 0.5  # Significant missing temporal data
+                    elif missing_pct > 10:
+                        temporal_score = min(temporal_score, 0.8)  # Some missing temporal data
+    
+    # Overall readiness score (temporal completeness is important for model accuracy)
+    readiness_score = (volume_score * 0.25 + feature_richness_score * 0.25 + quality_score * 0.35 + temporal_score * 0.15)
     readiness_pct = readiness_score * 100
     
     print(f"\nOverall Readiness Score: {readiness_pct:.1f}%")
+    
+    # Report temporal metadata status
+    if 'elk_present' in combined_df.columns:
+        absence_df = combined_df[combined_df['elk_present'] == 0]
+        if len(absence_df) > 0:
+            if 'month' in absence_df.columns and 'year' in absence_df.columns:
+                missing_month = absence_df['month'].isna().sum()
+                missing_year = absence_df['year'].isna().sum()
+                if missing_month > len(absence_df) * 0.1 or missing_year > len(absence_df) * 0.1:
+                    print(f"\n  ⚠ Temporal Metadata: {missing_month/len(absence_df)*100:.1f}% missing month, {missing_year/len(absence_df)*100:.1f}% missing year")
+                    print(f"    → Model accuracy will be reduced without complete temporal metadata")
+                    print(f"    → Re-run generate_absence_data.py with --use-temporal-strategies (enabled by default)")
+                else:
+                    print(f"\n  ✓ Temporal Metadata: Complete temporal information for absences")
     
     if readiness_pct >= 80:
         print(f"\n✓ Dataset is READY for model training")
@@ -305,6 +360,17 @@ def assess_training_readiness(dataset_path: Optional[Path] = None, test_mode: bo
         print(f"    - Proceed with model training")
         print(f"    - Consider cross-validation for robust evaluation")
         print(f"    - Monitor for overfitting with large feature set")
+        # Check if temporal strategies were used
+        if 'elk_present' in combined_df.columns:
+            absence_df = combined_df[combined_df['elk_present'] == 0]
+            if 'absence_strategy' in absence_df.columns:
+                print(f"    - ✓ Enhanced temporal strategies detected (all absences have temporal metadata)")
+            elif len(absence_df) > 0 and 'month' in absence_df.columns:
+                missing_month = absence_df['month'].isna().sum()
+                if missing_month < len(absence_df) * 0.1:
+                    print(f"    - ✓ Temporal metadata present (legacy generators with temporal support)")
+                else:
+                    print(f"    - ⚠ Consider re-running with enhanced temporal strategies for better accuracy")
     elif readiness_pct >= 60:
         print(f"\n⚠ Dataset is MOSTLY READY with some concerns")
         print(f"  Recommendations:")
