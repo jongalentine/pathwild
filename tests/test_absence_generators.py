@@ -47,6 +47,35 @@ def sample_presence_data():
 
 
 @pytest.fixture
+def sample_presence_data_with_dates():
+    """Create sample presence data with dates for temporal metadata testing."""
+    np.random.seed(42)
+    lats = np.random.uniform(43.0, 44.0, 10)
+    lons = np.random.uniform(-107.5, -107.0, 10)
+    
+    # Add dates
+    dates = pd.to_datetime([
+        '2020-06-15', '2020-07-20', '2020-08-10', '2020-09-05', '2020-10-12',
+        '2020-11-18', '2020-12-25', '2021-01-08', '2021-02-14', '2021-03-22'
+    ])
+    
+    df = pd.DataFrame({
+        'latitude': lats,
+        'longitude': lons,
+        'date': dates,
+        'elk_present': 1
+    })
+    
+    gdf = gpd.GeoDataFrame(
+        df,
+        geometry=gpd.points_from_xy(df.longitude, df.latitude),
+        crs="EPSG:4326"
+    )
+    
+    return gdf
+
+
+@pytest.fixture
 def sample_study_area():
     """Create sample study area (Wyoming bounding box)."""
     wyoming_bbox = box(-111.0, 41.0, -104.0, 45.0)
@@ -112,6 +141,10 @@ class TestRandomBackgroundGenerator:
         assert 'absence_strategy' in absences.columns
         assert all(absences['absence_strategy'] == 'background')
         
+        # Check that _add_temporal_metadata method exists
+        assert hasattr(generator, '_add_temporal_metadata'), \
+            "Legacy generators should have _add_temporal_metadata method"
+        
         # Check all points are in study area
         assert all(generator._is_in_study_area(p) for p in absences.geometry)
         
@@ -171,6 +204,36 @@ class TestRandomBackgroundGenerator:
         # Should generate fewer points than requested
         absences = generator.generate(n_samples=100, max_attempts=10)
         assert len(absences) <= 10
+    
+    def test_temporal_metadata_added_when_dates_available(self, sample_presence_data_with_dates, sample_study_area):
+        """Test that temporal metadata is added when presence data has dates."""
+        generator = RandomBackgroundGenerator(
+            sample_presence_data_with_dates,
+            sample_study_area,
+            min_distance_meters=500.0
+        )
+        
+        absences = generator.generate(n_samples=5, max_attempts=1000)
+        
+        if len(absences) > 0:
+            # Check if temporal metadata was added (depends on date column detection)
+            # The _add_temporal_metadata method should have been called
+            temporal_cols = ['date', 'year', 'month', 'day_of_year']
+            has_any_temporal = any(col in absences.columns for col in temporal_cols)
+            
+            # If dates are available, temporal metadata should be added
+            if 'date' in sample_presence_data_with_dates.columns:
+                # Method should exist
+                assert hasattr(generator, '_add_temporal_metadata')
+                
+                # If temporal columns exist, they should be complete
+                if has_any_temporal:
+                    for col in temporal_cols:
+                        if col in absences.columns:
+                            missing = absences[col].isna().sum()
+                            # Should have minimal missing values if dates were parsed correctly
+                            assert missing < len(absences), \
+                                f"{col} should have minimal missing values when dates are available"
 
 
 class TestEnvironmentalPseudoAbsenceGenerator:

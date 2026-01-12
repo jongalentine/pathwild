@@ -177,7 +177,12 @@ class TestIncrementalProcessing:
                     'ndvi': 0.5,  # Placeholder
                     'ndvi_age_days': 8,  # Placeholder
                     'irg': 0.0,  # Placeholder
-                    'summer_integrated_ndvi': 0.0  # Placeholder
+                    'summer_integrated_ndvi': 0.0,  # Placeholder
+                    # Lunar illumination features
+                    'moon_phase': 0.5,  # Placeholder
+                    'moon_altitude_midnight': 0.0,  # Placeholder
+                    'effective_illumination': 0.0,  # Placeholder
+                    'cloud_adjusted_illumination': 0.0  # Placeholder
                 })
             else:
                 # Rows with real values
@@ -210,7 +215,12 @@ class TestIncrementalProcessing:
                     'ndvi': 0.6,  # Not 0.5 (placeholder)
                     'ndvi_age_days': 5,  # Not 8 (placeholder)
                     'irg': 0.1,  # Not 0.0 (placeholder)
-                    'summer_integrated_ndvi': 75.0  # Not 0.0 (placeholder)
+                    'summer_integrated_ndvi': 75.0,  # Not 0.0 (placeholder)
+                    # Lunar illumination features with NON-PLACEHOLDER values
+                    'moon_phase': 0.3,  # Not 0.5 (placeholder)
+                    'moon_altitude_midnight': 15.0,  # Not 0.0 (placeholder)
+                    'effective_illumination': 0.4,  # Not 0.0 (placeholder)
+                    'cloud_adjusted_illumination': 0.35  # Not 0.0 (placeholder)
                 })
         
         df = pd.DataFrame(data)
@@ -380,7 +390,12 @@ class TestParallelProcessing:
                 'ndvi': 0.5,  # Placeholder
                 'ndvi_age_days': 8,  # Placeholder
                 'irg': 0.0,  # Placeholder
-                'summer_integrated_ndvi': 0.0  # Placeholder
+                'summer_integrated_ndvi': 0.0,  # Placeholder
+                # Lunar illumination features
+                'moon_phase': 0.5,  # Placeholder
+                'moon_altitude_midnight': 0.0,  # Placeholder
+                'effective_illumination': 0.0,  # Placeholder
+                'cloud_adjusted_illumination': 0.0  # Placeholder
             })
         
         df = pd.DataFrame(data)
@@ -481,7 +496,12 @@ class TestParallelProcessing:
             'ndvi': [0.6] * 100,  # Not 0.5 (placeholder)
             'ndvi_age_days': [5] * 100,  # Not 8 (placeholder)
             'irg': [0.1] * 100,  # Not 0.0 (placeholder)
-            'summer_integrated_ndvi': [75.0] * 100  # Not 0.0 (placeholder)
+            'summer_integrated_ndvi': [75.0] * 100,  # Not 0.0 (placeholder)
+            # Lunar illumination features with NON-PLACEHOLDER values
+            'moon_phase': [0.3] * 100,  # Not 0.5 (placeholder)
+            'moon_altitude_midnight': [15.0] * 100,  # Not 0.0 (placeholder)
+            'effective_illumination': [0.4] * 100,  # Not 0.0 (placeholder)
+            'cloud_adjusted_illumination': [0.35] * 100  # Not 0.0 (placeholder)
         })
         df = pd.concat([df, real_data], ignore_index=True)
         

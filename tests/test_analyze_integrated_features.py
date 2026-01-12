@@ -88,7 +88,7 @@ class TestAnalyzeIntegratedFeatures:
         assert 'temperature_f' in analyze_module.PLACEHOLDER_VALUES
         assert analyze_module.PLACEHOLDER_VALUES['temperature_f'] == 45.0
         assert 'ndvi' in analyze_module.PLACEHOLDER_VALUES
-        assert analyze_module.PLACEHOLDER_VALUES['ndvi'] == 0.5
+        assert analyze_module.PLACEHOLDER_VALUES['ndvi'] == [0.3, 0.5]  # Multiple placeholder values
         assert 'precip_last_7_days_inches' in analyze_module.PLACEHOLDER_VALUES
         assert analyze_module.PLACEHOLDER_VALUES['precip_last_7_days_inches'] == 0.0
     
