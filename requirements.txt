@@ -68,6 +68,14 @@ pyyaml>=6.0.0
 # Google Earth Engine (optional - for NDVI data)
 earthengine-api>=0.1.400
 
+# Astronomical calculations (for lunar illumination features)
+ephem>=4.1.0
+
+# ERA5 climate data (cloud cover)
+cdsapi>=0.7.0  # Copernicus Climate Data Store API
+xarray>=2024.1.0  # NetCDF file reading
+netCDF4>=1.6.0  # NetCDF support for xarray
+
 # Testing
 pytest>=7.4.0
 pytest-cov>=4.1.0

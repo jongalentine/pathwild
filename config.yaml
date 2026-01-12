@@ -106,3 +106,119 @@ area_048_polygon:
   - [-107.0, 44.7]
   - [-107.0, 44.3]
   - [-107.5, 44.3]
+
+# Absence generation configuration
+absence_generation:
+  # Input paths (flexible - user configures these)
+  input:
+    presence_data_dir: "data/processed"
+    presence_file_pattern: "presence_*.csv"
+    # OR specify exact files (uncomment and modify as needed):
+    # presence_files:
+    #   - "data/processed/presence_north_bighorn.csv"
+    #   - "data/processed/presence_south_bighorn.csv"
+    #   - "data/processed/presence_national_refuge.csv"
+    #   - "data/processed/presence_southern_gye.csv"
+    
+    # Geographic boundaries (for spatial sampling)
+    study_area:
+      # Auto-detect from presence data OR specify manually:
+      bbox: null  # [min_lon, min_lat, max_lon, max_lat] or null to auto-detect
+      shapefile: null  # Optional: Wyoming boundary shapefile path
+    
+    # DEM / elevation data (for unsuitable elevation strategy)
+    dem_file: "data/dem/wyoming_dem.tif"  # Optional, used for elevation checks
+  
+  # Dataset-specific settings (allow per-dataset configuration)
+  datasets:
+    north_bighorn:
+      enabled: true
+      weight: 1.0  # Relative weight in combined dataset
+      temporal_offset_months: 6  # For seasonal segregation
+    
+    south_bighorn:
+      enabled: true
+      weight: 1.0
+      temporal_offset_months: 6
+    
+    national_refuge:
+      enabled: true
+      weight: 0.5  # Lower weight due to distance from Area 048
+      temporal_offset_months: 6
+    
+    southern_gye:
+      enabled: true
+      weight: 0.5
+      temporal_offset_months: 4  # Adjust based on seasonal timing
+  
+  # Absence generation strategies
+  strategies:
+    temporal_matched:
+      enabled: true
+      proportion: 0.40
+      min_distance_from_presence_m: 2000
+      elevation_range: [6000, 11000]  # ft (optional filter)
+      max_slope_degrees: 45  # Optional filter
+      max_water_distance_miles: 5  # Optional filter
+    
+    seasonal_segregation:
+      enabled: true
+      proportion: 0.30
+      use_same_location: true
+      offset_months: 6  # Default, can be overridden per dataset
+      confidence: "high"
+    
+    unsuitable_temporal_environmental:
+      enabled: true
+      proportion: 0.20
+      rules:
+        winter_too_high:
+          elevation_min: 9000  # ft
+          months: [12, 1, 2, 3]
+        summer_too_low:
+          elevation_max: 6000  # ft
+          months: [6, 7, 8]
+        fall_too_high:
+          elevation_min: 11000  # ft
+          months: [9, 10, 11]
+        fall_too_low:
+          elevation_max: 5000  # ft
+          months: [9, 10, 11]
+      confidence: "high"
+    
+    random_background:
+      enabled: true
+      proportion: 0.10
+      min_distance_from_presence_m: 500
+      uniform_temporal: true  # Sample uniformly across all months
+      confidence: "low"
+  
+  # Balance settings
+  balance:
+    ratio: 1.0  # absences:presences (1.0 = equal)
+    per_dataset: false  # If true, balance each dataset separately
+    global: true  # If true, balance across all datasets combined
+  
+  # Output settings
+  output:
+    directory: "data/processed"
+    filename_pattern: "absence_{dataset}_{strategy}.csv"
+    combined_filename: "combined_presence_absence.csv"
+    save_separate_files: false  # Per-dataset files
+    save_strategy_files: false  # Per-strategy files
+    save_combined: true  # One combined file
+    save_metadata: true
+    save_validation_report: true
+  
+  # Feature enrichment (optional - handled by integrate_environmental_features.py)
+  enrichment:
+    enabled: false  # Set true to enrich with environmental features here
+    use_data_context_builder: true
+    batch_size: 1000
+    retry_attempts: 3
+    retry_delay_seconds: 5
+    cache_static_features: true
+  
+  # Enable/disable temporal strategies
+  use_temporal_strategies: true  # Enable enhanced temporal strategies (recommended)
+  use_legacy_generators: false   # Keep old generators as fallback
