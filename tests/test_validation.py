@@ -148,6 +148,121 @@ class TestValidation:
         # Scores should differ by season (exact relationships depend on location)
         # Main point: system responds to seasonal changes
         assert len(set(scores.values())) > 1  # Not all the same
+    
+    @pytest.mark.parametrize("month", range(1, 13))
+    def test_monthly_seasonal_validation(self, engine, month):
+        """Test seasonal validation across all 12 months"""
+        location = {
+            "location": {
+                "type": "polygon",
+                "coordinates": [[
+                    [-110.70, 43.05],
+                    [-110.65, 43.05],
+                    [-110.65, 43.00],
+                    [-110.70, 43.00],
+                    [-110.70, 43.05]
+                ]]
+            }
+        }
+        
+        # Create date for the 15th of each month in 2026
+        date = f"2026-{month:02d}-15"
+        
+        request = {
+            **location,
+            "date_range": {
+                "start": date,
+                "end": date,
+                "find_best_days": False
+            }
+        }
+        
+        response = engine.predict(request)
+        
+        # Validate response structure
+        assert "overall" in response
+        assert "score" in response["overall"]
+        assert 0 <= response["overall"]["score"] <= 100
+        
+        # Validate that system produces valid predictions for all months
+        assert response["overall"]["score"] >= 0
+        assert response["overall"]["confidence_level"] in ["low", "medium", "high"]
+        
+        # Store month name for reporting
+        month_names = {
+            1: "January", 2: "February", 3: "March", 4: "April",
+            5: "May", 6: "June", 7: "July", 8: "August",
+            9: "September", 10: "October", 11: "November", 12: "December"
+        }
+        
+        # Log the score for this month (visible in verbose test output)
+        print(f"\n{month_names[month]} ({date}): Score = {response['overall']['score']:.2f}")
+    
+    def test_seasonal_patterns_all_months(self, engine):
+        """Test that seasonal patterns are consistent across all months"""
+        location = {
+            "location": {
+                "type": "polygon",
+                "coordinates": [[
+                    [-110.70, 43.05],
+                    [-110.65, 43.05],
+                    [-110.65, 43.00],
+                    [-110.70, 43.00],
+                    [-110.70, 43.05]
+                ]]
+            }
+        }
+        
+        # Test all 12 months
+        monthly_scores = {}
+        month_names = {
+            1: "January", 2: "February", 3: "March", 4: "April",
+            5: "May", 6: "June", 7: "July", 8: "August",
+            9: "September", 10: "October", 11: "November", 12: "December"
+        }
+        
+        for month in range(1, 13):
+            date = f"2026-{month:02d}-15"
+            request = {
+                **location,
+                "date_range": {
+                    "start": date,
+                    "end": date,
+                    "find_best_days": False
+                }
+            }
+            response = engine.predict(request)
+            monthly_scores[month] = {
+                "month_name": month_names[month],
+                "date": date,
+                "score": response["overall"]["score"],
+                "confidence": response["overall"]["confidence_level"]
+            }
+        
+        # Validate that we have scores for all months
+        assert len(monthly_scores) == 12
+        
+        # Validate that scores vary (system responds to seasonal changes)
+        scores = [v["score"] for v in monthly_scores.values()]
+        assert len(set(scores)) > 1, "Scores should vary across months"
+        
+        # Validate that all scores are in valid range
+        assert all(0 <= s <= 100 for s in scores), "All scores should be 0-100"
+        
+        # Print summary for analysis
+        print("\n=== Seasonal Validation Summary ===")
+        for month, data in monthly_scores.items():
+            print(f"{data['month_name']:12} ({data['date']}): Score={data['score']:6.2f}, Confidence={data['confidence']}")
+        
+        # Check for expected seasonal patterns
+        # Winter months (Dec, Jan, Feb, Mar) might have different patterns than summer
+        winter_scores = [monthly_scores[m]["score"] for m in [12, 1, 2, 3]]
+        summer_scores = [monthly_scores[m]["score"] for m in [6, 7, 8]]
+        
+        # At minimum, ensure system produces different scores for different seasons
+        # (exact relationships depend on location and heuristics)
+        assert len(set(winter_scores + summer_scores)) > 1, \
+            "Winter and summer should show some variation"
 
 
 if __name__ == "__main__":
