@@ -45,6 +45,9 @@ dependencies:
   - beautifulsoup4
   - lxml
   - openpyxl
+
+  # Configuration
+  - pyyaml
   
   # Geospatial (conda handles binary dependencies better)
   - rasterio
