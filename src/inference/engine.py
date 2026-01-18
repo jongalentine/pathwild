@@ -16,26 +16,29 @@ from ..scoring.heuristics import (
     SecurityHabitatHeuristic,
     PredationRiskHeuristic,
     NutritionalConditionHeuristic,
-    WinterSeverityHeuristic
+    WinterSeverityHeuristic,
+    MLPredictionHeuristic
 )
 from ..data.processors import DataContextBuilder
 
 class ElkPredictionEngine:
     """Main inference engine for elk predictions"""
     
-    def __init__(self, data_dir: str, weights: Optional[Dict] = None, 
-                 method: str = "additive"):
+    def __init__(self, data_dir: str, weights: Optional[Dict] = None,
+                 method: str = "additive", use_ml: bool = True):
         """
         Initialize prediction engine
-        
+
         Args:
             data_dir: Path to data directory
             weights: Optional heuristic weights
             method: "additive" or "multiplicative"
+            use_ml: Whether to include the ML prediction heuristic (default: True)
         """
         self.data_dir = Path(data_dir)
         self.data_builder = DataContextBuilder(self.data_dir)
-        
+        self.use_ml = use_ml
+
         # Set up heuristics with weights
         default_weights = weights or {}
         self.heuristics = [
@@ -49,10 +52,28 @@ class ElkPredictionEngine:
             NutritionalConditionHeuristic(weight=default_weights.get("nutrition", 1.0)),
             WinterSeverityHeuristic(weight=default_weights.get("winterkill", 1.0))
         ]
-        
+
+        # Optionally add ML heuristic with higher weight
+        self.ml_heuristic = None
+        if use_ml:
+            try:
+                self.ml_heuristic = MLPredictionHeuristic(
+                    weight=default_weights.get("ml_prediction", 2.0)
+                )
+                self.heuristics.append(self.ml_heuristic)
+                print(f"ML heuristic loaded (weight={self.ml_heuristic.weight})")
+                if self.ml_heuristic.cv_accuracy:
+                    print(f"  Model CV accuracy: {self.ml_heuristic.cv_accuracy:.1%}")
+            except FileNotFoundError as e:
+                print(f"Warning: ML model not available - {e}")
+                print("  Predictions will use heuristics only.")
+            except Exception as e:
+                print(f"Warning: Could not load ML model - {e}")
+                print("  Predictions will use heuristics only.")
+
         # Create aggregator
         self.aggregator = ScoreAggregator(self.heuristics, method=method)
-        
+
         # Cache for expensive operations
         self._grid_cache = {}
     
@@ -305,7 +326,7 @@ class ElkPredictionEngine:
             
             # Calculate cluster metrics
             cluster_scores = [p["score"] for p in cluster]
-            avg_cluster_score = np.mean(cluster_scores)
+            avg_cluster_score = float(np.mean(cluster_scores))  # Convert to native Python float
             
             # Estimate elk in cluster
             cluster_area_acres = len(cluster) * 0.25  # Rough estimate
