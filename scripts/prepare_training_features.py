@@ -21,17 +21,20 @@ import importlib.util
 from typing import List, Set, Optional
 
 # Metadata columns to exclude from training (dataset-specific identifiers and source info)
+# NOTE: Matching is case-insensitive (see _is_metadata_column function)
 METADATA_COLUMNS = {
     # Identifiers
-    'route_id', 'id', 'Elk_ID', 'elk_id', 'point_index',  # point_index: route-specific metadata (only present for LineString routes, missing for Point geometries, CSV files, and absence data)
+    'route_id', 'id', 'elk_id', 'aid', 'point_index',  # point_index: route-specific metadata (only present for LineString routes, missing for Point geometries, CSV files, and absence data)
     # Area-specific metadata
     'distance_to_area_048_km', 'inside_area_048',
     # Source temporal metadata
     'mig', 'firstdate', 'lastdate', 'season',
-    # UTM coordinates (we have lat/lon)
-    'UTM_X', 'UTM_Y', 'utm_easting', 'utm_northing', 'Zone',
+    # UTM coordinates (we have lat/lon) - include various naming conventions
+    'utm_x', 'utm_y', 'utm_easting', 'utm_northing', 'easting', 'northing', 'zone',
     # Source data columns (duplicates of standardized columns)
-    'Lat', 'Long', 'DT', 'TZ', 't',
+    'lat', 'long', 'dt', 'tz', 't',
+    # Timestamps (dataset-specific formats)
+    'date_time_mst', 'datetime', 'timestamp',
     # Absence generation metadata (could cause data leakage)
     'absence_strategy',
     # Feedground info (dataset-specific)
@@ -52,6 +55,14 @@ METADATA_COLUMNS = {
     # Pregnancy rate (temporarily excluded until better modeling approach)
     'pregnancy_rate'
 }
+
+# Create lowercase set for case-insensitive matching
+_METADATA_COLUMNS_LOWER = {col.lower() for col in METADATA_COLUMNS}
+
+
+def _is_metadata_column(col: str) -> bool:
+    """Check if a column is a metadata column (case-insensitive)."""
+    return col.lower() in _METADATA_COLUMNS_LOWER
 
 # Columns that might be useful but should be evaluated carefully
 # (year, month, day_of_year could be useful for temporal patterns, but might encode dataset info)
@@ -81,34 +92,34 @@ CORE_FEATURES = {
 def get_feature_columns(df: pd.DataFrame, exclude_temporal: bool = False) -> List[str]:
     """
     Get list of feature columns to use for training.
-    
+
     Args:
         df: Input DataFrame
         exclude_temporal: If True, exclude year/month/day_of_year columns
-    
+
     Returns:
         List of column names to use as features
     """
     all_cols = set(df.columns)
-    
+
     # Start with core features that exist in the dataframe
     feature_cols = [col for col in CORE_FEATURES if col in all_cols]
-    
-    # Add any other columns that aren't metadata
+
+    # Add any other columns that aren't metadata (case-insensitive check)
     for col in all_cols:
-        if col not in METADATA_COLUMNS:
+        if not _is_metadata_column(col):
             if col not in feature_cols:
                 if exclude_temporal and col in OPTIONAL_TEMPORAL_COLUMNS:
                     continue
                 feature_cols.append(col)
-    
+
     # Ensure target is included (but not as a feature)
     if 'elk_present' in feature_cols:
         feature_cols.remove('elk_present')
-    
+
     # Sort for consistency
     feature_cols.sort()
-    
+
     return feature_cols
 
 

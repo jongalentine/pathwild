@@ -692,18 +692,18 @@ class PRISMClient:
         tmin = self.extract_value("tmin", lat, lon, date)
         tmax = self.extract_value("tmax", lat, lon, date)
         
-        # PRISM stores temperature as °C × 100, convert to °C
+        # PRISM .tif files store temperature in °C × 100 (divide by 100 to get actual °C)
         result = {}
         if tmean is not None:
             result["temp_mean_c"] = tmean / 100.0
         else:
             result["temp_mean_c"] = None
-        
+
         if tmin is not None:
             result["temp_min_c"] = tmin / 100.0
         else:
             result["temp_min_c"] = None
-        
+
         if tmax is not None:
             result["temp_max_c"] = tmax / 100.0
         else:
@@ -732,8 +732,8 @@ class PRISMClient:
         
         if ppt is None:
             return None
-        
-        # PRISM stores precipitation as mm × 100, convert to mm
+
+        # PRISM .tif files store precipitation in mm × 100 (divide by 100 to get actual mm)
         return ppt / 100.0
     
     def get_weather_for_date_range(
