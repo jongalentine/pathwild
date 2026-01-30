@@ -793,11 +793,11 @@ class TestFullIntegration:
         df.loc[:100, 'elevation'] = 8500.0
         df.to_csv(mixed_dataset, index=False)
         
-        # Time force mode and track calls
+        # Time force mode and track calls (no_resume so checkpoint from incremental doesn't skip work)
         mock_builder.build_context.reset_mock()  # Reset before force
         start_time = time.time()
         update_dataset(
-            mixed_dataset, mock_data_dir, batch_size=100, limit=None, n_workers=1, force=True
+            mixed_dataset, mock_data_dir, batch_size=100, limit=None, n_workers=1, force=True, no_resume=True
         )
         force_time = time.time() - start_time
         force_calls = mock_builder.build_context.call_count

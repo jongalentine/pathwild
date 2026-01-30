@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Callable, TypeVar, Any
 from pathlib import Path
 from datetime import datetime, timedelta
 import numpy as np
@@ -14,6 +14,10 @@ import time
 import sqlite3
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+
+# Type variable for generic timeout wrapper
+T = TypeVar('T')
 
 logger = logging.getLogger(__name__)
 
@@ -108,20 +112,270 @@ def retry_on_ee_exception(max_retries: int = 3, delay: float = 1.0):
                 try:
                     return func(*args, **kwargs)
                 except Exception as e:
+                    # Check if this is a "no images" error - don't retry these
+                    error_str = str(e).lower()
+                    if 'empty' in error_str or 'no images' in error_str or 'collection is empty' in error_str:
+                        # No images available - don't retry, just return None
+                        raise
+
                     # Check if it's an EE exception
                     if EE_AVAILABLE and hasattr(ee, 'EEException') and isinstance(e, ee.EEException):
                         if attempt == max_retries - 1:
                             raise
-                        logger.warning(
+                        # Reduce delay for retries to speed up processing
+                        retry_delay = delay * (1.5 ** attempt)  # Reduced from 2.0 to 1.5
+                        logger.debug(
                             f"GEE operation failed (attempt {attempt + 1}/{max_retries}): {e}"
                         )
-                        time.sleep(delay * (2 ** attempt))
+                        time.sleep(retry_delay)
                     else:
                         # Not an EE exception, don't retry
                         raise
             return None
         return wrapper
     return decorator
+
+
+class GEECircuitBreaker:
+    """
+    Circuit breaker pattern for Google Earth Engine API calls.
+
+    Prevents cascade failures when GEE is experiencing issues (rate limiting,
+    outages, network problems). After a threshold of consecutive failures,
+    the circuit "opens" and fails fast for a cooldown period before retrying.
+
+    States:
+    - CLOSED: Normal operation, requests go through
+    - OPEN: Too many failures, fail fast without making requests
+    - HALF_OPEN: Testing if service recovered, allow limited requests
+
+    Thread-safe implementation using locks.
+    """
+
+    # Singleton instance
+    _instance = None
+    _lock = threading.Lock()
+
+    # Circuit states
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        reset_timeout: float = 300.0,  # 5 minutes
+        half_open_max_calls: int = 3
+    ):
+        """
+        Initialize circuit breaker.
+
+        Args:
+            failure_threshold: Number of consecutive failures before opening circuit
+            reset_timeout: Seconds to wait before attempting recovery (half-open state)
+            half_open_max_calls: Number of test calls allowed in half-open state
+        """
+        if self._initialized:
+            return
+
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self.half_open_max_calls = half_open_max_calls
+
+        self._state = self.CLOSED
+        self._failure_count = 0
+        self._last_failure_time: Optional[float] = None
+        self._half_open_calls = 0
+        self._state_lock = threading.Lock()
+        self._initialized = True
+
+        logger.info(
+            f"GEE Circuit Breaker initialized: "
+            f"failure_threshold={failure_threshold}, "
+            f"reset_timeout={reset_timeout}s"
+        )
+
+    @property
+    def state(self) -> str:
+        """Get current circuit state."""
+        with self._state_lock:
+            return self._state
+
+    @property
+    def failure_count(self) -> int:
+        """Get current consecutive failure count."""
+        with self._state_lock:
+            return self._failure_count
+
+    def can_execute(self) -> bool:
+        """
+        Check if a request can be executed.
+
+        Returns:
+            True if request should proceed, False if circuit is open
+        """
+        with self._state_lock:
+            if self._state == self.CLOSED:
+                return True
+
+            if self._state == self.OPEN:
+                # Check if we should transition to half-open
+                if self._last_failure_time is not None:
+                    elapsed = time.time() - self._last_failure_time
+                    if elapsed >= self.reset_timeout:
+                        logger.info(
+                            f"GEE Circuit Breaker: transitioning from OPEN to HALF_OPEN "
+                            f"after {elapsed:.1f}s cooldown"
+                        )
+                        self._state = self.HALF_OPEN
+                        self._half_open_calls = 0
+                        return True
+                return False
+
+            if self._state == self.HALF_OPEN:
+                # Allow limited calls in half-open state
+                if self._half_open_calls < self.half_open_max_calls:
+                    self._half_open_calls += 1
+                    return True
+                return False
+
+            return True
+
+    def record_success(self):
+        """Record a successful request."""
+        with self._state_lock:
+            if self._state == self.HALF_OPEN:
+                # Success in half-open means service recovered
+                logger.info("GEE Circuit Breaker: service recovered, closing circuit")
+                self._state = self.CLOSED
+
+            # Reset failure count on success
+            self._failure_count = 0
+
+    def record_failure(self, error: Optional[Exception] = None):
+        """
+        Record a failed request.
+
+        Args:
+            error: The exception that caused the failure (for logging)
+        """
+        with self._state_lock:
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+
+            if self._state == self.HALF_OPEN:
+                # Failure in half-open means service still down
+                logger.warning(
+                    f"GEE Circuit Breaker: failure in HALF_OPEN state, reopening circuit. "
+                    f"Error: {error}"
+                )
+                self._state = self.OPEN
+                self._half_open_calls = 0
+
+            elif self._state == self.CLOSED:
+                if self._failure_count >= self.failure_threshold:
+                    logger.warning(
+                        f"GEE Circuit Breaker: {self._failure_count} consecutive failures, "
+                        f"opening circuit for {self.reset_timeout}s. Last error: {error}"
+                    )
+                    self._state = self.OPEN
+
+    def reset(self):
+        """Reset circuit breaker to initial state (for testing)."""
+        with self._state_lock:
+            self._state = self.CLOSED
+            self._failure_count = 0
+            self._last_failure_time = None
+            self._half_open_calls = 0
+            logger.info("GEE Circuit Breaker: manually reset to CLOSED state")
+
+    def get_status(self) -> Dict[str, any]:
+        """Get circuit breaker status for monitoring."""
+        with self._state_lock:
+            return {
+                "state": self._state,
+                "failure_count": self._failure_count,
+                "failure_threshold": self.failure_threshold,
+                "last_failure_time": self._last_failure_time,
+                "reset_timeout": self.reset_timeout,
+                "time_until_retry": (
+                    max(0, self.reset_timeout - (time.time() - self._last_failure_time))
+                    if self._last_failure_time and self._state == self.OPEN
+                    else 0
+                )
+            }
+
+
+class CircuitBreakerOpenError(Exception):
+    """Raised when circuit breaker is open and request cannot proceed."""
+    pass
+
+
+class GEETimeoutError(Exception):
+    """Raised when a GEE API call times out."""
+    pass
+
+
+# Default timeout for GEE API calls (in seconds)
+GEE_API_TIMEOUT = 60  # 1 minute
+
+
+def gee_with_timeout(
+    func: Callable[[], T],
+    timeout: float = GEE_API_TIMEOUT,
+    operation_name: str = "GEE operation"
+) -> T:
+    """
+    Execute a GEE operation with a timeout.
+
+    This is a thread-safe wrapper that runs the operation in a daemon thread
+    and enforces a timeout. Safe for use in parallel processing contexts.
+
+    Args:
+        func: Zero-argument callable that performs the GEE operation
+        timeout: Maximum seconds to wait for completion (default: 120)
+        operation_name: Description for logging purposes
+
+    Returns:
+        The result of func()
+
+    Raises:
+        GEETimeoutError: If the operation times out
+        Exception: Any exception raised by func() is re-raised
+    """
+    # Use a daemon thread so timed-out GEE calls don't prevent process exit.
+    # Daemon must be set before start(); setting it on an already-running thread raises RuntimeError.
+    result_holder: List[Optional[T]] = [None]
+    exc_holder: List[Optional[BaseException]] = [None]
+
+    def run() -> None:
+        try:
+            result_holder[0] = func()
+        except BaseException as e:
+            exc_holder[0] = e
+
+    thread = threading.Thread(target=run, daemon=True, name="gee_timeout")
+    thread.start()
+    thread.join(timeout=timeout)
+    if thread.is_alive():
+        logger.error(
+            f"{operation_name} timed out after {timeout}s. "
+            f"The GEE server may be unresponsive."
+        )
+        raise GEETimeoutError(
+            f"{operation_name} timed out after {timeout} seconds"
+        )
+    if exc_holder[0] is not None:
+        raise exc_holder[0]
+    return result_holder[0]
 
 
 # ============================================================================
@@ -389,6 +643,14 @@ class GEENDVIClient:
     """
     
     COLLECTIONS = {
+        'landsat5': {
+            'id': 'LANDSAT/LT05/C02/T1_L2',
+            'red_band': 'SR_B3',
+            'nir_band': 'SR_B4',
+            'scale': 30,
+            'start_date': '1984-03-01',
+            'end_date': '2013-05-30'
+        },
         'landsat8': {
             'id': 'LANDSAT/LC08/C02/T1_L2',
             'red_band': 'SR_B4',
@@ -417,9 +679,15 @@ class GEENDVIClient:
         """
         Initialize GEE NDVI client.
         
+        Uses hybrid collection selection: automatically selects Landsat 5 for dates < 2013
+        and Landsat 8 for dates >= 2013. This eliminates placeholder NDVI values for
+        historical years (2006-2012).
+        
         Args:
             project: GEE project ID
-            collection: Satellite collection ('landsat8' or 'sentinel2')
+            collection: Default satellite collection ('landsat8' or 'sentinel2').
+                       Note: If 'landsat8' (default), the client will automatically use
+                       Landsat 5 for dates < 2013 and Landsat 8 for dates >= 2013.
             batch_size: Points per batch for processing
             max_workers: Thread pool size for parallel processing
             cache_dir: Directory for NDVI cache (defaults to data/cache)
@@ -434,13 +702,21 @@ class GEENDVIClient:
         
         # Initialize GEE (singleton pattern)
         GEEInitializer().initialize(project)
-        
+
         self.collection_config = self.COLLECTIONS[collection]
         self.batch_size = batch_size
         self.max_workers = max_workers
         self.collection = collection
         self.use_cache = use_cache
-        
+
+        # Initialize circuit breaker (singleton pattern)
+        # This prevents cascade failures when GEE is having issues
+        self.circuit_breaker = GEECircuitBreaker(
+            failure_threshold=5,      # Open circuit after 5 consecutive failures
+            reset_timeout=300.0,      # Wait 5 minutes before retrying
+            half_open_max_calls=3     # Allow 3 test calls in half-open state
+        )
+
         # Initialize cache if enabled
         if self.use_cache:
             self.cache = NDVICache(cache_dir=cache_dir)
@@ -452,11 +728,51 @@ class GEENDVIClient:
         else:
             self.cache = None
             logger.info("NDVI cache disabled")
-        
+
         logger.info(
             f"GEENDVIClient initialized: {collection}, "
             f"batch_size={batch_size}, workers={max_workers}, cache={'enabled' if use_cache else 'disabled'}"
         )
+    
+    def _get_collection_for_date(self, date: datetime) -> Dict:
+        """
+        Select collection based on date: Landsat 5 for <2013-02-11, Landsat 8 for >=2013-02-11.
+        
+        This enables hybrid collection selection to provide real NDVI data for
+        historical years (2006-2012) using Landsat 5, eliminating placeholder values.
+        
+        Landsat 8 launched on 2013-02-11, so dates on or after this date use L8.
+        
+        Args:
+            date: Date to determine collection for
+            
+        Returns:
+            Dict with collection configuration (same structure as COLLECTIONS entries)
+        """
+        # Landsat 8 launched on 2013-02-11, so use L8 for dates on or after this date
+        landsat8_launch_date = datetime(2013, 2, 11)
+        if date < landsat8_launch_date:
+            return self.COLLECTIONS['landsat5']
+        else:
+            return self.COLLECTIONS['landsat8']
+    
+    def _get_collection_name_for_date(self, date: datetime) -> str:
+        """
+        Get collection name (for cache keys) based on date.
+        
+        Landsat 8 launched on 2013-02-11, so dates on or after this date use L8.
+        
+        Args:
+            date: Date to determine collection for
+            
+        Returns:
+            Collection name string ('landsat5' or 'landsat8')
+        """
+        landsat8_launch_date = datetime(2013, 2, 11)
+        if date < landsat8_launch_date:
+            return 'landsat5'
+        else:
+            return 'landsat8'
     
     def check_availability(self) -> Dict[str, bool]:
         """Check GEE connection"""
@@ -471,14 +787,18 @@ class GEENDVIClient:
             collection = ee.ImageCollection(self.collection_config['id']) \
                 .filterBounds(test_point) \
                 .limit(1)
-            count = collection.size().getInfo()
-            
+            count = gee_with_timeout(
+                lambda: collection.size().getInfo(),
+                timeout=GEE_API_TIMEOUT,
+                operation_name="GEE availability check"
+            )
+
             return {
                 'gee_initialized': True,
                 'collection_accessible': True,
                 'test_successful': count >= 0
             }
-        except Exception as e:
+        except (GEETimeoutError, Exception) as e:
             logger.error(f"GEE availability check failed: {e}")
             return {
                 'gee_initialized': GEEInitializer().is_initialized,
@@ -486,7 +806,7 @@ class GEENDVIClient:
                 'error': str(e)
             }
     
-    @retry_on_ee_exception(max_retries=3, delay=2.0)
+    @retry_on_ee_exception(max_retries=2, delay=1.0)  # Reduced retries and delay for faster processing
     def _get_ndvi_single_point(
         self,
         lat: float,
@@ -499,46 +819,82 @@ class GEENDVIClient:
         Get NDVI, cloud cover, and image age for single point (internal, with retry).
         
         Checks cache first, then queries GEE if not cached.
+        Uses hybrid collection selection: Landsat 5 for <2013, Landsat 8 for >=2013.
         
         Returns:
             Dict with 'ndvi' (float), 'cloud_cover' (float or None), 
             'image_date' (datetime or None), and 'ndvi_age_days' (float or None) keys,
             or None if no data available
         """
-        # Check cache first (if enabled)
+        # Get collection config and name based on date (hybrid selection)
+        collection_config = self._get_collection_for_date(date)
+        collection_name = self._get_collection_name_for_date(date)
+        
+        # Use adaptive buffer_days: larger for Landsat 5 (16-day revisit) vs Landsat 8 (8-day revisit)
+        # If buffer_days is provided, use it; otherwise use collection-specific defaults
+        if collection_name == 'landsat5':
+            # Landsat 5 has 16-day revisit, so use larger buffer to find images
+            effective_buffer_days = buffer_days if buffer_days > 0 else 21  # Default: 21 days (covers ~1.3 revisit cycles)
+        else:
+            # Landsat 8 has 8-day revisit, smaller buffer is sufficient
+            effective_buffer_days = buffer_days if buffer_days > 0 else 14  # Default: 14 days (covers ~1.75 revisit cycles)
+        
+        # DEBUG: Log collection selection
+        logger.debug(f"NDVI query for ({lat:.5f}, {lon:.5f}) on {date.strftime('%Y-%m-%d')}: using {collection_name} (collection: {collection_config['id']}), buffer_days={effective_buffer_days}")
+        
+        # Check cache first (if enabled) using the correct collection name and effective buffer
         if self.use_cache and self.cache:
             cached_result = self.cache.get(
                 lat=lat,
                 lon=lon,
                 date=date,
-                collection=self.collection,
-                buffer_days=buffer_days,
+                collection=collection_name,
+                buffer_days=effective_buffer_days,
                 max_cloud_cover=max_cloud_cover
             )
             if cached_result is not None:
-                logger.debug(f"Cache hit for ({lat:.5f}, {lon:.5f}) on {date.strftime('%Y-%m-%d')}")
+                logger.debug(f"Cache hit for ({lat:.5f}, {lon:.5f}) on {date.strftime('%Y-%m-%d')} using {collection_name}")
                 return cached_result
-        
+
+        # Check circuit breaker before making GEE API calls
+        if not self.circuit_breaker.can_execute():
+            status = self.circuit_breaker.get_status()
+            logger.debug(
+                f"Circuit breaker OPEN, skipping GEE call for ({lat:.5f}, {lon:.5f}). "
+                f"Retry in {status['time_until_retry']:.0f}s"
+            )
+            raise CircuitBreakerOpenError(
+                f"GEE circuit breaker is open after {status['failure_count']} failures. "
+                f"Will retry in {status['time_until_retry']:.0f}s"
+            )
+
         # Not in cache, query GEE
         point = ee.Geometry.Point([lon, lat])
         
-        # Date range
-        start_date = (date - timedelta(days=buffer_days)).strftime('%Y-%m-%d')
-        end_date = (date + timedelta(days=buffer_days)).strftime('%Y-%m-%d')
+        # Date range using effective buffer
+        start_date = (date - timedelta(days=effective_buffer_days)).strftime('%Y-%m-%d')
+        end_date = (date + timedelta(days=effective_buffer_days)).strftime('%Y-%m-%d')
         
-        # Filter collection
-        collection = ee.ImageCollection(self.collection_config['id']) \
+        # Filter collection using date-based collection config
+        collection = ee.ImageCollection(collection_config['id']) \
             .filterBounds(point) \
             .filterDate(start_date, end_date) \
             .filter(ee.Filter.lt('CLOUD_COVER', max_cloud_cover))
         
-        # Get best image (lowest cloud cover)
+        # Get best image (lowest cloud cover) - skip size check to save API call
+        # If no images exist, image.getInfo() will fail quickly
         image = collection.sort('CLOUD_COVER').first()
-        
+
         # Check existence and get metadata
+        # This will fail fast if no images exist, avoiding the extra collection.size() API call
         try:
-            image_info = image.getInfo()
+            image_info = gee_with_timeout(
+                lambda: image.getInfo(),
+                timeout=GEE_API_TIMEOUT,
+                operation_name=f"image.getInfo() for {collection_name} at ({lat:.5f}, {lon:.5f})"
+            )
             if not image_info:
+                logger.warning(f"image.getInfo() returned empty result for {collection_name} at ({lat:.5f}, {lon:.5f}) on {date.strftime('%Y-%m-%d')}")
                 return None
             
             properties = image_info.get('properties', {})
@@ -564,29 +920,58 @@ class GEENDVIClient:
                 if ndvi_age_days < 0:
                     # Image is after observation date (expected when buffer_days allows future images)
                     logger.debug(f"Image date ({image_date}) is after observation date ({date}), "
-                               f"age: {abs(ndvi_age_days):.2f} days (within {buffer_days}-day buffer)")
+                               f"age: {abs(ndvi_age_days):.2f} days (within {effective_buffer_days}-day buffer)")
                     ndvi_age_days = abs(ndvi_age_days)
             
         except Exception as e:
-            logger.debug(f"Error extracting image metadata: {e}")
+            # Check if this is a "no images" error - common and expected, don't log as warning
+            error_str = str(e).lower()
+            if 'empty' in error_str or 'no images' in error_str or 'collection is empty' in error_str:
+                logger.debug(f"No images found in {collection_name} for ({lat:.5f}, {lon:.5f}) on {date.strftime('%Y-%m-%d')} (date range: {start_date} to {end_date}, buffer: {effective_buffer_days} days, max_cloud_cover: {max_cloud_cover}%)")
+                # "No images" is expected, not a GEE failure - don't count against circuit breaker
+            else:
+                logger.warning(f"Error extracting image metadata from {collection_name} for ({lat:.5f}, {lon:.5f}) on {date.strftime('%Y-%m-%d')}: {e}")
+                # Record failure for circuit breaker (actual GEE error)
+                self.circuit_breaker.record_failure(e)
             return None
         
-        # Calculate NDVI
-        red_band = self.collection_config['red_band']
-        nir_band = self.collection_config['nir_band']
+        # Calculate NDVI using date-based collection config
+        red_band = collection_config['red_band']
+        nir_band = collection_config['nir_band']
         ndvi = image.normalizedDifference([nir_band, red_band]).rename('NDVI')
         
         # Sample at point
-        scale = self.collection_config['scale']
+        scale = collection_config['scale']
         value = ndvi.reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=point,
             scale=scale
         ).get('NDVI')
-        
-        ndvi_value = value.getInfo()
+
+        try:
+            ndvi_value = gee_with_timeout(
+                lambda: value.getInfo(),
+                timeout=GEE_API_TIMEOUT,
+                operation_name=f"NDVI value.getInfo() for ({lat:.5f}, {lon:.5f})"
+            )
+        except GEETimeoutError as e:
+            logger.warning(f"Timeout getting NDVI value from {collection_name} for ({lat:.5f}, {lon:.5f}) on {date.strftime('%Y-%m-%d')}: {e}")
+            self.circuit_breaker.record_failure(e)
+            return None
+        except Exception as e:
+            # Check if this is a "no images" error - common and expected
+            error_str = str(e).lower()
+            if 'empty' in error_str or 'no images' in error_str or 'collection is empty' in error_str:
+                logger.debug(f"No images found in {collection_name} for ({lat:.5f}, {lon:.5f}) on {date.strftime('%Y-%m-%d')}")
+                # "No images" is expected, not a GEE failure - don't count against circuit breaker
+            else:
+                logger.warning(f"Error getting NDVI value from {collection_name} for ({lat:.5f}, {lon:.5f}) on {date.strftime('%Y-%m-%d')}: {e}")
+                # Record failure for circuit breaker (actual GEE error)
+                self.circuit_breaker.record_failure(e)
+            return None
         
         if ndvi_value is None:
+            logger.warning(f"NDVI value is None from {collection_name} for ({lat:.5f}, {lon:.5f}) on {date.strftime('%Y-%m-%d')}")
             result = None
         else:
             result = {
@@ -595,15 +980,18 @@ class GEENDVIClient:
                 'image_date': image_date,
                 'ndvi_age_days': float(ndvi_age_days) if ndvi_age_days is not None else None
             }
+            # Record success for circuit breaker - GEE API call succeeded
+            self.circuit_breaker.record_success()
+            logger.debug(f"Successfully retrieved NDVI={ndvi_value:.3f} from {collection_name} for ({lat:.5f}, {lon:.5f}) on {date.strftime('%Y-%m-%d')}")
         
-        # Store in cache (even if None, to avoid repeated failed queries)
+        # Store in cache (even if None, to avoid repeated failed queries) using correct collection name and effective buffer
         if self.use_cache and self.cache:
             self.cache.put(
                 lat=lat,
                 lon=lon,
                 date=date,
-                collection=self.collection,
-                buffer_days=buffer_days,
+                collection=collection_name,
+                buffer_days=effective_buffer_days,
                 max_cloud_cover=max_cloud_cover,
                 result=result if result is not None else {
                     'ndvi': None,
@@ -876,6 +1264,7 @@ class GEENDVIClient:
         
         This is used for predicting pre-winter body condition and winterkill risk.
         Integrated NDVI = sum of NDVI values over the summer period.
+        Uses hybrid collection selection: Landsat 5 for <2013, Landsat 8 for >=2013.
         
         Args:
             lat: Latitude
@@ -887,28 +1276,46 @@ class GEENDVIClient:
         Returns:
             Integrated NDVI value (sum of NDVI over summer), or None if insufficient data
         """
+        # Check circuit breaker before making GEE API calls
+        if not self.circuit_breaker.can_execute():
+            status = self.circuit_breaker.get_status()
+            logger.debug(
+                f"Circuit breaker OPEN, skipping summer NDVI for ({lat:.5f}, {lon:.5f}) year {year}. "
+                f"Retry in {status['time_until_retry']:.0f}s"
+            )
+            raise CircuitBreakerOpenError(
+                f"GEE circuit breaker is open. Will retry in {status['time_until_retry']:.0f}s"
+            )
+
         point = ee.Geometry.Point([lon, lat])
         
         # Summer period: June 1 to September 30
         start_date = datetime(year, 6, 1)
         end_date = datetime(year, 9, 30)
         
-        # Filter collection for summer period
-        collection = ee.ImageCollection(self.collection_config['id']) \
+        # Get collection config based on year (hybrid selection)
+        collection_config = self._get_collection_for_date(start_date)
+        collection_name = self._get_collection_name_for_date(start_date)
+        
+        # DEBUG: Log collection selection
+        logger.debug(f"Summer integrated NDVI for ({lat:.5f}, {lon:.5f}) year {year}: using {collection_name} (collection: {collection_config['id']})")
+        
+        # Filter collection for summer period using date-based collection config
+        collection = ee.ImageCollection(collection_config['id']) \
             .filterBounds(point) \
             .filterDate(start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')) \
             .filter(ee.Filter.lt('CLOUD_COVER', max_cloud_cover)) \
             .sort('system:time_start')  # Sort by date for consistent sampling
-        
+
         # Optimize: Limit to max 8 images to reduce API calls
         # This captures ~4 months of summer with Landsat 16-day revisit (typically 7-8 images)
         # For Sentinel-2 (5-day revisit), this still gives good coverage
         collection = collection.limit(8)
         
-        # Calculate NDVI for all images in the collection
-        red_band = self.collection_config['red_band']
-        nir_band = self.collection_config['nir_band']
-        scale = self.collection_config['scale']
+        # Calculate NDVI for all images in the collection using date-based collection config
+        red_band = collection_config['red_band']
+        nir_band = collection_config['nir_band']
+        scale = collection_config['scale']
         
         # Map over collection to calculate NDVI for each image
         def calculate_ndvi(image):
@@ -926,28 +1333,55 @@ class GEENDVIClient:
         
         # Get all NDVI values
         try:
-            # Get list of NDVI values
-            ndvi_values = ndvi_collection.aggregate_array('ndvi_value').getInfo()
-            
+            # Get list of NDVI values with timeout protection
+            ndvi_values = gee_with_timeout(
+                lambda: ndvi_collection.aggregate_array('ndvi_value').getInfo(),
+                timeout=GEE_API_TIMEOUT,
+                operation_name=f"summer NDVI aggregate for ({lat:.5f}, {lon:.5f}) year {year}"
+            )
+
             # Filter out None values and calculate sum
             valid_ndvi = [v for v in ndvi_values if v is not None]
-            
+
             if len(valid_ndvi) == 0:
                 logger.debug(f"No valid NDVI data for summer {year} at ({lat}, {lon})")
                 return None
-            
+
             # Integrated NDVI = sum of all NDVI values
             integrated_ndvi = sum(valid_ndvi)
-            
+
+            # Log detailed information for debugging
             logger.debug(
-                f"Summer integrated NDVI for {year}: {integrated_ndvi:.2f} "
-                f"(from {len(valid_ndvi)} images)"
+                f"Summer integrated NDVI for {year} at ({lat:.5f}, {lon:.5f}): {integrated_ndvi:.2f} "
+                f"(from {len(valid_ndvi)} images, NDVI range: {min(valid_ndvi):.3f}-{max(valid_ndvi):.3f})"
             )
-            
+
+            # Warn if value seems unusually high (suggests calculation issue or too many images)
+            if integrated_ndvi > 10:
+                logger.warning(
+                    f"Summer integrated NDVI ({integrated_ndvi:.2f}) exceeds expected maximum (~8.0) "
+                    f"for {year} at ({lat:.5f}, {lon:.5f}). "
+                    f"Used {len(valid_ndvi)} images with NDVI values: {[f'{v:.3f}' for v in valid_ndvi[:5]]}"
+                    f"{'...' if len(valid_ndvi) > 5 else ''}"
+                )
+
+            # Record success for circuit breaker
+            self.circuit_breaker.record_success()
             return float(integrated_ndvi)
-            
+
+        except GEETimeoutError as e:
+            logger.warning(f"Timeout calculating summer integrated NDVI for {year} at ({lat:.5f}, {lon:.5f}): {e}")
+            self.circuit_breaker.record_failure(e)
+            return None
         except Exception as e:
-            logger.warning(f"Failed to calculate summer integrated NDVI: {e}")
+            # Check if this is a "no images" type error - expected, don't count against circuit breaker
+            error_str = str(e).lower()
+            if 'empty' in error_str or 'no images' in error_str or 'collection is empty' in error_str:
+                logger.debug(f"No summer images found for {year} at ({lat:.5f}, {lon:.5f}): {e}")
+            else:
+                logger.warning(f"Failed to calculate summer integrated NDVI: {e}")
+                # Record failure for circuit breaker (actual GEE error)
+                self.circuit_breaker.record_failure(e)
             return None
 
 
@@ -1002,6 +1436,10 @@ class DataContextBuilder:
                 # Use cache_dir from gee_config if provided, otherwise use DataContextBuilder's cache_dir
                 ndvi_cache_dir = gee_config.get('cache_dir') or self.cache_dir
                 use_cache = gee_config.get('use_cache', True)  # Default to True for historical data
+                # Store buffer_days from config (0 = adaptive, >0 = fixed value)
+                self.ndvi_buffer_days = gee_config.get('buffer_days', 0)  # 0 triggers adaptive mode
+                # Store max_cloud_cover from config (default: 50.0%)
+                self.ndvi_max_cloud_cover = gee_config.get('max_cloud_cover', 50.0)  # Use config value
                 try:
                     self.ndvi_client = GEENDVIClient(
                         project=gee_config.get('project', 'ee-jongalentine'),
@@ -1180,20 +1618,47 @@ class DataContextBuilder:
         
         print("Static data loading complete.\n")
     
-    def build_context(self, location: Dict, date: str, 
+    def build_context(self, location: Optional[Dict] = None, date: Optional[str] = None,
+                     lat: Optional[float] = None, lon: Optional[float] = None,
+                     dt: Optional[datetime] = None,
                      buffer_km: float = 1.0) -> Dict:
         """
         Build complete context for a location and date
         
         Args:
-            location: {"lat": float, "lon": float}
-            date: ISO format date string
+            location: {"lat": float, "lon": float} (deprecated, use lat/lon instead)
+            date: ISO format date string (deprecated, use dt instead)
+            lat: Latitude (preferred)
+            lon: Longitude (preferred)
+            dt: datetime object (preferred over date string)
             buffer_km: Radius for neighborhood analysis
         
         Returns:
             Dictionary with all context data
         """
-        lat, lon = location["lat"], location["lon"]
+        # Support both old (location dict) and new (lat/lon) calling conventions
+        if location is not None:
+            # Old calling convention: location dict
+            lat, lon = location["lat"], location["lon"]
+            if date is not None:
+                # Handle both string and datetime objects
+                if isinstance(date, datetime):
+                    dt = date
+                else:
+                    dt = pd.to_datetime(date)
+        elif lat is not None and lon is not None:
+            # New calling convention: separate lat/lon
+            if dt is None:
+                if date is not None:
+                    # Handle both string and datetime objects
+                    if isinstance(date, datetime):
+                        dt = date
+                    else:
+                        dt = pd.to_datetime(date)
+                else:
+                    raise ValueError("Either 'dt' or 'date' must be provided")
+        else:
+            raise ValueError("Either 'location' dict or 'lat'/'lon' must be provided")
         point = Point(lon, lat)
         
         context = {}
@@ -1318,7 +1783,7 @@ class DataContextBuilder:
             context["bear_data_quality"] = 0.5
         
         # --- TEMPORAL DATA (depends on date) ---
-        dt = datetime.fromisoformat(date)
+        # dt is already set from the calling convention handling above
         
         # Snow data - pass elevation for better estimation if no station nearby
         location_elevation = context.get("elevation", None)
@@ -1378,14 +1843,14 @@ class DataContextBuilder:
                     'timestamp': [dt]
                 })
                 
-                # Get NDVI from GEE
+                # Get NDVI from GEE (use config buffer_days and max_cloud_cover)
                 ndvi_df = self.ndvi_client.get_ndvi_for_points(
                     point_df,
                     date_column='timestamp',
                     lat_column='latitude',
                     lon_column='longitude',
-                    buffer_days=7,
-                    max_cloud_cover=30.0
+                    buffer_days=getattr(self, 'ndvi_buffer_days', 0),  # 0 = adaptive (21 days L5, 14 days L8)
+                    max_cloud_cover=getattr(self, 'ndvi_max_cloud_cover', 50.0)  # Use config value (default: 50%)
                 )
                 
                 # Extract NDVI value, cloud cover, age, and IRG
@@ -1452,25 +1917,47 @@ class DataContextBuilder:
                     lat=lat,
                     lon=lon,
                     year=summer_year,
-                    buffer_days=7,
-                    max_cloud_cover=30.0
+                    buffer_days=getattr(self, 'ndvi_buffer_days', 0),  # 0 = adaptive (21 days L5, 14 days L8)
+                    max_cloud_cover=getattr(self, 'ndvi_max_cloud_cover', 50.0)  # Use config value (default: 50%)
                 )
                 if summer_ndvi is not None:
                     context["summer_integrated_ndvi"] = summer_ndvi
                 else:
-                    # Fallback to SatelliteClient
-                    logger.debug(f"GEE returned None for summer integrated NDVI, using fallback")
+                    # Fallback: For historical data (before 2015), AppEEARS is not practical (async API, slow)
+                    # For recent data, AppEEARS might work but is still async and slow for real-time processing
+                    # Use placeholder 60.0 for all fallback cases to avoid pipeline slowdowns
+                    if summer_year < 2015:
+                        # Historical data: Skip AppEEARS (too slow, async API not suitable)
+                        context["summer_integrated_ndvi"] = 60.0
+                        logger.debug(f"GEE returned None for summer integrated NDVI for {summer_year} at ({lat:.4f}, {lon:.4f}), "
+                                   f"using placeholder 60.0 (historical data, AppEEARS not suitable for async processing)")
+                    else:
+                        # Recent data: Try AppEEARS but with short timeout to avoid blocking
+                        logger.debug(f"GEE returned None for summer integrated NDVI for {summer_year} at ({lat:.4f}, {lon:.4f}), "
+                                   f"trying AppEEARS fallback (may timeout and return placeholder)")
+                        summer_start = datetime(summer_year, 6, 1)
+                        summer_end = datetime(summer_year, 9, 1)
+                        fallback_ndvi = self.satellite_client.get_integrated_ndvi(lat, lon, summer_start, summer_end)
+                        context["summer_integrated_ndvi"] = fallback_ndvi
+                        if fallback_ndvi == 60.0:
+                            logger.debug(f"Summer integrated NDVI fallback returned placeholder 60.0 for {summer_year} "
+                                       f"at ({lat:.4f}, {lon:.4f}) (AppEEARS unavailable or timed out)")
+            except Exception as e:
+                # GEE failed, fall back to placeholder (AppEEARS too slow for real-time processing)
+                if summer_year < 2015:
+                    context["summer_integrated_ndvi"] = 60.0
+                    logger.debug(f"GEE summer integrated NDVI failed for {summer_year} at ({lat:.4f}, {lon:.4f}): {e}, "
+                               f"using placeholder 60.0 (historical data)")
+                else:
+                    logger.debug(f"GEE summer integrated NDVI failed for {summer_year} at ({lat:.4f}, {lon:.4f}): {e}, "
+                               f"trying AppEEARS fallback (may timeout)")
                     summer_start = datetime(summer_year, 6, 1)
                     summer_end = datetime(summer_year, 9, 1)
-                    context["summer_integrated_ndvi"] = \
-                        self.satellite_client.get_integrated_ndvi(lat, lon, summer_start, summer_end)
-            except Exception as e:
-                # GEE failed, fall back to SatelliteClient
-                logger.warning(f"GEE summer integrated NDVI failed: {e}, using SatelliteClient fallback")
-                summer_start = datetime(summer_year, 6, 1)
-                summer_end = datetime(summer_year, 9, 1)
-                context["summer_integrated_ndvi"] = \
-                    self.satellite_client.get_integrated_ndvi(lat, lon, summer_start, summer_end)
+                    fallback_ndvi = self.satellite_client.get_integrated_ndvi(lat, lon, summer_start, summer_end)
+                    context["summer_integrated_ndvi"] = fallback_ndvi
+                    if fallback_ndvi == 60.0:
+                        logger.debug(f"Summer integrated NDVI fallback returned placeholder 60.0 for {summer_year} "
+                                   f"at ({lat:.4f}, {lon:.4f}) (AppEEARS unavailable or timed out)")
         else:
             # Use SatelliteClient
             summer_start = datetime(summer_year, 6, 1)
@@ -2841,8 +3328,9 @@ class WeatherClient:
                 "wind_mph": 12
             }
 
-        # Default fallback values
-        temp_mean_f = 42.0
+        # Default fallback values (used only if PRISM data unavailable)
+        # NOTE: If these values appear in output, it indicates PRISM data retrieval failed
+        temp_mean_f = 42.0  # Default fallback (should be replaced by PRISM data)
         temp_high_f = 52.0
         temp_low_f = 32.0
         precip_7d = 0.5
@@ -2856,18 +3344,33 @@ class WeatherClient:
                 # Convert temps to Fahrenheit
                 if temp_data.get("temp_mean_c") is not None:
                     temp_mean_f = (temp_data["temp_mean_c"] * 9/5) + 32
+                    logger.debug(f"PRISM temperature for ({lat:.4f}, {lon:.4f}) on {date.strftime('%Y-%m-%d')}: "
+                               f"{temp_data['temp_mean_c']:.2f}°C = {temp_mean_f:.2f}°F")
+                else:
+                    logger.warning(f"PRISM temp_mean_c is None for ({lat:.4f}, {lon:.4f}) on {date.strftime('%Y-%m-%d')}, "
+                                 f"using fallback {temp_mean_f:.1f}°F")
+                    
                 if temp_data.get("temp_max_c") is not None:
                     temp_high_f = (temp_data["temp_max_c"] * 9/5) + 32
                 elif temp_data.get("temp_max_f") is not None:
                     temp_high_f = temp_data["temp_max_f"]
+                else:
+                    logger.debug(f"PRISM temp_max not available, using fallback {temp_high_f:.1f}°F")
+                    
                 if temp_data.get("temp_min_c") is not None:
                     temp_low_f = (temp_data["temp_min_c"] * 9/5) + 32
                 elif temp_data.get("temp_min_f") is not None:
                     temp_low_f = temp_data["temp_min_f"]
+                else:
+                    logger.debug(f"PRISM temp_min not available, using fallback {temp_low_f:.1f}°F")
             else:
-                logger.debug(f"PRISM temperature not available for {date.strftime('%Y-%m-%d')}")
+                logger.warning(f"PRISM temperature not available for ({lat:.4f}, {lon:.4f}) on {date.strftime('%Y-%m-%d')}, "
+                             f"using fallback values (mean={temp_mean_f:.1f}°F)")
         except Exception as e:
-            logger.debug(f"Failed to get PRISM temperature: {e}")
+            logger.warning(f"Failed to get PRISM temperature for ({lat:.4f}, {lon:.4f}) on {date.strftime('%Y-%m-%d')}: {e}, "
+                         f"using fallback {temp_mean_f:.1f}°F")
+            import traceback
+            logger.debug(f"PRISM temperature error traceback: {traceback.format_exc()}")
 
         # Get 7-day precipitation from PRISM
         try:
@@ -2932,8 +3435,10 @@ class SatelliteClient:
                 
                 if username and password:
                     self.appeears_client = AppEEARSClient(username, password)
+                    logger.info(f"AppEEARS client initialized successfully (username: {username[:3]}***)")
                 else:
-                    logger.warning("AppEEARS credentials not available, using placeholder NDVI")
+                    logger.warning("AppEEARS credentials not available, using placeholder NDVI. "
+                                 "Set APPEEARS_USERNAME and APPEEARS_PASSWORD environment variables.")
                     self.use_real_data = False
             except ImportError:
                 logger.warning("AppEEARS client not available, using placeholder NDVI")
@@ -3168,27 +3673,59 @@ class SatelliteClient:
     
     def get_integrated_ndvi(self, lat: float, lon: float, 
                            start_date: datetime, end_date: datetime) -> float:
-        """Get integrated NDVI over date range"""
-        if not self.use_real_data or not self.appeears_client:
+        """Get integrated NDVI over date range
+        
+        Note: AppEEARS is an async API that requires task submission and waiting.
+        For historical data or real-time processing, this is too slow.
+        Returns placeholder 60.0 if AppEEARS is not available or for historical dates.
+        """
+        # For historical data (before 2015), AppEEARS is not practical
+        if start_date.year < 2015:
+            logger.debug(f"Skipping AppEEARS for historical date {start_date.year}, returning placeholder 60.0")
+            return 60.0
+        
+        if not self.use_real_data:
+            logger.debug(f"SatelliteClient.use_real_data=False, returning placeholder 60.0 for integrated NDVI")
+            return 60.0  # Placeholder
+        
+        if not self.appeears_client:
+            logger.debug(f"AppEEARS client not initialized for integrated NDVI at ({lat:.4f}, {lon:.4f}), "
+                        f"date range {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}. "
+                        f"Returning placeholder 60.0.")
             return 60.0  # Placeholder
         
         try:
             # Sample every 16 days (Landsat revisit cycle)
             current_date = start_date
             ndvi_values = []
+            dates_checked = []
+            
+            logger.debug(f"Getting integrated NDVI from AppEEARS for ({lat:.4f}, {lon:.4f}), "
+                        f"date range {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
             
             while current_date <= end_date:
+                dates_checked.append(current_date.strftime('%Y-%m-%d'))
                 ndvi_data = self.get_ndvi(lat, lon, current_date)
                 if ndvi_data.get("ndvi") is not None:
                     ndvi_values.append(ndvi_data["ndvi"])
+                    logger.debug(f"  {current_date.strftime('%Y-%m-%d')}: NDVI={ndvi_data['ndvi']:.3f}")
+                else:
+                    logger.debug(f"  {current_date.strftime('%Y-%m-%d')}: No NDVI data available")
                 current_date += timedelta(days=16)
             
             if not ndvi_values:
+                logger.warning(f"No NDVI values found from AppEEARS for integrated NDVI at ({lat:.4f}, {lon:.4f}), "
+                             f"date range {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}. "
+                             f"Checked dates: {', '.join(dates_checked)}. Returning placeholder 60.0.")
                 return 60.0
             
             # Integrated NDVI = sum of NDVI values
-            return sum(ndvi_values)
+            integrated_ndvi = sum(ndvi_values)
+            logger.debug(f"Integrated NDVI from AppEEARS: {integrated_ndvi:.2f} (sum of {len(ndvi_values)} values: {ndvi_values})")
+            return integrated_ndvi
             
         except Exception as e:
-            logger.warning(f"Failed to get integrated NDVI: {e}")
+            logger.warning(f"Failed to get integrated NDVI from AppEEARS at ({lat:.4f}, {lon:.4f}): {e}")
+            import traceback
+            logger.debug(f"Integrated NDVI error traceback: {traceback.format_exc()}")
             return 60.0
