@@ -9,9 +9,18 @@ This script orchestrates the complete data processing workflow:
 4. Analyze integrated features
 5. Assess training readiness
 6. Prepare training features → feature datasets (excludes metadata)
+7. Replace NDVI placeholders → feature datasets with real AppEEARS data (post-processing)
+8. Apply feature engineering recommendations → optimized feature datasets
+
+Note: Step 7 (replace_ndvi_placeholders) only runs if AppEEARS credentials are available
+(APPEEARS_USERNAME and APPEEARS_PASSWORD environment variables). This step replaces
+placeholder NDVI values (0.3, 0.5, 0.55, 0.7, and summer_integrated_ndvi=60.0) with
+real satellite data from NASA AppEEARS API. It runs after prepare_features to ensure
+the final feature file is updated, and before apply_feature_recommendations so that
+optimized features use real NDVI values.
 
 Usage:
-    python scripts/run_data_pipeline.py [--dataset NAME] [--skip-steps STEP1,STEP2] [--force] [--workers N]
+    python scripts/run_data_pipeline.py [--dataset NAME] [--skip-steps STEP1,STEP2] [--force] [--workers N] [--serial]
     
 Valid Dataset Names:
     The following dataset names are supported (raw data must exist in data/raw/elk_<name>/):
@@ -23,7 +32,7 @@ Valid Dataset Names:
     Note: The raw data directory must be named 'elk_<dataset_name>' (e.g., 'elk_northern_bighorn').
     
 Examples:
-    # Process all datasets
+    # Process all datasets (default mode: processes all datasets at each step level)
     python scripts/run_data_pipeline.py
     
     # Process specific dataset
@@ -31,6 +40,13 @@ Examples:
     python scripts/run_data_pipeline.py --dataset southern_bighorn
     python scripts/run_data_pipeline.py --dataset national_refuge
     python scripts/run_data_pipeline.py --dataset southern_gye
+    
+    # Serial mode: Process all datasets sequentially (one complete pipeline per dataset)
+    # Uses 1 worker and processes each dataset through all steps before moving to next
+    python scripts/run_data_pipeline.py --serial
+    python scripts/run_data_pipeline.py --serial --limit 50
+    python scripts/run_data_pipeline.py --serial --force
+    python scripts/run_data_pipeline.py --serial --skip-steps process_raw,generate_absence
     
     # Skip specific steps (e.g., if already done)
     python scripts/run_data_pipeline.py --skip-steps process_raw,generate_absence
@@ -50,10 +66,167 @@ import logging
 import subprocess
 import sys
 import os
+import socket
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 import time
 from datetime import datetime, timedelta
+import pandas as pd
+import numpy as np
+
+# Set global socket timeout to prevent hanging network requests (e.g., GEE API calls)
+# This catches cases where TCP connection is established but server stops responding
+# Without this, requests can hang indefinitely (we observed a 3+ hour hang in production)
+socket.setdefaulttimeout(120)  # 2 minutes - kill any request hanging longer than this
+
+# Feature engineering recommendations (from apply_feature_recommendations.py)
+FEATURES_TO_REMOVE = {
+    # Redundant features (high correlation with another feature)
+    'snow_water_equiv_inches',      # r=0.96 with snow_depth_inches
+    'cloud_adjusted_illumination',  # r=0.94 with effective_illumination
+
+    # Weak discriminators (Cohen's d ≈ 0, no predictive value)
+    'moon_altitude_midnight',       # d=0.0001
+    'moon_phase',                   # d=0.008
+}
+
+FEATURES_TO_TRANSFORM = {
+    'security_habitat_percent': 'log1p',  # Extreme skewness (10.1) and kurtosis (111.5)
+}
+
+WYOMING_BOUNDS = {
+    'lat_min': 40.99,
+    'lat_max': 45.01,
+    'lon_min': -111.06,
+    'lon_max': -104.05,
+}
+
+
+def _remove_features(df: pd.DataFrame, features: set) -> Tuple[pd.DataFrame, List[str]]:
+    """Remove specified features from DataFrame."""
+    removed = []
+    for col in features:
+        if col in df.columns:
+            df = df.drop(columns=[col])
+            removed.append(col)
+    return df, removed
+
+
+def _transform_features(df: pd.DataFrame, transforms: dict) -> Tuple[pd.DataFrame, List[str]]:
+    """Apply transformations to specified features."""
+    transformed = []
+    
+    for col, transform in transforms.items():
+        if col not in df.columns:
+            continue
+
+        original_stats = {
+            'min': df[col].min(),
+            'max': df[col].max(),
+            'mean': df[col].mean(),
+            'skew': df[col].skew(),
+        }
+
+        if transform == 'log1p':
+            min_val = df[col].min()
+            if min_val < 0:
+                df[col] = np.log1p(df[col] - min_val)
+            else:
+                df[col] = np.log1p(df[col])
+            transformed.append(f"{col} (log1p)")
+
+        elif transform == 'cap_95':
+            cap_value = df[col].quantile(0.95)
+            df[col] = df[col].clip(upper=cap_value)
+            transformed.append(f"{col} (capped at {cap_value:.2f})")
+
+        elif transform == 'sqrt':
+            min_val = df[col].min()
+            if min_val < 0:
+                df[col] = np.sqrt(df[col] - min_val)
+            else:
+                df[col] = np.sqrt(df[col])
+            transformed.append(f"{col} (sqrt)")
+
+        new_stats = {
+            'min': df[col].min(),
+            'max': df[col].max(),
+            'mean': df[col].mean(),
+            'skew': df[col].skew(),
+        }
+
+        logger.debug(f"    {col}: skew {original_stats['skew']:.2f} -> {new_stats['skew']:.2f}")
+
+    return df, transformed
+
+
+def _flag_geographic_outliers(
+    df: pd.DataFrame,
+    bounds: dict = WYOMING_BOUNDS,
+    remove: bool = False
+) -> Tuple[pd.DataFrame, int]:
+    """Flag or remove points outside Wyoming bounds."""
+    if 'latitude' not in df.columns or 'longitude' not in df.columns:
+        return df, 0
+
+    outside_bounds = (
+        (df['latitude'] < bounds['lat_min']) |
+        (df['latitude'] > bounds['lat_max']) |
+        (df['longitude'] < bounds['lon_min']) |
+        (df['longitude'] > bounds['lon_max'])
+    )
+
+    n_outliers = outside_bounds.sum()
+
+    if remove and n_outliers > 0:
+        df = df[~outside_bounds].copy()
+
+    return df, n_outliers
+
+
+def _apply_feature_recommendations_to_file(
+    input_file: Path,
+    output_file: Path,
+    remove_geo_outliers: bool = False
+) -> pd.DataFrame:
+    """Apply all feature recommendations to a single file."""
+    logger.info(f"  Processing: {input_file.name}")
+    
+    # Load data
+    df = pd.read_csv(input_file)
+    original_shape = df.shape
+    logger.info(f"  Loaded: {original_shape[0]:,} rows, {original_shape[1]} columns")
+
+    # 1. Remove features
+    df, removed = _remove_features(df, FEATURES_TO_REMOVE)
+    if removed:
+        logger.info(f"  Removed {len(removed)} redundant/weak features:")
+        for col in removed:
+            logger.info(f"    - {col}")
+
+    # 2. Transform features
+    df, transformed = _transform_features(df, FEATURES_TO_TRANSFORM)
+    if transformed:
+        logger.info(f"  Transformed {len(transformed)} skewed features:")
+        for col in transformed:
+            logger.info(f"    - {col}")
+
+    # 3. Handle geographic outliers
+    df, n_geo_outliers = _flag_geographic_outliers(df, remove=remove_geo_outliers)
+    if n_geo_outliers > 0:
+        action = "Removed" if remove_geo_outliers else "Found"
+        logger.info(f"  Geographic outliers: {action} {n_geo_outliers:,} points outside Wyoming bounds")
+
+    # Summary
+    logger.info(f"  Summary: {original_shape[0]:,} rows, {original_shape[1]} columns -> {df.shape[0]:,} rows, {df.shape[1]} columns")
+
+    # Save
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(output_file, index=False)
+    logger.info(f"  Saved to: {output_file}")
+
+    return df
+
 
 # Helper function to find all datasets (matches integrate_environmental_features.py logic)
 def _find_all_datasets(processed_dir: Path, test_only: bool = False) -> list[Path]:
@@ -73,6 +246,92 @@ def _find_all_datasets(processed_dir: Path, test_only: bool = False) -> list[Pat
     else:
         dataset_files = [f for f in all_files if '_test' not in f.stem]
     return sorted(dataset_files)
+
+
+def _discover_all_datasets(raw_dir: Path) -> List[str]:
+    """
+    Discover all available datasets from raw data directories.
+    
+    Args:
+        raw_dir: Directory containing raw data (should contain elk_* subdirectories)
+    
+    Returns:
+        List of dataset names (sorted alphabetically)
+    """
+    datasets = []
+    for dataset_name in VALID_DATASET_NAMES:
+        elk_dir = raw_dir / f"elk_{dataset_name}"
+        if elk_dir.exists() and elk_dir.is_dir():
+            datasets.append(dataset_name)
+    return sorted(datasets)
+
+
+def _combine_optimized_features_serial_mode(features_dir: Path, test_mode: bool = False) -> None:
+    """
+    Combine all optimized feature files into a single complete_context_optimized file.
+    
+    This function is called after serial mode processing to combine all individual
+    dataset feature files into a single combined file.
+    
+    Args:
+        features_dir: Directory containing feature files
+        test_mode: If True, combine test files. If False, combine regular files.
+    """
+    output_dir = features_dir / 'optimized'
+    
+    # Find optimized feature files
+    if test_mode:
+        feature_files = [
+            f for f in output_dir.glob('*_features_test.csv')
+            if 'complete_context' not in f.name
+        ]
+        combined_output_name = 'complete_context_optimized_test.csv'
+    else:
+        feature_files = [
+            f for f in output_dir.glob('*_features.csv')
+            if 'complete_context' not in f.name and '_test' not in f.name
+        ]
+        combined_output_name = 'complete_context_optimized.csv'
+    
+    if not feature_files:
+        logger.warning("  No optimized feature files found to combine")
+        return
+    
+    logger.info(f"  Found {len(feature_files)} optimized feature file(s) to combine")
+    
+    # Load and combine all files
+    processed_dfs = []
+    for feature_file in sorted(feature_files):
+        try:
+            df = pd.read_csv(feature_file)
+            logger.info(f"  Loaded {feature_file.name}: {df.shape[0]:,} rows, {df.shape[1]} columns")
+            processed_dfs.append(df)
+        except Exception as e:
+            logger.error(f"  Failed to load {feature_file.name}: {e}")
+            continue
+    
+    if not processed_dfs:
+        logger.warning("  No valid feature files to combine")
+        return
+    
+    # Combine all dataframes
+    logger.info(f"\n  Combining {len(processed_dfs)} dataset(s) into {combined_output_name}")
+    combined = pd.concat(processed_dfs, ignore_index=True)
+    
+    logger.info(f"  Combined shape: {combined.shape[0]:,} rows, {combined.shape[1]} columns")
+    
+    # Target distribution
+    if 'elk_present' in combined.columns:
+        presence_rate = combined['elk_present'].mean()
+        logger.info(f"  Target distribution:")
+        logger.info(f"    Presence (1): {(combined['elk_present']==1).sum():,} ({presence_rate*100:.1f}%)")
+        logger.info(f"    Absence (0):  {(combined['elk_present']==0).sum():,} ({(1-presence_rate)*100:.1f}%)")
+    
+    # Save combined file
+    output_file = output_dir / combined_output_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    combined.to_csv(output_file, index=False)
+    logger.info(f"  ✓ Saved combined file to: {output_file}")
 
 # Configure logging - will be set up in main() after determining log file path
 logger = logging.getLogger(__name__)
@@ -183,21 +442,23 @@ class PipelineStep:
         self,
         name: str,
         description: str,
-        script_path: Path,
-        command_args: List[str],
+        script_path: Optional[Path] = None,
+        command_args: Optional[List[str]] = None,
         required_input: Optional[Path] = None,
         expected_output: Optional[Path] = None,
         check_output_exists: bool = True,
-        expected_outputs: Optional[List[Path]] = None  # For steps with multiple outputs
+        expected_outputs: Optional[List[Path]] = None,  # For steps with multiple outputs
+        callable_fn: Optional[callable] = None  # Optional callable to run instead of script
     ):
         self.name = name
         self.description = description
         self.script_path = script_path
-        self.command_args = command_args
+        self.command_args = command_args or []
         self.required_input = required_input
         self.expected_output = expected_output
         self.expected_outputs = expected_outputs  # List of expected output files (for "all datasets" mode)
         self.check_output_exists = check_output_exists
+        self.callable_fn = callable_fn
     
     def should_skip(self, skip_steps: List[str]) -> bool:
         """Check if this step should be skipped."""
@@ -205,7 +466,15 @@ class PipelineStep:
     
     def can_run(self) -> bool:
         """Check if this step can run (script exists, inputs available)."""
-        if not self.script_path.exists():
+        # If using a callable function, skip script check
+        if self.callable_fn:
+            if self.required_input and not self.required_input.exists():
+                logger.warning(f"  Required input not found: {self.required_input}")
+                return False
+            return True
+        
+        # Otherwise check script exists
+        if not self.script_path or not self.script_path.exists():
             logger.warning(f"  Script not found: {self.script_path}")
             return False
         
@@ -218,6 +487,51 @@ class PipelineStep:
     def is_complete(self) -> bool:
         """Check if this step has already been completed."""
         if not self.check_output_exists:
+            # Special check for replace_ndvi_placeholders: verify if placeholder values still exist
+            # This step updates files in-place, so we need to check if there are still placeholders
+            # This check must come BEFORE the marker file check
+            if self.name == 'replace_ndvi_placeholders':
+                if self.required_input and self.required_input.exists():
+                    try:
+                        import pandas as pd
+                        # Read enough rows to get a good sample (check up to 5000 rows or all rows if less)
+                        df_sample = pd.read_csv(self.required_input, nrows=5000)
+                        
+                        # Check for placeholder NDVI values
+                        ndvi_placeholders = {0.3, 0.5, 0.55, 0.7}
+                        summer_ndvi_placeholder = 60.0
+                        
+                        has_placeholder = False
+                        placeholder_count = 0
+                        
+                        if 'ndvi' in df_sample.columns:
+                            placeholder_ndvi_mask = df_sample['ndvi'].isin(ndvi_placeholders)
+                            placeholder_ndvi_count = placeholder_ndvi_mask.sum()
+                            if placeholder_ndvi_count > 0:
+                                has_placeholder = True
+                                placeholder_count += placeholder_ndvi_count
+                        
+                        if 'summer_integrated_ndvi' in df_sample.columns:
+                            placeholder_summer_mask = (df_sample['summer_integrated_ndvi'] == summer_ndvi_placeholder)
+                            placeholder_summer_count = placeholder_summer_mask.sum()
+                            if placeholder_summer_count > 0:
+                                has_placeholder = True
+                                placeholder_count += placeholder_summer_count
+                        
+                        # If placeholders exist, step is not complete
+                        if has_placeholder:
+                            logger.debug(f"Found {placeholder_count} placeholder value(s) in {self.required_input.name}, step not complete")
+                            return False
+                        
+                        # No placeholders found - step is complete
+                        logger.debug(f"No placeholder values found in {self.required_input.name}, step is complete")
+                        return True
+                    except Exception as e:
+                        # If we can't check, assume incomplete to be safe
+                        logger.debug(f"Could not check for placeholders in {self.required_input}: {e}")
+                        return False
+                return False
+            
             # For steps without output files (like analysis steps), check if input hasn't changed
             # by comparing input file modification time to a marker file
             if self.required_input and self.required_input.exists():
@@ -307,10 +621,32 @@ class PipelineStep:
         if not self.can_run():
             return False
         
+        start_time = time.time()
+        
+        # If using a callable function, call it directly
+        if self.callable_fn:
+            try:
+                logger.info(f"  Running: {self.description}")
+                result = self.callable_fn()
+                elapsed = time.time() - start_time
+                if result:
+                    logger.info(f"  ✓ Completed in {elapsed:.1f}s")
+                    # Create marker file for steps without output files
+                    if not self.check_output_exists and self.required_input and self.required_input.exists():
+                        marker_file = self.required_input.parent / f".{self.required_input.stem}.{self.name}.complete"
+                        marker_file.touch()
+                    return True
+                else:
+                    logger.error(f"  ✗ Failed after {elapsed:.1f}s")
+                    return False
+            except Exception as e:
+                elapsed = time.time() - start_time
+                logger.error(f"  ✗ Unexpected error after {elapsed:.1f}s: {e}")
+                return False
+        
+        # Otherwise run as subprocess script
         logger.info(f"  Running: {self.script_path.name}")
         logger.info(f"  Command: python {self.script_path} {' '.join(self.command_args)}")
-        
-        start_time = time.time()
         
         try:
             # Use Popen to capture output in real-time and log it
@@ -366,14 +702,20 @@ class DataPipeline:
         skip_steps: Optional[List[str]] = None,
         force: bool = False,
         limit: Optional[int] = None,
-        workers: Optional[int] = None
+        workers: Optional[int] = None,
+        serial: bool = False
     ):
         self.data_dir = data_dir
         self.dataset_name = dataset_name
         self.skip_steps = skip_steps or []
         self.force = force
         self.limit = limit
-        self.workers = workers
+        self.serial = serial
+        # When in serial mode, force workers=1
+        if serial:
+            self.workers = 1
+        else:
+            self.workers = workers
         
         # Validate dataset name if provided
         # Allow test dataset names in test environments (detected via pytest environment variable)
@@ -452,16 +794,25 @@ class DataPipeline:
         
         # Step 1: Process raw presence data
         if self.dataset_name:
-            presence_output = self.processed_dir / f"{self.dataset_name}_points.csv"
+            # In test mode (limit set), output goes to _test file
+            if self.limit is not None:
+                presence_output = self.processed_dir / f"{self.dataset_name}_points_test.csv"
+            else:
+                presence_output = self.processed_dir / f"{self.dataset_name}_points.csv"
+            
+            command_args = [
+                '--dataset', self.dataset_name,
+                '--input-dir', str(self.raw_dir),
+                '--output-dir', str(self.processed_dir)
+            ]
+            if self.limit is not None:
+                command_args.extend(['--limit', str(self.limit)])
+            
             steps.append(PipelineStep(
                 name='process_raw',
                 description='Process raw presence data files into presence points',
                 script_path=self.scripts_dir / 'process_raw_presence_data.py',
-                command_args=[
-                    '--dataset', self.dataset_name,
-                    '--input-dir', str(self.raw_dir),
-                    '--output-dir', str(self.processed_dir)
-                ],
+                command_args=command_args,
                 required_input=self.raw_dir / f"elk_{self.dataset_name}",
                 expected_output=presence_output
             ))
@@ -475,24 +826,36 @@ class DataPipeline:
                 for combined_file in combined_files:
                     # Extract name: combined_northern_bighorn_presence_absence.csv -> northern_bighorn
                     name = combined_file.stem.replace('combined_', '').replace('_presence_absence', '')
-                    points_file = self.processed_dir / f"{name}_points.csv"
+                    if self.limit is not None:
+                        points_file = self.processed_dir / f"{name}_points_test.csv"
+                    else:
+                        points_file = self.processed_dir / f"{name}_points.csv"
                     expected_outputs.append(points_file)
             else:
                 # No combined files yet - check for all points files
-                all_points_files = list(self.processed_dir.glob('*_points.csv'))
+                if self.limit is not None:
+                    all_points_files = list(self.processed_dir.glob('*_points_test.csv'))
+                else:
+                    all_points_files = list(self.processed_dir.glob('*_points.csv'))
+                    # Exclude test files in normal mode
+                    all_points_files = [f for f in all_points_files if '_test' not in f.stem]
                 expected_outputs = [
                     f for f in all_points_files 
-                    if not f.stem.endswith('_test') and '_points' in f.stem
+                    if '_points' in f.stem
                 ]
+            
+            command_args = [
+                '--input-dir', str(self.raw_dir),
+                '--output-dir', str(self.processed_dir)
+            ]
+            if self.limit is not None:
+                command_args.extend(['--limit', str(self.limit)])
             
             steps.append(PipelineStep(
                 name='process_raw',
                 description='Process raw presence data files into presence points',
                 script_path=self.scripts_dir / 'process_raw_presence_data.py',
-                command_args=[
-                    '--input-dir', str(self.raw_dir),
-                    '--output-dir', str(self.processed_dir)
-                ],
+                command_args=command_args,
                 required_input=self.raw_dir,
                 expected_output=None,  # Multiple outputs
                 expected_outputs=expected_outputs,  # List of expected files
@@ -502,10 +865,13 @@ class DataPipeline:
         # Step 2: Generate absence data
         if self.dataset_name:
             # Process single dataset
-            presence_file = self.processed_dir / f"{self.dataset_name}_points.csv"
-            # Always create the regular combined file (full dataset)
-            # integrate_features will limit it and create the test file when limit is set
-            combined_output = self.processed_dir / f"combined_{self.dataset_name}_presence_absence.csv"
+            # In test mode (limit set), use test presence file and create test output
+            if self.limit is not None:
+                presence_file = self.processed_dir / f"{self.dataset_name}_points_test.csv"
+                combined_output = self.processed_dir / f"combined_{self.dataset_name}_presence_absence_test.csv"
+            else:
+                presence_file = self.processed_dir / f"{self.dataset_name}_points.csv"
+                combined_output = self.processed_dir / f"combined_{self.dataset_name}_presence_absence.csv"
             
             command_args = [
                 '--presence-file', str(presence_file),
@@ -518,7 +884,7 @@ class DataPipeline:
             # NOTE: Only apply limit if explicitly set - don't limit when force is used without limit
             if self.limit is not None:
                 command_args.extend(['--limit', str(self.limit)])
-                logger.info(f"  ⚠️  TEST MODE: Limiting absence generation to {self.limit} presence points")
+                # Note: Warning will be logged by generate_absence_data.py when it runs
             if self.workers is not None:
                 command_args.extend(['--n-processes', str(self.workers)])
             
@@ -705,7 +1071,265 @@ class DataPipeline:
                 check_output_exists=True  # Check if all expected outputs exist
             ))
         
+        # Step 7: Replace NDVI placeholders with AppEEARS data (post-processing)
+        features_dir = self.data_dir / 'features'
+        
+        # Check if AppEEARS credentials are available
+        import os
+        has_appears_creds = bool(os.getenv("APPEEARS_USERNAME") and os.getenv("APPEEARS_PASSWORD"))
+        
+        if has_appears_creds:
+            if self.dataset_name:
+                # Single dataset mode
+                if self.limit is not None:
+                    feature_file = features_dir / f"{self.dataset_name}_features_test.csv"
+                else:
+                    feature_file = features_dir / f"{self.dataset_name}_features.csv"
+                
+                command_args = [
+                    '--input-file', str(feature_file),
+                    '--output-file', str(feature_file),  # Update in-place
+                    '--batch-size', '100',
+                    '--max-wait-minutes', '30'
+                ]
+                if self.limit is not None:
+                    command_args.extend(['--limit', str(self.limit)])
+                if self.force:
+                    command_args.append('--force')
+                
+                steps.append(PipelineStep(
+                    name='replace_ndvi_placeholders',
+                    description='Replace NDVI placeholder values with real AppEEARS data',
+                    script_path=self.scripts_dir / 'replace_ndvi_placeholders.py',
+                    command_args=command_args,
+                    required_input=feature_file,
+                    expected_output=feature_file,  # Same file, updated in-place
+                    check_output_exists=False  # File exists, we're updating it
+                ))
+            else:
+                # All datasets mode - process each feature file
+                combined_files = _find_all_datasets(self.processed_dir)
+                if combined_files:
+                    expected_outputs_list = []
+                    for combined_file in combined_files:
+                        name = combined_file.stem.replace('combined_', '').replace('_presence_absence', '')
+                        if self.limit is not None:
+                            feature_file = features_dir / f"{name}_features_test.csv"
+                        else:
+                            feature_file = features_dir / f"{name}_features.csv"
+                        
+                        if feature_file.exists():
+                            expected_outputs_list.append(feature_file)
+                    
+                    if expected_outputs_list:
+                        steps.append(PipelineStep(
+                            name='replace_ndvi_placeholders',
+                            description='Replace NDVI placeholder values with real AppEEARS data for all datasets',
+                            script_path=None,  # Use callable to process multiple files
+                            command_args=[],
+                            required_input=features_dir,
+                            expected_output=None,
+                            expected_outputs=expected_outputs_list,
+                            check_output_exists=False,
+                            callable_fn=lambda: self._replace_ndvi_placeholders_all_datasets()
+                        ))
+        else:
+            # Log warning but don't add step (will be skipped automatically)
+            pass  # Step won't be added, so it's effectively skipped
+        
+        # Step 8: Apply feature engineering recommendations
+        output_dir = features_dir / 'optimized'
+        
+        if self.dataset_name:
+            # Single dataset mode
+            if self.limit is not None:
+                input_file = features_dir / f"{self.dataset_name}_features_test.csv"
+                output_file = output_dir / f"{self.dataset_name}_features_test.csv"
+            else:
+                input_file = features_dir / f"{self.dataset_name}_features.csv"
+                output_file = output_dir / f"{self.dataset_name}_features.csv"
+            
+            expected_outputs_list = [output_file]
+        else:
+            # All datasets mode
+            combined_files = _find_all_datasets(self.processed_dir)
+            if combined_files:
+                expected_outputs_list = []
+                for combined_file in combined_files:
+                    name = combined_file.stem.replace('combined_', '').replace('_presence_absence', '')
+                    if self.limit is not None:
+                        expected_outputs_list.append(output_dir / f"{name}_features_test.csv")
+                    else:
+                        expected_outputs_list.append(output_dir / f"{name}_features.csv")
+                # Also expect the combined file
+                if self.limit is not None:
+                    expected_outputs_list.append(output_dir / 'complete_context_optimized_test.csv')
+                else:
+                    expected_outputs_list.append(output_dir / 'complete_context_optimized.csv')
+            else:
+                expected_outputs_list = []
+        
+        steps.append(PipelineStep(
+            name='apply_feature_recommendations',
+            description='Apply feature engineering recommendations (remove redundant features, transform skewed distributions)',
+            script_path=None,
+            command_args=[],
+            required_input=features_dir,
+            expected_output=None,
+            expected_outputs=expected_outputs_list if expected_outputs_list else None,
+            check_output_exists=True,
+            callable_fn=lambda: self._apply_feature_recommendations()
+        ))
+        
         return steps
+    
+    def _apply_feature_recommendations(self) -> bool:
+        """
+        Apply feature engineering recommendations to feature files.
+        
+        This method processes all feature files, applies recommendations (removes
+        redundant features, transforms skewed distributions), and creates optimized
+        versions in the optimized/ directory.
+        """
+        features_dir = self.data_dir / 'features'
+        output_dir = features_dir / 'optimized'
+        
+        # Find feature files (exclude complete_context and test files unless in test mode)
+        if self.limit is not None:
+            # Test mode: process test files
+            feature_files = [
+                f for f in features_dir.glob('*_features_test.csv')
+                if 'complete_context' not in f.name
+            ]
+            combined_output_name = 'complete_context_optimized_test.csv'
+        else:
+            # Normal mode: process regular files
+            feature_files = [
+                f for f in features_dir.glob('*_features.csv')
+                if 'complete_context' not in f.name and '_test' not in f.name
+            ]
+            combined_output_name = 'complete_context_optimized.csv'
+        
+        if not feature_files:
+            logger.warning("  No feature files found to process")
+            return True  # Not an error if no files found
+        
+        logger.info(f"  Found {len(feature_files)} feature file(s) to process")
+        
+        processed_dfs = []
+        
+        # Process each feature file
+        for input_file in sorted(feature_files):
+            output_file = output_dir / input_file.name
+            try:
+                df = _apply_feature_recommendations_to_file(
+                    input_file,
+                    output_file,
+                    remove_geo_outliers=False  # Keep outliers by default
+                )
+                processed_dfs.append(df)
+            except Exception as e:
+                logger.error(f"  Failed to process {input_file.name}: {e}")
+                return False
+        
+        # Combine into complete_context_optimized.csv (only if processing multiple datasets)
+        # In single dataset mode, we don't create a combined file
+        if processed_dfs and not self.dataset_name:
+            logger.info(f"\n  Combining {len(processed_dfs)} dataset(s) into {combined_output_name}")
+            combined = pd.concat(processed_dfs, ignore_index=True)
+            
+            logger.info(f"  Combined shape: {combined.shape[0]:,} rows, {combined.shape[1]} columns")
+            
+            # Target distribution
+            if 'elk_present' in combined.columns:
+                presence_rate = combined['elk_present'].mean()
+                logger.info(f"  Target distribution:")
+                logger.info(f"    Presence (1): {(combined['elk_present']==1).sum():,} ({presence_rate*100:.1f}%)")
+                logger.info(f"    Absence (0):  {(combined['elk_present']==0).sum():,} ({(1-presence_rate)*100:.1f}%)")
+            
+            output_file = output_dir / combined_output_name
+            output_dir.mkdir(parents=True, exist_ok=True)
+            combined.to_csv(output_file, index=False)
+            logger.info(f"  Saved combined file to: {output_file}")
+        
+        return True
+    
+    def _replace_ndvi_placeholders_all_datasets(self) -> bool:
+        """
+        Replace NDVI placeholders for all feature files.
+        
+        This method processes all feature files found in the features directory,
+        replacing placeholder NDVI values with real AppEEARS data.
+        """
+        import subprocess
+        import os
+        
+        features_dir = self.data_dir / 'features'
+        
+        # Check if AppEEARS credentials are available
+        if not (os.getenv("APPEEARS_USERNAME") and os.getenv("APPEEARS_PASSWORD")):
+            logger.warning("  AppEEARS credentials not set, skipping NDVI placeholder replacement")
+            return True  # Not an error, just skip
+        
+        # Find feature files
+        if self.limit is not None:
+            feature_files = [
+                f for f in features_dir.glob('*_features_test.csv')
+                if 'complete_context' not in f.name
+            ]
+        else:
+            feature_files = [
+                f for f in features_dir.glob('*_features.csv')
+                if 'complete_context' not in f.name and '_test' not in f.name
+            ]
+        
+        if not feature_files:
+            logger.warning("  No feature files found to process")
+            return True
+        
+        logger.info(f"  Processing {len(feature_files)} feature file(s)...")
+        
+        script_path = self.scripts_dir / 'replace_ndvi_placeholders.py'
+        
+        for feature_file in feature_files:
+            logger.info(f"  Processing: {feature_file.name}")
+            
+            command_args = [
+                sys.executable,
+                str(script_path),
+                '--input-file', str(feature_file),
+                '--output-file', str(feature_file),  # Update in-place
+                '--batch-size', '100',
+                '--max-wait-minutes', '30'
+            ]
+            if self.limit is not None:
+                command_args.extend(['--limit', str(self.limit)])
+            if self.force:
+                command_args.append('--force')
+            
+            try:
+                result = subprocess.run(
+                    command_args,
+                    capture_output=True,
+                    text=True,
+                    timeout=3600  # 1 hour timeout per file
+                )
+                
+                if result.returncode == 0:
+                    logger.info(f"    ✓ Completed: {feature_file.name}")
+                else:
+                    logger.warning(f"    ⚠ Failed: {feature_file.name}")
+                    logger.warning(f"    Error: {result.stderr}")
+                    # Continue with other files
+                    
+            except subprocess.TimeoutExpired:
+                logger.warning(f"    ⚠ Timeout: {feature_file.name} (exceeded 1 hour)")
+                # Continue with other files
+            except Exception as e:
+                logger.error(f"    ✗ Error processing {feature_file.name}: {e}")
+                # Continue with other files
+        
+        return True
     
     def run(self) -> bool:
         """Run the complete pipeline."""
@@ -824,18 +1448,39 @@ Valid Dataset Names:
   Note: Raw data directory must be named 'elk_<dataset_name>' (e.g., 'elk_northern_bighorn')
 
 Examples:
-  # Process all datasets
+  # Process all datasets (default mode: processes all datasets at each step level)
   python scripts/run_data_pipeline.py
   
   # Process specific dataset
   python scripts/run_data_pipeline.py --dataset northern_bighorn
   python scripts/run_data_pipeline.py --dataset southern_bighorn
   
+  # Serial mode: Process all datasets sequentially (one complete pipeline per dataset)
+  # Uses 1 worker and processes each dataset through all steps before moving to next
+  python scripts/run_data_pipeline.py --serial
+  python scripts/run_data_pipeline.py --serial --limit 50
+  python scripts/run_data_pipeline.py --serial --force
+  python scripts/run_data_pipeline.py --serial --skip-steps process_raw,generate_absence
+  
   # Skip steps that are already complete
   python scripts/run_data_pipeline.py --skip-steps process_raw,generate_absence
   
   # Force regeneration of all features
   python scripts/run_data_pipeline.py --force
+  
+  # Test mode: Process only first 50 rows (creates test files)
+  python scripts/run_data_pipeline.py --dataset southern_gye --limit 50
+
+Pipeline Steps:
+  1. process_raw - Process raw presence data files
+  2. generate_absence - Generate absence data and combine with presence
+  3. integrate_features - Integrate environmental features (elevation, NDVI, weather, etc.)
+  4. analyze_features - Analyze integrated environmental features
+  5. assess_readiness - Assess training data readiness
+  6. prepare_features - Prepare training-ready features (excludes metadata)
+  7. replace_ndvi_placeholders - Replace NDVI placeholder values with real AppEEARS data
+     (Only runs if APPEEARS_USERNAME and APPEEARS_PASSWORD are set)
+  8. apply_feature_recommendations - Apply feature engineering recommendations
         """
     )
     parser.add_argument(
@@ -873,10 +1518,132 @@ Examples:
         default=None,
         help='Number of parallel workers to use for parallelizable steps (generate_absence, integrate_features). Default: auto-detect based on hardware.'
     )
+    parser.add_argument(
+        '--serial',
+        action='store_true',
+        help='Process all datasets sequentially (one complete pipeline per dataset). Uses 1 worker and honors --limit, --force, and --skip-steps options. Cannot be used with --dataset.'
+    )
     
     args = parser.parse_args()
     
-    # Set up logging to file and console
+    skip_steps = []
+    if args.skip_steps:
+        skip_steps = [s.strip() for s in args.skip_steps.split(',')]
+    
+    # Handle serial mode
+    if args.serial:
+        if args.dataset:
+            print("=" * 70, file=sys.stderr)
+            print("ERROR: --serial cannot be used with --dataset", file=sys.stderr)
+            print("=" * 70, file=sys.stderr)
+            print("Serial mode processes all datasets sequentially.", file=sys.stderr)
+            print("Omit --dataset when using --serial.", file=sys.stderr)
+            print("=" * 70, file=sys.stderr)
+            return 1
+        
+        # Discover all available datasets
+        raw_dir = args.data_dir / 'raw'
+        datasets = _discover_all_datasets(raw_dir)
+        
+        if not datasets:
+            print("=" * 70, file=sys.stderr)
+            print("ERROR: No datasets found for serial processing", file=sys.stderr)
+            print("=" * 70, file=sys.stderr)
+            print(f"No valid dataset directories found in: {raw_dir}", file=sys.stderr)
+            print(f"Expected directories: elk_northern_bighorn, elk_southern_bighorn, etc.", file=sys.stderr)
+            print("=" * 70, file=sys.stderr)
+            return 1
+        
+        # Set up logging to file and console
+        # Clean up old logs first (before setting up logging to avoid logging the cleanup)
+        logs_dir = args.data_dir / 'logs'
+        cleanup_old_logs(logs_dir, max_age_days=7)
+        
+        # Set up logging for serial mode (use "all_datasets" as identifier)
+        log_file = get_log_file_path(args.data_dir, None)
+        setup_logging(log_file)
+        
+        logger.info("=" * 70)
+        logger.info("PATHWILD DATA PROCESSING PIPELINE - SERIAL MODE")
+        logger.info("=" * 70)
+        logger.info(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Data directory: {args.data_dir}")
+        logger.info(f"Mode: Serial (processing {len(datasets)} dataset(s) sequentially)")
+        logger.info(f"Datasets to process: {', '.join(datasets)}")
+        logger.info(f"Force mode: {args.force}")
+        if args.limit is not None:
+            logger.info(f"⚠️  TEST MODE: Processing only first {args.limit:,} rows (will create test files)")
+        logger.info(f"Workers: 1 (forced for serial mode)")
+        if skip_steps:
+            logger.info(f"Skipping steps: {', '.join(skip_steps)}")
+        logger.info("")
+        
+        # Process each dataset sequentially
+        results = {}
+        overall_start = time.time()
+        
+        for i, dataset_name in enumerate(datasets, 1):
+            logger.info("")
+            logger.info("=" * 70)
+            logger.info(f"[{i}/{len(datasets)}] Processing dataset: {dataset_name}")
+            logger.info("=" * 70)
+            
+            try:
+                pipeline = DataPipeline(
+                    data_dir=args.data_dir,
+                    dataset_name=dataset_name,
+                    skip_steps=skip_steps,
+                    force=args.force,
+                    limit=args.limit,
+                    workers=1,  # Force 1 worker in serial mode
+                    serial=True
+                )
+                success = pipeline.run()
+                results[dataset_name] = success
+            except Exception as e:
+                import traceback
+                logger.error(f"Failed to process dataset {dataset_name}: {e}")
+                logger.error(f"Traceback:\n{traceback.format_exc()}")
+                results[dataset_name] = False
+        
+        # Print summary
+        overall_elapsed = time.time() - overall_start
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("SERIAL MODE SUMMARY")
+        logger.info("=" * 70)
+        logger.info(f"Completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Total time: {overall_elapsed/60:.1f} minutes")
+        logger.info("")
+        logger.info("Per-dataset results:")
+        for dataset_name, success in results.items():
+            status = "✓ Success" if success else "✗ Failed"
+            logger.info(f"  {dataset_name}: {status}")
+        
+        successful = sum(1 for s in results.values() if s)
+        logger.info("")
+        logger.info(f"Overall: {successful}/{len(datasets)} dataset(s) processed successfully")
+        
+        # Combine optimized feature files from all datasets
+        if successful > 0:
+            logger.info("")
+            logger.info("=" * 70)
+            logger.info("COMBINING OPTIMIZED FEATURE FILES")
+            logger.info("=" * 70)
+            try:
+                _combine_optimized_features_serial_mode(
+                    args.data_dir / 'features',
+                    args.limit is not None
+                )
+            except Exception as e:
+                import traceback
+                logger.error(f"Failed to combine optimized feature files: {e}")
+                logger.error(f"Traceback:\n{traceback.format_exc()}")
+                # Don't fail the entire pipeline if combination fails
+        
+        return 0 if all(results.values()) else 1
+    
+    # Set up logging to file and console (for non-serial mode)
     # Clean up old logs first (before setting up logging to avoid logging the cleanup)
     logs_dir = args.data_dir / 'logs'
     cleanup_old_logs(logs_dir, max_age_days=7)
@@ -884,10 +1651,6 @@ Examples:
     # Generate log file path and set up logging
     log_file = get_log_file_path(args.data_dir, args.dataset)
     setup_logging(log_file)
-    
-    skip_steps = []
-    if args.skip_steps:
-        skip_steps = [s.strip() for s in args.skip_steps.split(',')]
     
     # Validate dataset name early (before setting up logging and creating pipeline)
     # Allow test dataset names in test environments

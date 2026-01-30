@@ -234,7 +234,8 @@ def process_csv(input_path: Path, dataset_name: str) -> pd.DataFrame:
 def process_dataset(
     input_dir: Path,
     dataset_name: str,
-    output_dir: Path
+    output_dir: Path,
+    limit: Optional[int] = None
 ) -> Optional[Path]:
     """
     Process a single dataset from raw data to presence points.
@@ -317,9 +318,19 @@ def process_dataset(
         logger.error(f"  Missing required columns: {missing_cols}")
         return None
     
+    # Apply limit if specified (for testing)
+    if limit is not None:
+        original_count = len(df)
+        df = df.head(limit)
+        logger.info(f"  ⚠️  TEST MODE: Limited presence points from {original_count:,} to {len(df):,}")
+    
     # Save output
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_file = output_dir / f"{dataset_name}_points.csv"
+    # Use _test suffix when limit is set
+    if limit is not None:
+        output_file = output_dir / f"{dataset_name}_points_test.csv"
+    else:
+        output_file = output_dir / f"{dataset_name}_points.csv"
     
     logger.info(f"  Saving {len(df):,} presence points to {output_file}")
     df.to_csv(output_file, index=False)
@@ -359,6 +370,12 @@ def main():
         nargs='+',
         default=None,
         help='List of datasets to process. If not specified, auto-detects from input directory.'
+    )
+    parser.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='Maximum number of presence points to process per dataset (for testing). Creates *_test.csv files instead of overwriting originals.'
     )
     
     args = parser.parse_args()
@@ -402,7 +419,7 @@ def main():
             failed.append(dataset_name)
             continue
         
-        output_file = process_dataset(dataset_input_dir, dataset_name, output_dir)
+        output_file = process_dataset(dataset_input_dir, dataset_name, output_dir, limit=args.limit)
         
         if output_file:
             processed.append((dataset_name, output_file))

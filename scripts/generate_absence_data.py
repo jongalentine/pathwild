@@ -220,10 +220,16 @@ def main():
     # Setup paths
     data_dir = Path(args.data_dir)
     presence_file = Path(args.presence_file)
-    output_file = Path(args.output_file)
+    
+    # Determine output filename - use _test suffix when limit is set
+    output_file_path = Path(args.output_file)
+    if args.limit is not None and not output_file_path.stem.endswith('_test'):
+        # Change output filename to _test version
+        output_file_path = output_file_path.parent / f"{output_file_path.stem}_test.csv"
+        logger.info(f"⚠️  TEST MODE: Output will be saved to {output_file_path.name}")
     
     # Ensure output directory exists
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file_path.parent.mkdir(parents=True, exist_ok=True)
     
     # Load presence data
     logger.info(f"Loading presence data from {presence_file}")
@@ -545,8 +551,8 @@ def main():
     # This avoids duplication and reduces processing time
     
     # Save
-    logger.info(f"\nSaving combined dataset to {output_file}")
-    training_data.to_csv(output_file, index=False)
+    logger.info(f"\nSaving combined dataset to {output_file_path}")
+    training_data.to_csv(output_file_path, index=False)
     
     # Summary
     logger.info(f"\n✓ Dataset generation complete!")

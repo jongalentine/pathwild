@@ -90,7 +90,7 @@ gee:
   collection: landsat8  # landsat8 | sentinel2
   batch_size: 100
   max_workers: 4
-  buffer_days: 7
+  buffer_days: 0  # 0 = use adaptive defaults (21 days for Landsat 5, 14 days for Landsat 8). Set to specific value to override.
   max_cloud_cover: 50.0  # Increased from 30.0 to find more images and reduce placeholder values
 
 # Processing Configuration
@@ -98,6 +98,41 @@ processing:
   parallel_threshold: 5000  # Use parallel if > N records
   retry_attempts: 3
   retry_delay: 2.0
+
+# Rut Behavior Configuration (Wyoming-specific)
+rut_behavior:
+  enabled: true
+  timing:
+    # Rut phases (month, start_day, month_end, end_day)
+    pre_rut:
+      start_month: 9
+      start_day: 1
+      end_month: 9
+      end_day: 15
+    peak_rut:
+      start_month: 9
+      start_day: 15
+      end_month: 10
+      end_day: 10
+    post_rut:
+      start_month: 10
+      start_day: 10
+      end_month: 10
+      end_day: 31
+  terrain_boosts:
+    meadow_edge: 1.2      # 20% score boost
+    ridgeline: 1.15        # 15% score boost
+    elevated_viewpoint: 1.1  # 10% score boost
+    aspen_stand: 1.1       # 10% score boost
+    ecotone: 1.15          # 15% score boost
+  elevation_preferences:
+    optimal_low: 9000      # ft during rut
+    optimal_high: 10000    # ft during rut
+    acceptable_low: 8500   # ft
+    acceptable_high: 10500 # ft
+  security_importance:
+    pre_rut_boost: 1.15    # 15% boost during pre-rut
+    peak_rut_boost: 1.20   # 20% boost during peak rut (higher vulnerability)
 
 # Area polygon configuration (example: Area 048)
 area_048_polygon:

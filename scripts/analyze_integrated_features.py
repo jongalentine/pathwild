@@ -672,7 +672,21 @@ def analyze_integrated_features(dataset_path: Path):
                         summer_temp = df_with_date[df_with_date['month'].isin([6, 7, 8])]['temperature_f'].mean()
                         winter_temp = df_with_date[df_with_date['month'].isin([12, 1, 2])]['temperature_f'].mean()
                         temp_range = summer_temp - winter_temp
-                        if temp_range < 20:  # Summer should be significantly warmer
+                        
+                        # Check overall temperature range (min to max)
+                        overall_temp_range = df_with_date['temperature_f'].max() - df_with_date['temperature_f'].min()
+                        unique_months = df_with_date['month'].nunique()
+                        
+                        # Enhanced validation: Check if data spans multiple seasons
+                        if unique_months >= 6:  # Data spans at least 6 months (multi-season)
+                            if overall_temp_range < 10:
+                                print(f"\n    ⚠⚠ CRITICAL WARNING: Temperature variation ({overall_temp_range:.1f}°F) is extremely small for multi-season data")
+                                print(f"      Data spans {unique_months} months but temperature only varies by {overall_temp_range:.1f}°F")
+                                print(f"      Expected variation: 30-50°F for Wyoming data spanning multiple seasons")
+                                print(f"      This strongly suggests PRISM data is not being read correctly or using fallback values")
+                                print(f"      → Check PRISM data files exist and are readable")
+                                print(f"      → Check PRISM client error logs for extraction failures")
+                        elif temp_range < 20:  # Summer should be significantly warmer
                             print(f"\n    ⚠ Warning: Temperature variation ({temp_range:.1f}°F) is smaller than expected")
                             print(f"      Expected ~30-50°F difference between summer and winter in Wyoming")
                             print(f"      This may indicate placeholder data or insufficient date range")

@@ -85,7 +85,9 @@ CORE_FEATURES = {
     'temperature_f', 'precip_last_7_days_inches', 'cloud_cover_percent',
     'ndvi', 'ndvi_age_days', 'irg', 'summer_integrated_ndvi',
     # Lunar illumination features (for nocturnal activity modeling)
-    'moon_phase', 'moon_altitude_midnight', 'effective_illumination', 'cloud_adjusted_illumination'
+    'moon_phase', 'moon_altitude_midnight', 'effective_illumination', 'cloud_adjusted_illumination',
+    # Rut behavior features (derived from temporal data)
+    'rut_phase', 'days_since_rut_start'
 }
 
 
@@ -123,11 +125,191 @@ def get_feature_columns(df: pd.DataFrame, exclude_temporal: bool = False) -> Lis
     return feature_cols
 
 
+def create_rut_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create rut-specific features from temporal data.
+    
+    Args:
+        df: Input DataFrame with month/day_of_year columns
+    
+    Returns:
+        DataFrame with added rut features
+    """
+    df = df.copy()
+    
+    # Get month from date or month column
+    if 'month' in df.columns:
+        months = df['month']
+    elif 'firstdate' in df.columns:
+        months = pd.to_datetime(df['firstdate']).dt.month
+    elif 'date' in df.columns:
+        months = pd.to_datetime(df['date']).dt.month
+    else:
+        # Can't create rut features without month data
+        return df
+    
+    # Get day from date or derive from month/day_of_year/day_of_year_sin/cos
+    days = None
+    if 'firstdate' in df.columns:
+        days = pd.to_datetime(df['firstdate']).dt.day
+    elif 'date' in df.columns:
+        days = pd.to_datetime(df['date']).dt.day
+    elif 'day_of_year' in df.columns and 'month' in df.columns:
+        # Approximate day from day_of_year and month (rough estimate)
+        # This is not precise but acceptable for rut phase detection
+        days = np.where(df['month'] == 9, 
+                       np.maximum(1, df['day_of_year'] - 243),  # Approximate Sep 1 = day 244
+                       np.where(df['month'] == 10,
+                               np.maximum(1, df['day_of_year'] - 273),  # Approximate Oct 1 = day 274
+                               np.nan))
+    elif 'day_of_year_sin' in df.columns and 'day_of_year_cos' in df.columns and 'month' in df.columns:
+        # Reverse engineer day_of_year from sin/cos (for feature files that have cyclical encoding)
+        estimated_day_of_year = np.arctan2(df['day_of_year_sin'], df['day_of_year_cos'])
+        estimated_day_of_year = (estimated_day_of_year / (2 * np.pi)) * 365.25
+        estimated_day_of_year = ((estimated_day_of_year % 365.25) + 365.25) % 365.25
+        
+        # Estimate day of month from estimated day_of_year
+        days = np.where(
+            months == 9,
+            np.maximum(1, estimated_day_of_year - 243),  # Sep 1 ≈ day 244
+            np.where(
+                months == 10,
+                np.maximum(1, estimated_day_of_year - 273),  # Oct 1 ≈ day 274
+                np.nan
+            )
+        )
+    
+    # Create rut_phase (categorical: pre_rut, peak_rut, post_rut, none)
+    rut_phase = pd.Series('none', index=df.index)
+    
+    if days is not None:
+        # Pre-rut: September 1-15
+        mask_pre = (months == 9) & (days >= 1) & (days < 15)
+        rut_phase.loc[mask_pre] = 'pre_rut'
+        
+        # Peak rut: September 15 - October 10
+        mask_peak_sep = (months == 9) & (days >= 15)
+        mask_peak_oct = (months == 10) & (days < 10)
+        rut_phase.loc[mask_peak_sep | mask_peak_oct] = 'peak_rut'
+        
+        # Post-rut: October 10-31
+        mask_post = (months == 10) & (days >= 10)
+        rut_phase.loc[mask_post] = 'post_rut'
+    else:
+        # Fallback: approximate from month only
+        mask_pre = months == 9
+        mask_peak = (months == 9) | (months == 10)
+        rut_phase.loc[mask_pre] = 'pre_rut'
+        rut_phase.loc[mask_peak] = 'peak_rut'
+    
+    df['rut_phase'] = rut_phase
+    
+    # Create days_since_rut_start (days from September 1)
+    # Use day_of_year if available, otherwise approximate from month/day or sin/cos
+    if 'day_of_year' in df.columns:
+        # September 1 is approximately day 244 (varies by leap year)
+        # Use a simple approximation: day_of_year - 244 for September/October
+        days_since_rut = np.where(
+            months >= 9,
+            df['day_of_year'] - 243,  # Approximate Sep 1 = day 244
+            np.nan
+        )
+    elif 'day_of_year_sin' in df.columns and 'day_of_year_cos' in df.columns:
+        # Reverse engineer day_of_year from sin/cos
+        estimated_day_of_year = np.arctan2(df['day_of_year_sin'], df['day_of_year_cos'])
+        estimated_day_of_year = (estimated_day_of_year / (2 * np.pi)) * 365.25
+        estimated_day_of_year = ((estimated_day_of_year % 365.25) + 365.25) % 365.25
+        
+        days_since_rut = np.where(
+            months >= 9,
+            estimated_day_of_year - 243,  # Approximate Sep 1 = day 244
+            np.nan
+        )
+    elif days is not None:
+        # Calculate from month and day
+        days_since_rut = np.where(
+            months == 9,
+            days,  # Days into September
+            np.where(
+                months == 10,
+                days + 30,  # Days into October (approximate Sept = 30 days)
+                np.nan
+            )
+        )
+    else:
+        days_since_rut = np.nan
+    
+    df['days_since_rut_start'] = days_since_rut
+    
+    return df
+
+
+def create_rut_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create interaction features for rut-related features.
+    
+    Creates numeric interactions between rut features and other numeric features
+    that may have meaningful interactions with rut behavior.
+    
+    Args:
+        df: Input DataFrame with rut features
+    
+    Returns:
+        DataFrame with added interaction features
+    """
+    df = df.copy()
+    interactions_created = []
+    
+    # Check if rut features exist
+    if 'days_since_rut_start' not in df.columns:
+        return df
+    
+    # days_since_rut_start * temperature_f (rut timing affected by weather)
+    if 'temperature_f' in df.columns and 'days_since_rut_start' in df.columns:
+        df['rut_days_x_temperature'] = df['days_since_rut_start'] * df['temperature_f']
+        interactions_created.append('rut_days_x_temperature')
+    
+    # days_since_rut_start * elevation (rut behavior may vary by elevation)
+    if 'elevation' in df.columns and 'days_since_rut_start' in df.columns:
+        df['rut_days_x_elevation'] = df['days_since_rut_start'] * df['elevation']
+        interactions_created.append('rut_days_x_elevation')
+    
+    # days_since_rut_start * water_distance_miles (rut changes water needs)
+    if 'water_distance_miles' in df.columns and 'days_since_rut_start' in df.columns:
+        df['rut_days_x_water_distance'] = df['days_since_rut_start'] * df['water_distance_miles']
+        interactions_created.append('rut_days_x_water_distance')
+    
+    # For rut_phase (categorical), create numeric encoding if not already numeric
+    # Then create interactions with key numeric features
+    if 'rut_phase' in df.columns:
+        # Check if rut_phase is already numeric (label encoded)
+        if df['rut_phase'].dtype in ['object', 'string']:
+            # Create numeric encoding for rut_phase
+            phase_mapping = {'none': 0, 'pre_rut': 1, 'peak_rut': 2, 'post_rut': 3}
+            df['rut_phase_encoded'] = df['rut_phase'].map(phase_mapping).fillna(0)
+            rut_phase_col = 'rut_phase_encoded'
+        else:
+            rut_phase_col = 'rut_phase'
+        
+        # rut_phase * elevation (rut behavior varies by elevation)
+        if 'elevation' in df.columns:
+            df['rut_phase_x_elevation'] = df[rut_phase_col] * df['elevation']
+            interactions_created.append('rut_phase_x_elevation')
+        
+        # rut_phase * month (captures phase-month interactions)
+        if 'month' in df.columns:
+            df['rut_phase_x_month'] = df[rut_phase_col] * df['month']
+            interactions_created.append('rut_phase_x_month')
+    
+    return df
+
+
 def prepare_training_dataset(
     input_file: Path,
     output_file: Path,
     exclude_temporal: bool = False,
-    include_day_of_year: bool = True
+    include_day_of_year: bool = True,
+    include_interactions: bool = False
 ) -> pd.DataFrame:
     """
     Prepare a training-ready dataset by excluding metadata columns.
@@ -144,6 +326,21 @@ def prepare_training_dataset(
     print(f"Loading: {input_file}")
     df = pd.read_csv(input_file)
     print(f"  Loaded {len(df):,} rows, {len(df.columns)} columns")
+    
+    # Create rut-specific features from temporal data
+    df = create_rut_features(df)
+    rut_features_created = ['rut_phase', 'days_since_rut_start']
+    created_rut_features = [f for f in rut_features_created if f in df.columns]
+    if created_rut_features:
+        print(f"  ✓ Created {len(created_rut_features)} rut behavior features: {', '.join(created_rut_features)}")
+    
+    # Create rut interaction features if requested
+    if include_interactions:
+        df_before = len(df.columns)
+        df = create_rut_interaction_features(df)
+        interaction_features = [c for c in df.columns if c not in [col for col in df.columns[:df_before]]]
+        if interaction_features:
+            print(f"  ✓ Created {len(interaction_features)} rut interaction features: {', '.join(interaction_features)}")
     
     # Debug: Check if day_of_year exists
     if 'day_of_year' in df.columns:
@@ -291,7 +488,8 @@ def prepare_all_datasets(
     features_dir: Path = Path('data/features'),
     exclude_temporal: bool = False,
     include_day_of_year: bool = True,
-    limit: Optional[int] = None
+    limit: Optional[int] = None,
+    include_interactions: bool = False
 ):
     """Prepare training features for all combined datasets."""
     processed_dir = Path(processed_dir)
@@ -342,7 +540,8 @@ def prepare_all_datasets(
                 input_file, 
                 output_file, 
                 exclude_temporal=exclude_temporal,
-                include_day_of_year=include_day_of_year
+                include_day_of_year=include_day_of_year,
+                include_interactions=include_interactions
             )
         except Exception as e:
             print(f"  ✗ Error: {e}")
@@ -471,6 +670,11 @@ Examples:
         default=None,
         help='Limit mode: process test files (combined_*_presence_absence_test.csv) and save to test output files'
     )
+    parser.add_argument(
+        '--include-interactions',
+        action='store_true',
+        help='Create rut feature interaction features (e.g., rut_days_x_temperature, rut_phase_x_elevation)'
+    )
     
     args = parser.parse_args()
     
@@ -482,7 +686,8 @@ Examples:
             features_dir=args.features_dir,
             exclude_temporal=args.exclude_temporal,
             include_day_of_year=include_day_of_year,
-            limit=args.limit
+            limit=args.limit,
+            include_interactions=args.include_interactions
         )
     else:
         if not args.input_file or not args.output_file:
@@ -492,7 +697,8 @@ Examples:
             args.input_file,
             args.output_file,
             exclude_temporal=args.exclude_temporal,
-            include_day_of_year=include_day_of_year
+            include_day_of_year=include_day_of_year,
+            include_interactions=args.include_interactions
         )
     
     return 0
