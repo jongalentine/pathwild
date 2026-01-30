@@ -16,9 +16,14 @@ import os
 import sys
 from types import ModuleType
 
+# Create a context manager-compatible mock for rasterio.open
+mock_rasterio_open = MagicMock()
+mock_rasterio_open.return_value.__enter__ = MagicMock(return_value=MagicMock())
+mock_rasterio_open.return_value.__exit__ = MagicMock(return_value=False)
+
 # Create a mock rasterio module
 mock_rasterio = ModuleType('rasterio')
-mock_rasterio.open = Mock()
+mock_rasterio.open = mock_rasterio_open
 sys.modules['rasterio'] = mock_rasterio
 
 mock_rasterio_mask = ModuleType('rasterio.mask')
@@ -143,6 +148,9 @@ class TestPRISMClient:
         
         # Mock download to return file path
         cog_path = prism_dir / "tmean" / "prism_tmean_us_4km_20240615.tif"
+        # Create the file so the existence check passes
+        cog_path.parent.mkdir(parents=True, exist_ok=True)
+        cog_path.write_bytes(b'dummy tif content')
         mock_download.return_value = cog_path
         
         # Mock rasterio dataset
@@ -344,10 +352,16 @@ class TestPRISMClient:
         mock_zipfile.assert_called_once()
     
     @pytest.mark.unit
-    def test_get_temperature(self, tmp_path):
+    @patch.object(PRISMClient, '_get_file_path')
+    def test_get_temperature(self, mock_get_file_path, tmp_path):
         """Test getting temperature data."""
         prism_dir = tmp_path / "prism"
         client = PRISMClient(data_dir=prism_dir)
+        
+        # Mock _get_file_path to return a non-existent .bil path so magnitude check is used
+        # This ensures the 2500.0 value gets divided by 100 to become 25.0
+        bil_path = prism_dir / "tmean" / "PRISM_tmean_stable_4kmD2_20240615_bil.bil"
+        mock_get_file_path.return_value = bil_path
         
         # Mock extract_value for each variable
         client.extract_value = Mock(side_effect=[
@@ -363,10 +377,15 @@ class TestPRISMClient:
         assert result["temp_max_c"] == 30.0
     
     @pytest.mark.unit
-    def test_get_temperature_with_none_values(self, tmp_path):
+    @patch.object(PRISMClient, '_get_file_path')
+    def test_get_temperature_with_none_values(self, mock_get_file_path, tmp_path):
         """Test getting temperature data when some values are None."""
         prism_dir = tmp_path / "prism"
         client = PRISMClient(data_dir=prism_dir)
+        
+        # Mock _get_file_path to return a non-existent .bil path so magnitude check is used
+        bil_path = prism_dir / "tmean" / "PRISM_tmean_stable_4kmD2_20240615_bil.bil"
+        mock_get_file_path.return_value = bil_path
         
         # Mock extract_value returning None for some variables
         client.extract_value = Mock(side_effect=[

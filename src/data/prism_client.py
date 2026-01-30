@@ -638,6 +638,17 @@ class PRISMClient:
         
         # If download returned None (404/not available), return None
         if file_path is None:
+            logger.warning(f"PRISM file not available for {variable} on {date.strftime('%Y-%m-%d')} "
+                         f"(file path would be: {self._get_file_path(variable, date)})")
+            return None
+        
+        # Verify file exists and is readable
+        if not file_path.exists():
+            logger.error(f"PRISM file path returned but file does not exist: {file_path}")
+            return None
+        
+        if file_path.stat().st_size == 0:
+            logger.warning(f"PRISM file exists but is empty (0 bytes): {file_path}")
             return None
         
         # Extract value at point (works for both COG and BIL formats)
@@ -648,7 +659,9 @@ class PRISMClient:
                 # Check if point is within bounds
                 if not src.bounds.left <= lon <= src.bounds.right or \
                    not src.bounds.bottom <= lat <= src.bounds.top:
-                    logger.warning(f"Point ({lat}, {lon}) outside PRISM bounds for {date}")
+                    logger.warning(f"Point ({lat}, {lon}) outside PRISM bounds for {date.strftime('%Y-%m-%d')} "
+                                 f"(bounds: {src.bounds.left:.2f} to {src.bounds.right:.2f} lon, "
+                                 f"{src.bounds.bottom:.2f} to {src.bounds.top:.2f} lat)")
                     return None
                 
                 # Use rasterio's sample method for more reliable point sampling
@@ -663,12 +676,20 @@ class PRISMClient:
                 
                 # Check for nodata
                 if value < -9000:  # PRISM nodata is typically -9999
+                    logger.debug(f"PRISM nodata value detected ({value}) for {variable} at ({lat}, {lon}) on {date.strftime('%Y-%m-%d')}")
                     return None
+                
+                # Log suspicious values (0 or near 0 for temperature in winter might be OK, but worth logging)
+                if variable.startswith('t') and abs(value) < 10:  # Temperature near 0°C
+                    logger.debug(f"PRISM {variable} value near zero ({value}) for ({lat}, {lon}) on {date.strftime('%Y-%m-%d')} "
+                               f"(file: {file_path.name})")
                 
                 return value
                 
         except Exception as e:
-            logger.error(f"Error extracting PRISM value: {e}")
+            logger.error(f"Error extracting PRISM {variable} value from {file_path.name} for ({lat}, {lon}) on {date.strftime('%Y-%m-%d')}: {e}")
+            import traceback
+            logger.debug(f"PRISM extraction traceback: {traceback.format_exc()}")
             return None
     
     def get_temperature(
@@ -688,24 +709,72 @@ class PRISMClient:
         Returns:
             Dictionary with temp_mean_c, temp_min_c, temp_max_c (in °C)
         """
+        # Get file path to determine format (COG vs BIL)
+        file_path = self._get_file_path("tmean", date)
+        is_cog_format = file_path.suffix == ".tif" or (file_path.exists() and file_path.suffix == ".tif")
+        is_bil_format = file_path.suffix == ".bil" or (file_path.exists() and file_path.suffix == ".bil")
+        
+        # If file exists, check actual extension
+        if file_path.exists():
+            is_cog_format = file_path.suffix == ".tif"
+            is_bil_format = file_path.suffix == ".bil"
+        
         tmean = self.extract_value("tmean", lat, lon, date)
         tmin = self.extract_value("tmin", lat, lon, date)
         tmax = self.extract_value("tmax", lat, lon, date)
         
-        # PRISM .tif files store temperature in °C × 100 (divide by 100 to get actual °C)
+        # PRISM format conversion:
+        # - COG (.tif) files store temperature directly in °C (no conversion needed)
+        # - BIL (.bil) files store temperature in °C × 100 (divide by 100 to get actual °C)
+        # If format is unclear, check value magnitude: values > 100 are likely BIL format
         result = {}
         if tmean is not None:
-            result["temp_mean_c"] = tmean / 100.0
+            # Determine if conversion is needed based on format or value magnitude
+            if is_bil_format:
+                # BIL format: divide by 100
+                result["temp_mean_c"] = tmean / 100.0
+                logger.debug(f"PRISM tmean (BIL format) for ({lat:.4f}, {lon:.4f}) on {date.strftime('%Y-%m-%d')}: "
+                            f"raw={tmean}, converted={result['temp_mean_c']:.2f}°C")
+            elif is_cog_format:
+                # COG format: already in °C, no conversion
+                result["temp_mean_c"] = tmean
+                logger.debug(f"PRISM tmean (COG format) for ({lat:.4f}, {lon:.4f}) on {date.strftime('%Y-%m-%d')}: "
+                            f"raw={tmean}, converted={result['temp_mean_c']:.2f}°C")
+            else:
+                # Format unclear - use value magnitude to determine
+                if abs(tmean) > 100:
+                    # Large value suggests BIL format (×100)
+                    result["temp_mean_c"] = tmean / 100.0
+                    logger.debug(f"PRISM tmean (auto-detected BIL) for ({lat:.4f}, {lon:.4f}) on {date.strftime('%Y-%m-%d')}: "
+                                f"raw={tmean}, converted={result['temp_mean_c']:.2f}°C")
+                else:
+                    # Small value suggests COG format (direct °C)
+                    result["temp_mean_c"] = tmean
+                    logger.debug(f"PRISM tmean (auto-detected COG) for ({lat:.4f}, {lon:.4f}) on {date.strftime('%Y-%m-%d')}: "
+                                f"raw={tmean}, converted={result['temp_mean_c']:.2f}°C")
         else:
             result["temp_mean_c"] = None
+            logger.warning(f"PRISM tmean returned None for ({lat:.4f}, {lon:.4f}) on {date.strftime('%Y-%m-%d')}")
 
         if tmin is not None:
-            result["temp_min_c"] = tmin / 100.0
+            if is_bil_format:
+                result["temp_min_c"] = tmin / 100.0
+            elif is_cog_format:
+                result["temp_min_c"] = tmin
+            else:
+                # Auto-detect based on magnitude
+                result["temp_min_c"] = tmin / 100.0 if abs(tmin) > 100 else tmin
         else:
             result["temp_min_c"] = None
 
         if tmax is not None:
-            result["temp_max_c"] = tmax / 100.0
+            if is_bil_format:
+                result["temp_max_c"] = tmax / 100.0
+            elif is_cog_format:
+                result["temp_max_c"] = tmax
+            else:
+                # Auto-detect based on magnitude
+                result["temp_max_c"] = tmax / 100.0 if abs(tmax) > 100 else tmax
         else:
             result["temp_max_c"] = None
         
@@ -728,13 +797,26 @@ class PRISMClient:
         Returns:
             Precipitation in mm (PRISM units), or None
         """
+        # Get file path to determine format (COG vs BIL)
+        file_path = self._get_file_path("ppt", date)
+        is_cog_format = file_path.exists() and file_path.suffix == ".tif"
+        is_bil_format = file_path.exists() and file_path.suffix == ".bil"
+        
         ppt = self.extract_value("ppt", lat, lon, date)
         
         if ppt is None:
             return None
 
-        # PRISM .tif files store precipitation in mm × 100 (divide by 100 to get actual mm)
-        return ppt / 100.0
+        # PRISM format conversion:
+        # - COG (.tif) files store precipitation directly in mm (no conversion needed)
+        # - BIL (.bil) files store precipitation in mm × 100 (divide by 100 to get actual mm)
+        if is_bil_format:
+            return ppt / 100.0
+        elif is_cog_format:
+            return ppt
+        else:
+            # Auto-detect based on magnitude (precipitation > 1000mm is unlikely for daily values)
+            return ppt / 100.0 if abs(ppt) > 1000 else ppt
     
     def get_weather_for_date_range(
         self,
