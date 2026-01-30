@@ -6,37 +6,76 @@ This script updates existing CSV files with real environmental features
 from DEM, water sources, land cover, etc. It replaces placeholder values
 with actual data from environmental datasets.
 
+Checkpointing
+-------------
+This script supports resumable processing via checkpoints. Progress is saved
+every batch (default 1000 rows) to `data/processed/.checkpoints/`. If the
+script is interrupted, it will automatically resume from the last saved row
+on the next run.
+
+Checkpoint behavior:
+- Checkpoints are per-dataset and track: last processed row, rows processed,
+  rows skipped, error indices, and a file checksum
+- If the input file changes (different checksum), the checkpoint is invalidated
+  and processing starts from the beginning
+- Use --no-resume to ignore existing checkpoint and start from row 0
+  (still creates a new checkpoint for future resumability)
+- Use --force to reprocess all rows, even those without placeholder values
+- Use --force --no-resume together to fully reprocess from scratch
+- Use --status to check checkpoint state without processing
+- Test runs (--limit) use separate checkpoint files (*_test.json)
+
+Checkpoint files are stored at:
+    data/processed/.checkpoints/integrate_features_<dataset_name>.json
+
 Usage:
     # First, activate the conda environment:
     conda activate pathwild
-    
+
     # Then run the script:
     python scripts/integrate_environmental_features.py [dataset_path] [--workers N] [--batch-size N] [--limit N]
-    
+
 Examples:
     # Process ALL datasets in data/processed/ (finds all combined_*_presence_absence.csv files)
     python scripts/integrate_environmental_features.py
-    
+
     # Process specific dataset (auto-detects optimal workers and batch size based on hardware)
     python scripts/integrate_environmental_features.py data/processed/combined_northern_bighorn_presence_absence.csv
-    
+
     # Process with specific number of workers
     python scripts/integrate_environmental_features.py data/processed/combined_national_refuge_presence_absence.csv --workers 4
-    
+
     # Force sequential processing (no parallelization)
     python scripts/integrate_environmental_features.py data/processed/dataset.csv --workers 1
-    
+
     # Test on first 100 rows (saves to *_test.csv, doesn't overwrite original)
     python scripts/integrate_environmental_features.py data/processed/combined_national_refuge_presence_absence.csv --limit 100
-    
+
     # Process with custom batch size (auto-detects workers)
     python scripts/integrate_environmental_features.py data/processed/dataset.csv --batch-size 500
+
+    # Check checkpoint status for all datasets
+    python scripts/integrate_environmental_features.py --status
+
+    # Force reprocess all rows (even those without placeholders), with checkpointing
+    python scripts/integrate_environmental_features.py data/processed/dataset.csv --force
+
+    # Start from row 0 (ignore existing checkpoint), but still create checkpoint
+    python scripts/integrate_environmental_features.py data/processed/dataset.csv --no-resume
+
+    # Full restart: reprocess all rows from the beginning
+    python scripts/integrate_environmental_features.py data/processed/dataset.csv --force --no-resume
 """
 
 import argparse
 import logging
 import sys
 import os
+import socket
+
+# Set global socket timeout to prevent hanging network requests (e.g., GEE API calls)
+# This catches cases where TCP connection is established but server stops responding
+socket.setdefaulttimeout(120)  # 2 minutes
 
 # Check for required dependencies early with helpful error message
 try:
@@ -77,6 +116,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.data.processors import DataContextBuilder
+from src.data.checkpoint import ProcessingCheckpoint
 
 # Configure logging (must be before any logger usage)
 logging.basicConfig(
@@ -303,12 +343,19 @@ def detect_optimal_batch_size(dataset_size: int, n_workers: int) -> int:
     return batch_size
 
 
-def _process_sequential(df, builder, date_col, batch_size, limit, dataset_path, force: bool = False):
-    """Process rows sequentially (original method)"""
+def _process_sequential(df, builder, date_col, batch_size, limit, dataset_path, force: bool = False,
+                        checkpoint=None, checkpoint_mgr=None, no_resume: bool = False):
+    """Process rows sequentially with checkpoint support for resumable processing.
+
+    Args:
+        force: If True, process all rows even without placeholders.
+        no_resume: If True, start from row 0 (checkpoint already reset by caller).
+    """
     updated_count = 0
     error_count = 0
     skipped_count = 0
-    
+    error_indices = []
+
     # Define environmental columns (static + temporal)
     env_columns = [
         # Static features (terrain, infrastructure, etc.)
@@ -325,20 +372,36 @@ def _process_sequential(df, builder, date_col, batch_size, limit, dataset_path, 
         # Lunar illumination features
         'moon_phase', 'moon_altitude_midnight', 'effective_illumination', 'cloud_adjusted_illumination'
     ]
-    
+
+    # Determine start row from checkpoint (no_resume means checkpoint was already reset)
+    start_row = 0
+    if checkpoint and not no_resume:
+        start_row = checkpoint.get('last_processed_row', -1) + 1
+        if start_row > 0:
+            logger.info(f"Checkpoint: resuming from row {start_row:,}")
+            # Restore counts from checkpoint
+            updated_count = checkpoint.get('rows_processed', 0)
+            skipped_count = checkpoint.get('rows_skipped', 0)
+            error_count = checkpoint.get('rows_with_errors', 0)
+            error_indices = checkpoint.get('error_indices', [])
+
     # Filter rows if not forcing (only process rows with placeholders)
     if not force:
         rows_to_process = []
-        for idx in range(len(df)):
+        for idx in range(start_row, len(df)):
             row = df.iloc[idx]
             if has_placeholder_values(row, env_columns):
                 rows_to_process.append(idx)
-        skipped_count = len(df) - len(rows_to_process)
+            else:
+                skipped_count += 1
         if skipped_count > 0:
             logger.info(f"Skipping {skipped_count:,} rows without placeholders (use --force to process all)")
     else:
-        rows_to_process = list(range(len(df)))
-        logger.info("Force mode: Processing all rows")
+        rows_to_process = list(range(start_row, len(df)))
+        if start_row == 0:
+            logger.info("Force mode: Processing all rows")
+        else:
+            logger.info(f"Force mode: Processing rows {start_row:,} to {len(df):,}")
     
     iterator = rows_to_process
     if HAS_TQDM:
@@ -416,7 +479,7 @@ def _process_sequential(df, builder, date_col, batch_size, limit, dataset_path, 
                     df.at[idx, col] = context[col]
             
             updated_count += 1
-            
+
             # Save progress periodically
             if (idx + 1) % batch_size == 0:
                 if limit is not None:
@@ -425,16 +488,48 @@ def _process_sequential(df, builder, date_col, batch_size, limit, dataset_path, 
                 else:
                     df.to_csv(dataset_path, index=False)
                 logger.debug(f"Progress saved at row {idx + 1}")
-        
+
+                # Update checkpoint
+                if checkpoint_mgr and checkpoint:
+                    checkpoint_mgr.update(
+                        checkpoint,
+                        last_row=idx,
+                        rows_processed=updated_count,
+                        rows_skipped=skipped_count,
+                        error_indices=error_indices
+                    )
+
         except Exception as e:
             error_count += 1
+            error_indices.append(idx)
             logger.warning(f"Error processing row {idx}: {e}")
             if error_count > 100:
                 logger.error("Too many errors, stopping")
+                # Save checkpoint before stopping
+                if checkpoint_mgr and checkpoint:
+                    checkpoint_mgr.update(
+                        checkpoint,
+                        last_row=idx,
+                        rows_processed=updated_count,
+                        rows_skipped=skipped_count,
+                        error_indices=error_indices
+                    )
                 break
-    
+
     if skipped_count > 0:
         logger.info(f"Skipped {skipped_count:,} rows without placeholders")
+
+    # Final checkpoint update (for any remaining rows since last batch)
+    if checkpoint_mgr and checkpoint and rows_to_process:
+        last_idx = rows_to_process[-1] if rows_to_process else (start_row - 1)
+        checkpoint_mgr.update(
+            checkpoint,
+            last_row=last_idx,
+            rows_processed=updated_count,
+            rows_skipped=skipped_count,
+            error_indices=error_indices
+        )
+
     return updated_count, error_count
 
 
@@ -758,34 +853,64 @@ def process_batch(args):
     return results
 
 
-def update_dataset(dataset_path: Path, data_dir: Path, batch_size: int = 1000, limit: int = None, n_workers: int = None, force: bool = False):
+def update_dataset(dataset_path: Path, data_dir: Path, batch_size: int = 1000, limit: int = None, n_workers: int = None, force: bool = False, no_resume: bool = False):
     """
     Update dataset with real environmental features.
-    
+
+    Supports checkpointing for resumable processing. If processing is interrupted,
+    re-running with the same parameters will resume from the last checkpoint.
+
     Args:
         dataset_path: Path to CSV file to update
         data_dir: Path to data directory with environmental datasets
         batch_size: Number of rows to process before saving progress
         limit: Maximum number of rows to process (for testing). If None, processes all rows.
+        n_workers: Number of parallel workers. If None, auto-detected.
+        force: If True, reprocess all rows even if they don't have placeholders.
+        no_resume: If True, ignore existing checkpoint and start from row 0
+                   (still creates new checkpoint for future resumability).
     """
     # Ensure absolute paths for multiprocessing compatibility
     data_dir = data_dir.resolve()
     dataset_path = dataset_path.resolve()
 
     logger.info(f"Loading dataset: {dataset_path}")
-    
+
     if not dataset_path.exists():
         logger.error(f"Dataset not found: {dataset_path}")
         return False
-    
+
     df = pd.read_csv(dataset_path)
     original_len = len(df)
     logger.info(f"Loaded {original_len:,} rows")
-    
+
     # Limit rows for testing if specified
     if limit is not None:
         df = df.head(limit)
         logger.info(f"⚠️  TEST MODE: Processing only first {len(df):,} rows (limit={limit})")
+
+    # Initialize checkpoint manager
+    checkpoint_dir = data_dir / 'processed' / '.checkpoints'
+    checkpoint_mgr = ProcessingCheckpoint(checkpoint_dir)
+
+    # Load or create checkpoint
+    checkpoint = checkpoint_mgr.load_or_create(
+        dataset_path=dataset_path,
+        total_rows=len(df),
+        force=no_resume,  # no_resume deletes existing checkpoint
+        limit=limit,
+        workers=n_workers,
+        batch_size=batch_size
+    )
+
+    # Check if already completed
+    if checkpoint.get('state') == 'completed' and not no_resume:
+        logger.info(f"Dataset already fully processed (checkpoint shows completed)")
+        logger.info(f"  Rows processed: {checkpoint.get('rows_processed', 0):,}")
+        logger.info(f"  Rows skipped: {checkpoint.get('rows_skipped', 0):,}")
+        logger.info(f"  Errors: {checkpoint.get('rows_with_errors', 0):,}")
+        logger.info(f"Use --no-resume to start fresh, or --force to reprocess all rows")
+        return True
     
     # Check required columns
     required_cols = ['latitude', 'longitude']
@@ -906,13 +1031,17 @@ def update_dataset(dataset_path: Path, data_dir: Path, batch_size: int = 1000, l
             logger.warning(f"   Using more workers can cause segmentation faults due to resource exhaustion")
             n_workers = 4
         logger.info(f"Dataset size ({len(df):,}) >= {PARALLEL_THRESHOLD:,} rows - using parallel processing with {n_workers} workers")
+        # Note: Parallel processing doesn't use checkpointing yet (complex due to out-of-order completion)
         updated_count, error_count = _process_parallel(df, data_dir, date_col, batch_size, limit, dataset_path, n_workers, force)
     else:
         if len(df) < PARALLEL_THRESHOLD:
             logger.info(f"Dataset size ({len(df):,}) < {PARALLEL_THRESHOLD:,} rows - using sequential processing")
         else:
             logger.info("Using sequential processing")
-        updated_count, error_count = _process_sequential(df, builder, date_col, batch_size, limit, dataset_path, force)
+        updated_count, error_count = _process_sequential(
+            df, builder, date_col, batch_size, limit, dataset_path, force,
+            checkpoint=checkpoint, checkpoint_mgr=checkpoint_mgr, no_resume=no_resume
+        )
     
     # Final save
     logger.info(f"\nSaving updated dataset...")
@@ -933,14 +1062,19 @@ def update_dataset(dataset_path: Path, data_dir: Path, batch_size: int = 1000, l
     if limit is not None:
         logger.info(f"  Test mode: Processed {len(df):,} of {original_len:,} total rows")
     logger.info(f"  Saved to: {output_path}")
-    
+
+    # Mark checkpoint as completed
+    if checkpoint_mgr and checkpoint:
+        checkpoint_mgr.complete(checkpoint)
+        logger.info(f"  Checkpoint: marked as completed")
+
     # Show sample of updated values
     logger.info("\nSample updated values:")
     sample_cols = ['elevation', 'slope_degrees', 'water_distance_miles']
     available_cols = [col for col in sample_cols if col in df.columns]
     if available_cols:
         logger.info(f"\n{df[available_cols].head().to_string()}")
-    
+
     return True
 
 
@@ -959,6 +1093,61 @@ def find_all_datasets(processed_dir: Path) -> list[Path]:
     # Filter out test files
     dataset_files = [f for f in all_files if '_test' not in f.stem]
     return sorted(dataset_files)
+
+
+def show_checkpoint_status(args, data_dir: Path, processed_dir: Path) -> int:
+    """
+    Show checkpoint status for dataset(s) without processing.
+
+    Args:
+        args: Parsed command line arguments
+        data_dir: Path to data directory
+        processed_dir: Path to processed directory
+
+    Returns:
+        Exit code (0 for success)
+    """
+    checkpoint_dir = data_dir / 'processed' / '.checkpoints'
+    checkpoint_mgr = ProcessingCheckpoint(checkpoint_dir)
+
+    # Determine which dataset(s) to check
+    if args.dataset is None:
+        dataset_files = find_all_datasets(processed_dir)
+        if not dataset_files:
+            logger.info(f"No datasets found in {processed_dir}")
+            return 0
+    else:
+        dataset_path = Path(args.dataset).resolve()
+        if not dataset_path.exists():
+            logger.error(f"Dataset not found: {dataset_path}")
+            return 1
+        dataset_files = [dataset_path]
+
+    logger.info(f"{'='*70}")
+    logger.info("CHECKPOINT STATUS")
+    logger.info(f"{'='*70}")
+
+    for dataset_path in dataset_files:
+        dataset_name = dataset_path.stem.replace("combined_", "").replace("_presence_absence", "")
+        test_mode = args.limit is not None
+
+        status = checkpoint_mgr.get_status(dataset_path, test_mode)
+
+        if status is None:
+            logger.info(f"\n{dataset_name}:")
+            logger.info(f"  Status: No checkpoint (not started or completed without checkpointing)")
+        else:
+            logger.info(f"\n{dataset_name}:")
+            logger.info(f"  Status: {status['state']}")
+            logger.info(f"  Progress: {status['last_processed_row'] + 1:,} / {status['total_rows']:,} rows ({status['progress_percent']:.1f}%)")
+            logger.info(f"  Rows processed: {status['rows_processed']:,}")
+            logger.info(f"  Rows skipped: {status['rows_skipped']:,}")
+            logger.info(f"  Errors: {status['rows_with_errors']:,}")
+            logger.info(f"  Started: {status['started_at']}")
+            logger.info(f"  Updated: {status['updated_at']}")
+
+    logger.info(f"\n{'='*70}")
+    return 0
 
 
 def main():
@@ -1008,10 +1197,25 @@ def main():
     parser.add_argument(
         '--force',
         action='store_true',
-        help='Force regeneration of all features, even if placeholders don\'t exist'
+        help='Force regeneration of all features, even for rows without placeholders'
     )
-    
+    parser.add_argument(
+        '--no-resume',
+        action='store_true',
+        dest='no_resume',
+        help='Ignore existing checkpoint and start from row 0 (still creates new checkpoint for resumability)'
+    )
+    parser.add_argument(
+        '--status',
+        action='store_true',
+        help='Show checkpoint status for dataset(s) without processing'
+    )
+
     args = parser.parse_args()
+
+    # Handle --status option
+    if args.status:
+        return show_checkpoint_status(args, Path(args.data_dir).resolve(), Path(args.processed_dir).resolve())
     
     data_dir = Path(args.data_dir).resolve()  # Resolve to absolute path for multiprocessing
     processed_dir = Path(args.processed_dir).resolve()
@@ -1062,7 +1266,8 @@ def main():
                     args.batch_size,
                     args.limit,
                     args.workers,
-                    args.force
+                    args.force,
+                    args.no_resume
                 ): dataset_path
                 for dataset_path in dataset_files
             }
@@ -1109,7 +1314,7 @@ def main():
             return 1
         
         success = update_dataset(
-            dataset_path, data_dir, args.batch_size, args.limit, args.workers, args.force
+            dataset_path, data_dir, args.batch_size, args.limit, args.workers, args.force, args.no_resume
         )
         
         return 0 if success else 1
