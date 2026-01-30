@@ -14,8 +14,13 @@ import sys
 
 # Mock rasterio before importing PRISMClient to avoid import errors in sandbox
 from types import ModuleType
+# Create a context manager-compatible mock for rasterio.open
+mock_rasterio_open = MagicMock()
+mock_rasterio_open.return_value.__enter__ = MagicMock(return_value=MagicMock())
+mock_rasterio_open.return_value.__exit__ = MagicMock(return_value=False)
+
 mock_rasterio = ModuleType('rasterio')
-mock_rasterio.open = Mock()
+mock_rasterio.open = mock_rasterio_open
 # Add errors module for NotGeoreferencedWarning
 mock_rasterio_errors = ModuleType('rasterio.errors')
 mock_rasterio_errors.NotGeoreferencedWarning = type('NotGeoreferencedWarning', (Warning,), {})

@@ -23,7 +23,7 @@ try:
 except ImportError:
     EE_AVAILABLE = False
 
-from src.data.processors import NDVICache, GEENDVIClient
+from src.data.processors import NDVICache, GEENDVIClient, GEECircuitBreaker
 
 try:
     import yaml
@@ -277,6 +277,10 @@ class TestGEENDVIClientWithCache:
     @pytest.fixture
     def gee_client_with_cache(self, test_config, temp_cache_dir):
         """Fixture for GEE NDVI client with cache enabled"""
+        # Reset circuit breaker before each test to prevent state persistence
+        if GEECircuitBreaker._instance is not None:
+            GEECircuitBreaker._instance.reset()
+        
         if not EE_AVAILABLE:
             pytest.skip("earthengine-api not available")
         
@@ -298,6 +302,10 @@ class TestGEENDVIClientWithCache:
     @pytest.fixture
     def gee_client_no_cache(self, test_config):
         """Fixture for GEE NDVI client with cache disabled"""
+        # Reset circuit breaker before each test to prevent state persistence
+        if GEECircuitBreaker._instance is not None:
+            GEECircuitBreaker._instance.reset()
+        
         if not EE_AVAILABLE:
             pytest.skip("earthengine-api not available")
         
@@ -318,6 +326,10 @@ class TestGEENDVIClientWithCache:
     @pytest.mark.slow
     def test_cache_enabled_by_default(self, test_config, temp_cache_dir):
         """Test that cache is enabled by default"""
+        # Reset circuit breaker before each test to prevent state persistence
+        if GEECircuitBreaker._instance is not None:
+            GEECircuitBreaker._instance.reset()
+        
         if not EE_AVAILABLE:
             pytest.skip("earthengine-api not available")
         
@@ -371,6 +383,10 @@ class TestGEENDVIClientWithCache:
     @pytest.mark.slow
     def test_cache_persistence_across_instances(self, test_config, temp_cache_dir):
         """Test that cache persists across different client instances"""
+        # Reset circuit breaker before each test to prevent state persistence
+        if GEECircuitBreaker._instance is not None:
+            GEECircuitBreaker._instance.reset()
+        
         if not EE_AVAILABLE:
             pytest.skip("earthengine-api not available")
         

@@ -29,6 +29,7 @@ data/raw/*.pdf
 data/raw/*.json
 data/processed/*.csv      # Processed data
 data/features/*.csv       # Feature datasets
+data/cache/*.db           # Cache databases (NDVI, SNOTEL, AppEEARS)
 *.h5                      # HDF5 files
 *.pkl                     # Pickle files
 *.pickle

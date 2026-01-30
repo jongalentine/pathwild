@@ -506,6 +506,92 @@ class TestDataPipeline:
         
         # Should be marked for skipping
         assert prepare_step.should_skip(pipeline.skip_steps) is True
+    
+    def test_replace_ndvi_placeholders_step_included_with_credentials(self, tmp_path, monkeypatch):
+        """Test that replace_ndvi_placeholders step is included when AppEEARS credentials are available."""
+        # Set AppEEARS credentials
+        monkeypatch.setenv("APPEEARS_USERNAME", "test_user")
+        monkeypatch.setenv("APPEEARS_PASSWORD", "test_pass")
+        
+        data_dir = tmp_path / "data"
+        features_dir = data_dir / "features"
+        features_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create feature file
+        feature_file = features_dir / "test_dataset_features.csv"
+        feature_file.write_text("year,month,latitude,longitude,ndvi\n2020,6,43.0,-110.0,0.5\n")
+        
+        pipeline = DataPipeline(
+            data_dir=data_dir,
+            dataset_name='test_dataset',
+            skip_steps=[],
+            force=False,
+            limit=None
+        )
+        
+        # Find replace_ndvi_placeholders step
+        replace_step = next((s for s in pipeline.steps if s.name == 'replace_ndvi_placeholders'), None)
+        assert replace_step is not None
+        assert 'replace_ndvi_placeholders.py' in str(replace_step.script_path)
+        assert str(feature_file) in replace_step.command_args
+    
+    def test_replace_ndvi_placeholders_step_with_limit(self, tmp_path, monkeypatch):
+        """Test that replace_ndvi_placeholders step passes --limit option when limit is set."""
+        # Set AppEEARS credentials
+        monkeypatch.setenv("APPEEARS_USERNAME", "test_user")
+        monkeypatch.setenv("APPEEARS_PASSWORD", "test_pass")
+        
+        data_dir = tmp_path / "data"
+        features_dir = data_dir / "features"
+        features_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create feature file
+        feature_file = features_dir / "test_dataset_features_test.csv"
+        feature_file.write_text("year,month,latitude,longitude,ndvi\n2020,6,43.0,-110.0,0.5\n")
+        
+        pipeline = DataPipeline(
+            data_dir=data_dir,
+            dataset_name='test_dataset',
+            skip_steps=[],
+            force=False,
+            limit=50
+        )
+        
+        # Find replace_ndvi_placeholders step
+        replace_step = next((s for s in pipeline.steps if s.name == 'replace_ndvi_placeholders'), None)
+        assert replace_step is not None
+        
+        # Check that --limit is in command args
+        assert '--limit' in replace_step.command_args
+        limit_idx = replace_step.command_args.index('--limit')
+        assert replace_step.command_args[limit_idx + 1] == '50'
+    
+    def test_replace_ndvi_placeholders_step_skipped_without_credentials(self, tmp_path, monkeypatch):
+        """Test that replace_ndvi_placeholders step is skipped when AppEEARS credentials are not available."""
+        # Ensure credentials are not set
+        monkeypatch.delenv("APPEEARS_USERNAME", raising=False)
+        monkeypatch.delenv("APPEEARS_PASSWORD", raising=False)
+        
+        data_dir = tmp_path / "data"
+        features_dir = data_dir / "features"
+        features_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create feature file
+        feature_file = features_dir / "test_dataset_features.csv"
+        feature_file.write_text("year,month,latitude,longitude,ndvi\n2020,6,43.0,-110.0,0.5\n")
+        
+        pipeline = DataPipeline(
+            data_dir=data_dir,
+            dataset_name='test_dataset',
+            skip_steps=[],
+            force=False,
+            limit=None
+        )
+        
+        # Find replace_ndvi_placeholders step
+        replace_step = next((s for s in pipeline.steps if s.name == 'replace_ndvi_placeholders'), None)
+        # Step should not be included when credentials are missing
+        assert replace_step is None
 
 
 class TestProcessRawPresenceData:
@@ -615,6 +701,99 @@ class TestProcessRawPresenceData:
         assert 'longitude' in df.columns
         assert all(df['latitude'].between(-90, 90))
         assert all(df['longitude'].between(-180, 180))
+    
+    def test_process_dataset_with_limit_creates_test_file(self, sample_csv_data, tmp_path):
+        """Test that process_dataset with limit creates *_test.csv file."""
+        import importlib.util
+        import shutil
+        scripts_dir = Path(__file__).parent.parent / "scripts"
+        real_script = scripts_dir / "process_raw_presence_data.py"
+        temp_script = tmp_path / "process_raw_presence_data.py"
+        
+        if real_script.exists():
+            shutil.copy2(real_script, temp_script)
+        else:
+            pytest.skip("Real process_raw_presence_data.py not found")
+        
+        spec = importlib.util.spec_from_file_location(
+            "process_raw_presence_data",
+            temp_script
+        )
+        process_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(process_module)
+        
+        # Create input directory with CSV
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        shutil.copy2(sample_csv_data, input_dir / "test_data.csv")
+        
+        # Create output directory
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        
+        # Process with limit
+        output_file = process_module.process_dataset(
+            input_dir=input_dir,
+            dataset_name="test_dataset",
+            output_dir=output_dir,
+            limit=1
+        )
+        
+        # Should create test file
+        assert output_file is not None
+        assert output_file.name == "test_dataset_points_test.csv"
+        assert output_file.exists()
+        
+        # Verify file contains limited data
+        df = pd.read_csv(output_file)
+        assert len(df) == 1, "Output should have only 1 row when limit=1"
+    
+    def test_process_dataset_without_limit_creates_normal_file(self, sample_csv_data, tmp_path):
+        """Test that process_dataset without limit creates normal file."""
+        import importlib.util
+        import shutil
+        scripts_dir = Path(__file__).parent.parent / "scripts"
+        real_script = scripts_dir / "process_raw_presence_data.py"
+        temp_script = tmp_path / "process_raw_presence_data.py"
+        
+        if real_script.exists():
+            shutil.copy2(real_script, temp_script)
+        else:
+            pytest.skip("Real process_raw_presence_data.py not found")
+        
+        spec = importlib.util.spec_from_file_location(
+            "process_raw_presence_data",
+            temp_script
+        )
+        process_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(process_module)
+        
+        # Create input directory with CSV
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        shutil.copy2(sample_csv_data, input_dir / "test_data.csv")
+        
+        # Create output directory
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        
+        # Process without limit
+        output_file = process_module.process_dataset(
+            input_dir=input_dir,
+            dataset_name="test_dataset",
+            output_dir=output_dir,
+            limit=None
+        )
+        
+        # Should create normal file (no _test suffix)
+        assert output_file is not None
+        assert output_file.name == "test_dataset_points.csv"
+        assert '_test' not in output_file.stem
+        assert output_file.exists()
+        
+        # Verify file contains all data
+        df = pd.read_csv(output_file)
+        assert len(df) == 2, "Output should have all rows when limit is not set"
 
 
 class TestEndToEndPipeline:
@@ -713,6 +892,9 @@ class TestEndToEndPipeline:
         # Mock all script paths to exist
         scripts_dir = Path(__file__).parent.parent / "scripts"
         for step in pipeline.steps:
+            # Skip steps without script_path (e.g., callable_fn steps)
+            if step.script_path is None:
+                continue
             # Use real script paths if they exist, otherwise create mocks
             if not step.script_path.exists():
                 step.script_path.parent.mkdir(parents=True, exist_ok=True)
@@ -754,8 +936,16 @@ class TestEndToEndPipeline:
     def test_pipeline_with_limit_parameter(self, tmp_path):
         """Test that pipeline correctly handles limit parameter."""
         data_dir = tmp_path / "data"
+        raw_dir = data_dir / "raw"
         processed_dir = data_dir / "processed"
+        raw_dir.mkdir(parents=True, exist_ok=True)
         processed_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create test dataset directory
+        (raw_dir / "elk_test_dataset").mkdir()
+        (raw_dir / "elk_test_dataset" / "test.csv").write_text(
+            "latitude,longitude,id,date\n43.0,-110.0,1,2024-01-01\n"
+        )
         
         # Create pipeline with limit
         pipeline = DataPipeline(
@@ -769,11 +959,26 @@ class TestEndToEndPipeline:
         # Verify limit is stored
         assert pipeline.limit == 100
         
+        # Verify process_raw step includes --limit
+        process_raw_step = next((s for s in pipeline.steps if s.name == 'process_raw'), None)
+        assert process_raw_step is not None
+        assert '--limit' in process_raw_step.command_args
+        limit_idx = process_raw_step.command_args.index('--limit')
+        assert process_raw_step.command_args[limit_idx + 1] == '100'
+        # Verify test file is expected
+        assert '_test' in str(process_raw_step.expected_output) or 'test' in str(process_raw_step.expected_output)
+        assert process_raw_step.expected_output.name == "test_dataset_points_test.csv"
+        
         # Verify generate_absence step includes --limit
         generate_absence_step = next((s for s in pipeline.steps if s.name == 'generate_absence'), None)
         assert generate_absence_step is not None
         assert '--limit' in generate_absence_step.command_args
         assert '100' in generate_absence_step.command_args
+        # Verify test files are used
+        assert '_test' in str(generate_absence_step.required_input) or 'test' in str(generate_absence_step.required_input)
+        assert generate_absence_step.required_input.name == "test_dataset_points_test.csv"
+        assert '_test' in str(generate_absence_step.expected_output) or 'test' in str(generate_absence_step.expected_output)
+        assert generate_absence_step.expected_output.name == "combined_test_dataset_presence_absence_test.csv"
         
         # Verify integrate_features step includes --limit
         integrate_step = next((s for s in pipeline.steps if s.name == 'integrate_features'), None)
@@ -783,6 +988,47 @@ class TestEndToEndPipeline:
         
         # Verify test files are used
         assert 'test' in str(integrate_step.expected_output) or '_test' in str(integrate_step.expected_output)
+    
+    def test_pipeline_without_limit_uses_normal_files(self, tmp_path):
+        """Test that pipeline without limit uses normal (non-test) files."""
+        data_dir = tmp_path / "data"
+        raw_dir = data_dir / "raw"
+        processed_dir = data_dir / "processed"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        processed_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create test dataset directory
+        (raw_dir / "elk_test_dataset").mkdir()
+        (raw_dir / "elk_test_dataset" / "test.csv").write_text(
+            "latitude,longitude,id,date\n43.0,-110.0,1,2024-01-01\n"
+        )
+        
+        # Create pipeline without limit
+        pipeline = DataPipeline(
+            data_dir=data_dir,
+            dataset_name='test_dataset',
+            skip_steps=[],
+            force=False,
+            limit=None
+        )
+        
+        # Verify process_raw step does NOT include --limit
+        process_raw_step = next((s for s in pipeline.steps if s.name == 'process_raw'), None)
+        assert process_raw_step is not None
+        assert '--limit' not in process_raw_step.command_args
+        # Verify normal file is expected (no _test suffix)
+        assert process_raw_step.expected_output.name == "test_dataset_points.csv"
+        assert not process_raw_step.expected_output.stem.endswith('_test')
+        
+        # Verify generate_absence step does NOT include --limit
+        generate_absence_step = next((s for s in pipeline.steps if s.name == 'generate_absence'), None)
+        assert generate_absence_step is not None
+        assert '--limit' not in generate_absence_step.command_args
+        # Verify normal files are used (no _test suffix)
+        assert generate_absence_step.required_input.name == "test_dataset_points.csv"
+        assert not generate_absence_step.required_input.stem.endswith('_test')
+        assert generate_absence_step.expected_output.name == "combined_test_dataset_presence_absence.csv"
+        assert not generate_absence_step.expected_output.stem.endswith('_test')
 
 
 class TestDatasetNameValidation:
@@ -979,6 +1225,7 @@ class TestDatasetNameValidation:
                 self.force = False
                 self.limit = None
                 self.workers = None
+                self.serial = False  # Add missing serial attribute
         
         # Create data directory
         (tmp_path / "data" / "logs").mkdir(parents=True, exist_ok=True)
