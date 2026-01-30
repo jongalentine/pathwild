@@ -39,12 +39,32 @@ class ElevationHeuristic(BaseHeuristic):
             # Fall back to DEM lookup if not provided
             elevation = self._get_elevation_from_dem(location, context)
         
-        # Parse date to get month
+        # Parse date to get month and day
         dt = datetime.fromisoformat(date)
         month = dt.month
+        day = dt.day
         
         # Get optimal range for this month
         opt_low, opt_high, min_accept, max_accept = self.MONTHLY_RANGES[month]
+        
+        # Adjust for rut period: bulls prefer higher elevations (9,000-10,000 ft)
+        # during peak rut (Sept 15 - Oct 10) for display sites
+        rut_phase = self._get_rut_phase(month, day)
+        if rut_phase in ["pre_rut", "peak_rut"]:
+            # During rut, prefer slightly higher elevations (9,000-10,000 ft)
+            # Adjust optimal range upward during rut
+            if month == 9:  # September
+                # Pre-rut and peak rut favor higher elevations
+                opt_low = max(opt_low, 9000)
+                opt_high = max(opt_high, 10000)
+                min_accept = max(min_accept, 8500)
+                max_accept = max(max_accept, 10500)
+            elif month == 10 and day < 10:  # Early October (peak rut)
+                # Peak rut in early October favors higher elevations
+                opt_low = max(opt_low, 9000)
+                opt_high = max(opt_high, 10000)
+                min_accept = max(min_accept, 8500)
+                max_accept = max(max_accept, 10500)
         
         # Calculate score
         if opt_low <= elevation <= opt_high:
@@ -52,6 +72,8 @@ class ElevationHeuristic(BaseHeuristic):
             score = 10.0
             status = "excellent"
             note = f"Elevation {elevation:.0f}ft is optimal for {dt.strftime('%B')}"
+            if rut_phase:
+                note += f" ({rut_phase.replace('_', ' ')})"
         elif min_accept <= elevation <= max_accept:
             # In acceptable range
             # Score decreases linearly as you move away from optimal
@@ -91,7 +113,8 @@ class ElevationHeuristic(BaseHeuristic):
                 "elevation_ft": elevation,
                 "month": dt.strftime('%B'),
                 "optimal_range": (opt_low, opt_high),
-                "acceptable_range": (min_accept, max_accept)
+                "acceptable_range": (min_accept, max_accept),
+                "rut_phase": rut_phase
             }
         )
     
@@ -106,6 +129,20 @@ class ElevationHeuristic(BaseHeuristic):
         elevation = self._bilinear_interpolate(dem, lat, lon)
         
         return elevation
+    
+    def _get_rut_phase(self, month: int, day: int) -> str:
+        """Determine rut phase based on date"""
+        if month == 9:  # September
+            if day >= 1 and day < 15:
+                return "pre_rut"
+            elif day >= 15:
+                return "peak_rut"
+        elif month == 10:  # October
+            if day < 10:
+                return "peak_rut"
+            elif day >= 10:
+                return "post_rut"
+        return None
     
     def _bilinear_interpolate(self, grid, lat, lon):
         """Simple bilinear interpolation (you'd use rasterio in practice)"""

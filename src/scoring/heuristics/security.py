@@ -1,4 +1,5 @@
-from typing import Dict
+from typing import Dict, Optional
+from datetime import datetime
 import numpy as np
 from .base import BaseHeuristic, HeuristicScore
 
@@ -39,6 +40,10 @@ class SecurityHabitatHeuristic(BaseHeuristic):
         security_pct = context.get("security_habitat_percent", 
                                    50 if is_security else 20)
         
+        # Determine rut phase (elk more vulnerable during rut)
+        dt = datetime.fromisoformat(date)
+        rut_phase = self._get_rut_phase(dt.month, dt.day)
+        
         # Calculate score based on security percentage in area
         if security_pct >= self.OPTIMAL_SECURITY_PCT:
             score = 10.0
@@ -66,6 +71,25 @@ class SecurityHabitatHeuristic(BaseHeuristic):
             score = min(10.0, score * 1.1)
             note += " [location is secure]"
         
+        # During rut, security habitat becomes even more important
+        # Elk are more vulnerable and predictable during rut
+        if rut_phase in ["pre_rut", "peak_rut"]:
+            # Increase importance of security habitat during rut
+            if rut_phase == "peak_rut":
+                security_boost = 1.2  # 20% boost during peak rut vulnerability
+                note += f" [heightened importance during {rut_phase.replace('_', ' ')}]"
+            else:  # pre_rut
+                security_boost = 1.15  # 15% boost during pre-rut
+                note += f" [increased importance during {rut_phase.replace('_', ' ')}]"
+            
+            score = min(10.0, score * security_boost)
+            
+            # Adjust status if boosted into higher category
+            if score >= 9.0 and status != "excellent":
+                status = "excellent"
+            elif score >= 7.0 and status not in ["excellent", "good"]:
+                status = "good"
+        
         # Add qualifiers about what makes it secure
         security_features = []
         if slope > 40:
@@ -92,6 +116,21 @@ class SecurityHabitatHeuristic(BaseHeuristic):
                 "slope_degrees": slope,
                 "canopy_cover": canopy_cover,
                 "road_distance": road_distance,
-                "security_features": security_features
+                "security_features": security_features,
+                "rut_phase": rut_phase
             }
         )
+    
+    def _get_rut_phase(self, month: int, day: int) -> Optional[str]:
+        """Determine rut phase based on date"""
+        if month == 9:  # September
+            if day >= 1 and day < 15:
+                return "pre_rut"
+            elif day >= 15:
+                return "peak_rut"
+        elif month == 10:  # October
+            if day < 10:
+                return "peak_rut"
+            elif day >= 10:
+                return "post_rut"
+        return None

@@ -11,6 +11,7 @@ from .security import SecurityHabitatHeuristic
 from .predation import PredationRiskHeuristic
 from .nutrition import NutritionalConditionHeuristic
 from .winterkill import WinterSeverityHeuristic
+from .rut import RutBehaviorHeuristic
 from .ml_prediction import MLPredictionHeuristic
 
 __all__ = [
@@ -25,5 +26,6 @@ __all__ = [
     "PredationRiskHeuristic",
     "NutritionalConditionHeuristic",
     "WinterSeverityHeuristic",
+    "RutBehaviorHeuristic",
     "MLPredictionHeuristic",
 ]    

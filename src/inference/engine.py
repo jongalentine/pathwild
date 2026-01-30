@@ -17,6 +17,7 @@ from ..scoring.heuristics import (
     PredationRiskHeuristic,
     NutritionalConditionHeuristic,
     WinterSeverityHeuristic,
+    RutBehaviorHeuristic,
     MLPredictionHeuristic
 )
 from ..data.processors import DataContextBuilder
@@ -50,7 +51,8 @@ class ElkPredictionEngine:
             SecurityHabitatHeuristic(weight=default_weights.get("security", 1.0)),
             PredationRiskHeuristic(weight=default_weights.get("predation", 1.0)),
             NutritionalConditionHeuristic(weight=default_weights.get("nutrition", 1.0)),
-            WinterSeverityHeuristic(weight=default_weights.get("winterkill", 1.0))
+            WinterSeverityHeuristic(weight=default_weights.get("winterkill", 1.0)),
+            RutBehaviorHeuristic(weight=default_weights.get("rut_behavior", 1.0))
         ]
 
         # Optionally add ML heuristic with higher weight

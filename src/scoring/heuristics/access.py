@@ -1,7 +1,7 @@
 # src/scoring/heuristics/access.py
 
 from datetime import datetime
-from typing import Dict
+from typing import Dict, Optional
 import numpy as np
 from .base import BaseHeuristic, HeuristicScore
 
@@ -38,6 +38,9 @@ class HuntingPressureHeuristic(BaseHeuristic):
         dt = datetime.fromisoformat(date)
         in_hunting_season, season_name = self._check_hunting_season(dt)
         
+        # Determine rut phase (elk may be slightly less sensitive during peak rut)
+        rut_phase = self._get_rut_phase(dt.month, dt.day)
+        
         # Calculate accessibility score (inverse of what elk want during hunting)
         min_access_distance = min(road_distance, trail_distance if trail_distance else road_distance)
         
@@ -61,6 +64,15 @@ class HuntingPressureHeuristic(BaseHeuristic):
                 status = "poor"
                 note = f"High access ({min_access_distance:.1f}mi from road), " \
                        f"heavy hunting pressure [{season_name}]"
+            
+            # During peak rut, elk may be slightly less sensitive to hunting pressure
+            # (breeding priority) but still avoid heavily accessed areas
+            if rut_phase == "peak_rut" and min_access_distance >= self.ROAD_BUFFER_MINIMUM:
+                # Small reduction in penalty for moderate access during peak rut
+                # Still heavily penalize very close access
+                score *= 1.05  # 5% boost (still avoid close access)
+                if min_access_distance >= self.ROAD_BUFFER_OPTIMAL:
+                    note += " [slightly less sensitive during peak rut]"
         else:
             # Outside hunting season: accessibility matters less
             # But elk still prefer some security
@@ -101,7 +113,8 @@ class HuntingPressureHeuristic(BaseHeuristic):
                 "in_hunting_season": in_hunting_season,
                 "season_name": season_name if in_hunting_season else "closed",
                 "security_cover_percent": security_cover,
-                "is_weekend": dt.weekday() in [5, 6]
+                "is_weekend": dt.weekday() in [5, 6],
+                "rut_phase": rut_phase
             }
         )
     
@@ -111,3 +124,17 @@ class HuntingPressureHeuristic(BaseHeuristic):
             if start <= date <= end:
                 return True, season_name
         return False, None
+    
+    def _get_rut_phase(self, month: int, day: int) -> Optional[str]:
+        """Determine rut phase based on date"""
+        if month == 9:  # September
+            if day >= 1 and day < 15:
+                return "pre_rut"
+            elif day >= 15:
+                return "peak_rut"
+        elif month == 10:  # October
+            if day < 10:
+                return "peak_rut"
+            elif day >= 10:
+                return "post_rut"
+        return None
